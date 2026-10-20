@@ -6,8 +6,9 @@
 //! which reaches the exit code as `CliError::Serve`; `KeyTextFault` why
 //! command-line text is not a key (core's `RewriteTextFault` says why
 //! `--rewrite` text is not a rule); `ColumnTextFault` why `--column` text
-//! is not a column read; `WireKeyFault` why a wire key is not a key; `WireScanFault` why a
-//! Scan's direction or bound is not one; `CallFault`
+//! is not a column read; `OrderTextFault` why `--start` or `--before` text
+//! is not an order value; `WireKeyFault` why a wire key is not a key;
+//! `WireScanFault` why a Scan's direction or bound is not one; `CallFault`
 //! why the service ended a call on one of its own bounds.
 //! `CliError::exit_code` is the one exhaustive match from a subcommand's
 //! failure to an exit code; the two failures before any subcommand runs, a
@@ -23,9 +24,12 @@ use std::time::Duration;
 
 use icetray_core::config::{ConfigError, schema_detail};
 use icetray_core::key::UUID_BYTES;
-use icetray_core::{BoundSide, CacheError, ErrorKind, KeyType, LocationError};
+use icetray_core::{
+    BoundSide, CacheError, ErrorKind, KeyType, LocationError, OrderVariant, TableKind,
+};
 
 use crate::cli::{ConfigPath, ENV_CONFIG};
+use crate::oneshot::Reader;
 use crate::serve::PeriodicTask;
 use crate::service::WireVariant;
 
@@ -49,7 +53,9 @@ pub const EXIT_BELOW_LEVEL: u8 = 2;
 /// The command line or the target could not be used: clap's own errors, no
 /// configuration and no target, a `--location` no store serves, `--table`
 /// with `--location`, a `--table` name no table is configured under, a
-/// table name required, a key that does not parse. `sysexits.h`'s `EX_USAGE`, chosen so that 2 means one thing;
+/// table name required, a key or a bound that does not parse, a request the
+/// table's configuration refuses, a table of the kind the command does not
+/// read. `sysexits.h`'s `EX_USAGE`, chosen so that 2 means one thing;
 /// clap's default usage code of 2 is never used.
 pub const EXIT_USAGE: u8 = 64;
 
@@ -86,6 +92,16 @@ pub enum Hint {
         /// The table's key type.
         key_type: KeyType,
     },
+    /// Write the bound in the form its table's order type takes.
+    BoundForm {
+        /// The variant the table's order type travels as.
+        variant: OrderVariant,
+    },
+    /// Read the table with the command for its kind.
+    Command {
+        /// The command that reads it.
+        command: Reader,
+    },
     /// Raise the open-file limit, or shrink the disk level that needs it.
     DescriptorLimit,
 }
@@ -105,6 +121,18 @@ impl fmt::Display for Hint {
                 KeyType::Binary => "a binary key is two hex digits per byte, with or without 0x",
                 KeyType::Uuid => "a uuid key is hyphenated or 32 hex digits",
             }),
+            Self::BoundForm { variant } => f.write_str(match variant {
+                OrderVariant::Long => {
+                    "an integer or time bound is a long in the column's unit: days for a date, microseconds or nanoseconds for a timestamp"
+                }
+                OrderVariant::Str => {
+                    "a string bound is its text, with \\\\ for a backslash and \\0 for a zero byte"
+                }
+                OrderVariant::Bin => {
+                    "a binary or fixed bound is two hex digits per byte, with or without 0x"
+                }
+            }),
+            Self::Command { command } => write!(f, "read it with icetray {command}"),
             Self::DescriptorLimit => f.write_str(
                 "raise the hard open-file limit (ulimit -Hn, or the container runtime's nofile limit), or lower storage.local.page_cache_disk_bytes",
             ),
@@ -149,6 +177,57 @@ impl KeyTextFault {
             Self::NotALong { .. } => KeyType::Long,
             Self::OddHexLength { .. } | Self::NotHex { .. } => KeyType::Binary,
             Self::NotAUuid { .. } => KeyType::Uuid,
+        }
+    }
+}
+
+/// Why `--start` or `--before` text is not an order value of the table's
+/// order type (`order_text::parse`). The messages carry the flag and the
+/// text, since the shell may have changed what the person typed.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum OrderTextFault {
+    /// The order type travels as a long and the text is not a signed
+    /// 64-bit integer.
+    #[error("--{bound} {text} is not a long")]
+    NotALong {
+        /// The flag the text was given for.
+        bound: BoundSide,
+        /// The text as given.
+        text: String,
+    },
+    /// A binary or fixed bound's hex has an odd number of digits.
+    #[error("--{bound} {text} has an odd number of hex digits")]
+    OddHexLength {
+        /// The flag the text was given for.
+        bound: BoundSide,
+        /// The text as given.
+        text: String,
+    },
+    /// A binary or fixed bound's text is not hex.
+    #[error("--{bound} {text} is not hex")]
+    NotHex {
+        /// The flag the text was given for.
+        bound: BoundSide,
+        /// The text as given.
+        text: String,
+    },
+    /// A string bound holds a backslash that starts neither escape.
+    #[error("--{bound} {text} has a backslash that is neither \\\\ nor \\0")]
+    BadEscape {
+        /// The flag the text was given for.
+        bound: BoundSide,
+        /// The text as given.
+        text: String,
+    },
+}
+
+impl OrderTextFault {
+    /// The variant the text did not parse as.
+    pub fn variant(&self) -> OrderVariant {
+        match self {
+            Self::NotALong { .. } => OrderVariant::Long,
+            Self::OddHexLength { .. } | Self::NotHex { .. } => OrderVariant::Bin,
+            Self::BadEscape { .. } => OrderVariant::Str,
         }
     }
 }
@@ -380,20 +459,41 @@ pub enum CliError {
     /// configuration lists, the other opens one table without any.
     #[error("--table selects a configured table and --location opens one table directly")]
     TableWithLocation,
-    /// A `get` with no `--table` while more than one table is configured.
-    #[error("several tables are configured and get reads one")]
+    /// A `get` or `scan` with no `--table` while more than one table is
+    /// configured.
+    #[error("several tables are configured and {command} reads one")]
     TableNameRequired {
+        /// The command.
+        command: Reader,
         /// The configured names, in configuration order.
         tables: Vec<String>,
+    },
+    /// A `get` of an ordered table or a `scan` of a key-value one, found
+    /// from the table's configuration before the load.
+    #[error("table {table} is {kind}, and {command} reads a {} table", command.reads())]
+    WrongCommand {
+        /// The table's configured name.
+        table: String,
+        /// The table's kind.
+        kind: TableKind,
+        /// The command that cannot read it.
+        command: Reader,
     },
     /// Command-line text that is not a key of the table's type.
     #[error(transparent)]
     Key(#[from] KeyTextFault),
-    /// A `get --column` the table is not configured to serve, one given
-    /// twice, or a field list its configured format does not take:
-    /// `icetray_core::Error::ColumnRequest`, found before the load.
+    /// `--start` or `--before` text that is not an order value of the
+    /// table's order type.
     #[error(transparent)]
-    Column(icetray_core::Error),
+    Bound(#[from] OrderTextFault),
+    /// A request the table's configuration refuses before the load, as a
+    /// lookup or a Scan refuses it: a `--column` the table is not
+    /// configured to serve, one given twice, or a field list its configured
+    /// format does not take (`icetray_core::Error::ColumnRequest`), and a
+    /// `scan` limit of 0 or above the table's `max_scan_rows`
+    /// (`icetray_core::Error::ScanRequest`).
+    #[error(transparent)]
+    Request(icetray_core::Error),
     /// Writing a line failed for a reason other than a closed pipe.
     #[error("cannot write output: {0}")]
     Io(#[from] std::io::Error),
@@ -451,13 +551,19 @@ impl CliError {
     /// How to fix this failure, when the failure alone makes it plain.
     pub fn hint(&self) -> Option<Hint> {
         match self {
-            Self::NoTableMatched { tables, .. } | Self::TableNameRequired { tables } => {
+            Self::NoTableMatched { tables, .. } | Self::TableNameRequired { tables, .. } => {
                 Some(Hint::PassTable {
                     tables: tables.clone(),
                 })
             }
             Self::Key(fault) => Some(Hint::KeyForm {
                 key_type: fault.key_type(),
+            }),
+            Self::Bound(fault) => Some(Hint::BoundForm {
+                variant: fault.variant(),
+            }),
+            Self::WrongCommand { kind, .. } => Some(Hint::Command {
+                command: Reader::of(*kind),
             }),
             Self::TableWithLocation => Some(Hint::TableOrLocation),
             Self::Core(icetray_core::Error::Cache(CacheError::DescriptorLimit { .. })) => {
@@ -471,7 +577,7 @@ impl CliError {
             | Self::WorkingDirectory { .. }
             | Self::WorkingDirectoryNotUtf8 { .. }
             | Self::Location(_)
-            | Self::Column(_)
+            | Self::Request(_)
             | Self::Io(_)
             | Self::Json(_)
             | Self::BrokenPipe
@@ -496,8 +602,10 @@ impl CliError {
             | Self::Location(_)
             | Self::NoTableMatched { .. }
             | Self::TableNameRequired { .. }
-            | Self::Column(_)
-            | Self::Key(_) => EXIT_USAGE,
+            | Self::WrongCommand { .. }
+            | Self::Request(_)
+            | Self::Key(_)
+            | Self::Bound(_) => EXIT_USAGE,
             Self::BrokenPipe => EXIT_OK,
         };
         ExitCode::from(code)
@@ -614,11 +722,22 @@ mod tests {
                 tables: vec!["a".to_string()],
             },
             CliError::TableNameRequired {
+                command: Reader::Get,
                 tables: vec!["a".to_string(), "b".to_string()],
+            },
+            CliError::WrongCommand {
+                table: TABLE.to_string(),
+                kind: TableKind::Ordered,
+                command: Reader::Get,
             },
             CliError::Key(KeyTextFault::NotALong {
                 text: "abc".to_string(),
             }),
+            CliError::Bound(OrderTextFault::NotALong {
+                bound: BoundSide::Start,
+                text: "abc".to_string(),
+            }),
+            CliError::Request(core_error()),
         ];
         for error in cases {
             assert_eq!(error.exit_code(), ExitCode::from(EXIT_USAGE), "{error}");
@@ -636,7 +755,14 @@ mod tests {
             tables: tables.clone(),
         };
         assert_eq!(unmatched.hint(), pass_table);
-        assert_eq!(CliError::TableNameRequired { tables }.hint(), pass_table);
+        assert_eq!(
+            CliError::TableNameRequired {
+                command: Reader::Scan,
+                tables
+            }
+            .hint(),
+            pass_table
+        );
         assert_eq!(CliError::NoTarget.hint(), None);
     }
 
@@ -658,6 +784,64 @@ mod tests {
     }
 
     #[test]
+    fn test_hint_names_the_command_for_the_table_s_kind() {
+        for (kind, wrong, right) in [
+            (TableKind::Ordered, Reader::Get, Reader::Scan),
+            (TableKind::KeyValue, Reader::Scan, Reader::Get),
+        ] {
+            let error = CliError::WrongCommand {
+                table: TABLE.to_string(),
+                kind,
+                command: wrong,
+            };
+            assert_eq!(error.hint(), Some(Hint::Command { command: right }));
+            assert_eq!(right.reads(), kind);
+        }
+    }
+
+    #[test]
+    fn test_hint_gives_the_form_of_the_variant_the_bound_missed() {
+        let text = || "abc".to_string();
+        let bound = BoundSide::Before;
+        let cases = [
+            (
+                OrderTextFault::NotALong {
+                    bound,
+                    text: text(),
+                },
+                OrderVariant::Long,
+            ),
+            (
+                OrderTextFault::OddHexLength {
+                    bound,
+                    text: text(),
+                },
+                OrderVariant::Bin,
+            ),
+            (
+                OrderTextFault::NotHex {
+                    bound,
+                    text: text(),
+                },
+                OrderVariant::Bin,
+            ),
+            (
+                OrderTextFault::BadEscape {
+                    bound,
+                    text: text(),
+                },
+                OrderVariant::Str,
+            ),
+        ];
+        for (fault, variant) in cases {
+            assert_eq!(
+                CliError::Bound(fault).hint(),
+                Some(Hint::BoundForm { variant })
+            );
+        }
+    }
+
+    #[test]
     fn test_hint_for_a_descriptor_limit_is_to_raise_it() {
         let (limit, needed) = (1_100, 3_328);
         let limit = CliError::Core(icetray_core::Error::Cache(CacheError::DescriptorLimit {
@@ -672,6 +856,7 @@ mod tests {
     #[test]
     fn test_render_is_an_error_line_and_a_hint_line_when_there_is_a_hint() {
         let error = CliError::TableNameRequired {
+            command: Reader::Get,
             tables: vec!["a".to_string(), "b".to_string()],
         };
         let with_hint = render(&error, error.hint().as_ref());

@@ -1,8 +1,8 @@
 //! The command line: `serve` takes only the configuration path, from a flag
-//! or the environment (RFD 012); `doctor`, `get`, and `info` share one
-//! target vocabulary, a configuration file or one table located directly,
-//! and open tables the same way `serve` does. Every command finds and reads
-//! its configuration file through `ConfigPath`.
+//! or the environment (RFD 012); `doctor`, `get`, `scan`, and `info` share
+//! one target vocabulary, a configuration file or one table located
+//! directly, and open tables the same way `serve` does. Every command finds
+//! and reads its configuration file through `ConfigPath`.
 
 use std::ffi::OsString;
 use std::fmt;
@@ -10,6 +10,7 @@ use std::path::{Component, MAIN_SEPARATOR, Path, PathBuf};
 
 use clap::builder::{NonEmptyStringValueParser, PossibleValuesParser, Styles, TypedValueParser};
 use clap::{Args, Parser, Subcommand};
+use icetray_core::Direction;
 use icetray_core::catalog::{is_relative_path, table_root_name};
 use icetray_core::config::{
     Config, ConfigViolation, DEFAULT_RESIDENCY, Residency, RewriteRule, ServerConfig, SourceConfig,
@@ -47,6 +48,10 @@ pub const DEFAULT_REF: &str = "main";
 /// `disk` is not offered; the doctor under `full` already reports each
 /// tier's predicted bytes.
 const LOCATED_RESIDENCIES: [Residency; 2] = [Residency::Full, Residency::Bloom];
+
+/// The directions `scan --direction` takes, each under its word
+/// (`direction_word`).
+const DIRECTIONS: [Direction; 2] = [Direction::NewestFirst, Direction::OldestFirst];
 
 /// What separates a `--column` name from its field list, `NAME=FIELDS`; the
 /// last occurrence, so a name holding one is still named, as `NAME=` for
@@ -104,6 +109,7 @@ fn footer() -> String {
 {heading}Examples:{heading:#}
   icetray get --location s3://warehouse/db/kv --value-column payload --column payload 42 43
   icetray get --location s3://warehouse/db/kv --value-column detail:protobuf --column detail=1,4 42
+  icetray scan --config icetray.toml --table events --direction newest --limit 10 42
   icetray doctor --config icetray.toml
   icetray serve --config icetray.toml"
     )
@@ -171,7 +177,8 @@ pub enum Command {
     /// Prints one JSON lookup line per key, in the order given, saying
     /// whether the key is present or absent and, for a present key, the
     /// value of each column named with --column, a null as null. An absent
-    /// key is an answer, not a failure: the exit status is 0.
+    /// key is an answer, not a failure: the exit status is 0. An ordered
+    /// table is read with scan, and get of one fails before it loads.
     Get {
         /// Where the tables come from.
         #[command(flatten)]
@@ -179,20 +186,9 @@ pub enum Command {
         /// The table to read; needed when more than one is configured.
         #[arg(long, short, value_name = "NAME", help_heading = HEADING_TABLES)]
         table: Option<String>,
-        /// A value column to read for every key, whole or trimmed to some
-        /// fields; repeatable, read in the order given.
-        ///
-        /// FIELDS is a comma-separated list of top-level protobuf field
-        /// numbers, such as detail=1,4,9, for a column declared protobuf:
-        /// each value is trimmed to every occurrence of those fields. NAME
-        /// alone, or NAME= for a name that holds an =, reads the whole
-        /// value. With no --column, each lookup line says only whether its
-        /// key is present, and no value page is read. A column the table
-        /// does not serve, one named twice, a field list for a column not
-        /// declared protobuf, a number outside 1 to 536870911, or one given
-        /// twice fails the run before the table loads.
-        #[arg(long = "column", value_name = "NAME[=FIELDS]", value_parser = parse_column)]
-        columns: Vec<ColumnArg>,
+        /// The value columns to read.
+        #[command(flatten)]
+        columns: Columns,
         /// Keys to look up, each as text of the table's key type.
         ///
         /// A long is its digits, with a leading - when negative. A string
@@ -203,6 +199,27 @@ pub enum Command {
         /// after --.
         #[arg(value_name = "KEY", required = true, allow_negative_numbers = true)]
         keys: Vec<String>,
+    },
+    /// Read one key's rows in an ordered table.
+    ///
+    /// Prints one JSON row line per row, in the direction asked, with its
+    /// order value and the value of each column named with --column, a
+    /// null as null, then one scan line with the snapshot, the rows
+    /// returned, and, when rows remain past them, next: passed back as
+    /// --before reading newest first, or as --start reading oldest first,
+    /// it reads the next page. A key with no rows is an answer, not a
+    /// failure: the exit status is 0. A key-value table is read with get,
+    /// and scan of one fails before it loads.
+    Scan {
+        /// Where the tables come from.
+        #[command(flatten)]
+        target: Target,
+        /// The table to read; needed when more than one is configured.
+        #[arg(long, short, value_name = "NAME", help_heading = HEADING_TABLES)]
+        table: Option<String>,
+        /// What to read of the key's rows.
+        #[command(flatten)]
+        request: ScanArgs,
     },
     /// Describe each table's current snapshot.
     ///
@@ -218,21 +235,103 @@ pub enum Command {
     },
 }
 
+/// The value columns a `get` or `scan` reads, each `--column`.
+#[derive(Args, Debug)]
+pub struct Columns {
+    /// A value column to read, whole or trimmed to some fields; repeatable,
+    /// read in the order given.
+    ///
+    /// FIELDS is a comma-separated list of top-level protobuf field
+    /// numbers, such as detail=1,4,9, for a column declared protobuf: each
+    /// value is trimmed to every occurrence of those fields. NAME alone, or
+    /// NAME= for a name that holds an =, reads the whole value. With no
+    /// --column, a line says only whether its key or row is there, and no
+    /// value page is read. A column the table does not serve, one named
+    /// twice, a field list for a column not declared protobuf, a number
+    /// outside 1 to 536870911, or one given twice fails the run before the
+    /// table loads.
+    #[arg(long = "column", value_name = "NAME[=FIELDS]", value_parser = parse_column)]
+    pub columns: Vec<ColumnArg>,
+}
+
+/// What a `scan` reads of its key's rows: the columns, the direction, the
+/// limit, the bounds as text, and the key as text. The bounds are parsed
+/// under the table's order type and the key under its key type once the
+/// table's metadata gives them (`order_text::parse`, `key_text::parse`).
+/// Each field's doc comment is its help.
+#[derive(Args, Debug)]
+pub struct ScanArgs {
+    /// The value columns to read for each row.
+    #[command(flatten)]
+    pub columns: Columns,
+    /// Which end of the key's rows to read from.
+    ///
+    /// newest returns the highest order values first, oldest the lowest.
+    #[arg(long, value_name = "DIRECTION", value_parser = direction_parser())]
+    pub direction: Direction,
+    /// The most rows to print, from 1 to the table's `max_scan_rows`.
+    ///
+    /// A limit of 0, or one above the table's `max_scan_rows`, which info
+    /// reports, fails the run before the table loads.
+    #[arg(long, value_name = "N")]
+    pub limit: u32,
+    /// Only rows at or above this order value.
+    ///
+    /// The value is text of the table's order type. An integer, date, or
+    /// timestamp is a long in the column's Iceberg unit: days for a date,
+    /// microseconds for timestamp and timestamptz, nanoseconds for
+    /// `timestamp_ns` and `timestamptz_ns`. A string is its text, with \\
+    /// for a backslash and \0 for a zero byte. A binary or fixed value is
+    /// hex, two digits per byte in either case, with or without 0x. A scan
+    /// line's next is in this form.
+    #[arg(long, value_name = "ORDER", allow_hyphen_values = true)]
+    pub start: Option<String>,
+    /// Only rows below this order value, in the form --start takes.
+    #[arg(long, value_name = "ORDER", allow_hyphen_values = true)]
+    pub before: Option<String>,
+    /// The key whose rows to read, as text of the table's key type.
+    ///
+    /// In the form get takes a key. A key that starts with - and is not a
+    /// number goes after --.
+    #[arg(value_name = "KEY", allow_negative_numbers = true)]
+    pub key: String,
+}
+
+/// The word `--direction` takes for `direction`.
+fn direction_word(direction: Direction) -> &'static str {
+    match direction {
+        Direction::NewestFirst => "newest",
+        Direction::OldestFirst => "oldest",
+    }
+}
+
+/// `--direction`'s parser: the word of one of `DIRECTIONS`. Clap refuses
+/// any other word as a usage error that lists the accepted ones.
+fn direction_parser() -> impl TypedValueParser<Value = Direction> {
+    PossibleValuesParser::new(DIRECTIONS.map(direction_word)).map(|word| {
+        DIRECTIONS
+            .into_iter()
+            .find(|&direction| direction_word(direction) == word)
+            .expect("a possible value is the word of a direction")
+    })
+}
+
 /// Where the tables come from: a configuration file listing them, or one
 /// table located directly. At most one of the two; with neither, `config`
 /// reads the file `ICETRAY_CONFIG` names, and a `--location` run never
 /// reads the variable. An empty `--location`, which as a path would be the
-/// filesystem root, is refused by clap as a usage error. The column, ref,
-/// and residency flags describe the
-/// located table, so they both require `--location` and conflict with
-/// `--config`: clap waives a requirement whose argument conflicts with a
-/// present one, so `requires` alone would let `--config` and `--key-column`
-/// pass together, and the conflict alone would let `--key-column` pass with
-/// no target and go unread under the variable. Their defaults are clap's,
-/// and a defaulted argument counts as absent to both checks, so the
-/// defaults stand under `--config` without tripping either; `--value-column`
-/// has no default, so a located table serves no value column unless one is
-/// named. Each field's doc comment is its help.
+/// filesystem root, is refused by clap as a usage error. The column, order
+/// column, ref, and residency flags describe the located table, so they
+/// both require `--location` and conflict with `--config`: clap waives a
+/// requirement whose argument conflicts with a present one, so `requires`
+/// alone would let `--config` and `--key-column` pass together, and the
+/// conflict alone would let `--key-column` pass with no target and go
+/// unread under the variable. Their defaults are clap's, and a defaulted
+/// argument counts as absent to both checks, so the defaults stand under
+/// `--config` without tripping either; `--value-column` has no default, so
+/// a located table serves no value column unless one is named, and
+/// `--order-column` none, so a located table is a key-value table unless
+/// it names one. Each field's doc comment is its help.
 #[derive(Args, Debug)]
 pub struct Target {
     /// The configuration file listing the tables.
@@ -296,6 +395,16 @@ pub struct Target {
         help_heading = HEADING_LOCATED
     )]
     pub value_columns: Vec<ValueColumnConfig>,
+    /// The order column of the located table, which makes it an ordered
+    /// table that scan reads.
+    #[arg(
+        long,
+        value_name = "COLUMN",
+        requires = "location",
+        conflicts_with = "config",
+        help_heading = HEADING_LOCATED
+    )]
+    pub order_column: Option<String>,
     /// The branch or tag of the located table to read.
     #[arg(
         long,
@@ -401,7 +510,7 @@ fn located_residency() -> impl TypedValueParser<Value = Residency> {
     })
 }
 
-/// One `get --column`: the column's name and the field numbers to trim its
+/// One `--column` of a `get` or `scan`: the column's name and the field numbers to trim its
 /// values to, empty for the whole value.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ColumnArg {
@@ -559,8 +668,8 @@ impl Target {
     }
 
     /// The configuration of one table at `location` over `storage`, under
-    /// this target's column, ref, and residency flags or their defaults,
-    /// named after its table root.
+    /// this target's column, order column, ref, and residency flags or
+    /// their defaults, named after its table root.
     fn location_config(&self, location: String, storage: StorageConfig) -> Config {
         Config {
             server: ServerConfig::default(),
@@ -572,7 +681,7 @@ impl Target {
                 r#ref: self.r#ref.clone(),
                 key_column: self.key_column.clone(),
                 value_columns: self.value_columns.clone(),
-                order_column: None,
+                order_column: self.order_column.clone(),
                 max_scan_rows: None,
                 strict: false,
                 lookups: None,
@@ -610,6 +719,7 @@ mod tests {
         match cli.command {
             Command::Doctor { target, .. }
             | Command::Get { target, .. }
+            | Command::Scan { target, .. }
             | Command::Info { target, .. } => target,
             Command::Serve { .. } => panic!("a one-shot was parsed"),
         }
@@ -680,7 +790,7 @@ mod tests {
 
     #[test]
     fn test_try_parse_rejects_location_flags_without_location() {
-        for flag in ["--key-column", "--value-column", "--ref"] {
+        for flag in ["--key-column", "--value-column", "--order-column", "--ref"] {
             let under_config = parse(&["info", "--config", "icetray.toml", flag, "x"]).unwrap_err();
             assert_eq!(
                 under_config.kind(),
@@ -927,6 +1037,103 @@ value_columns = ["value"]
         }
     }
 
+    /// The scan flags as typed, each a part of the request.
+    #[test]
+    fn test_try_parse_scan_reads_its_request() {
+        let cli = parse(&[
+            "scan",
+            "--location",
+            LOCATION,
+            "--order-column",
+            "ts",
+            "--direction",
+            "oldest",
+            "--limit",
+            "5",
+            "--start",
+            "-10",
+            "--before",
+            "20",
+            "--column",
+            "payload",
+            NEGATIVE_KEY,
+        ])
+        .unwrap();
+        let Command::Scan {
+            target, request, ..
+        } = cli.command
+        else {
+            panic!("a scan");
+        };
+        assert_eq!(request.direction, Direction::OldestFirst);
+        assert_eq!(request.limit, 5);
+        assert_eq!(request.start.as_deref(), Some("-10"));
+        assert_eq!(request.before.as_deref(), Some("20"));
+        assert_eq!(request.key, NEGATIVE_KEY);
+        assert_eq!(request.columns.columns.len(), 1);
+        let config = target.config(None).unwrap();
+        assert_eq!(config.tables[0].order_column.as_deref(), Some("ts"));
+        let newest = parse(&[
+            "scan",
+            "-c",
+            "f.toml",
+            "--direction",
+            "newest",
+            "--limit",
+            "1",
+            "7",
+        ])
+        .unwrap();
+        let Command::Scan { request, .. } = newest.command else {
+            panic!("a scan");
+        };
+        assert_eq!(request.direction, Direction::NewestFirst);
+        assert_eq!(request.start, None);
+    }
+
+    /// A direction clap does not know, a limit that is not a `u32`, and a
+    /// scan without its direction, limit, or key are usage errors.
+    #[test]
+    fn test_try_parse_scan_refuses_a_bad_or_missing_direction_or_limit() {
+        let scan = |extra: &[&str]| {
+            parse(&[&["scan", "--config", "icetray.toml"][..], extra].concat()).unwrap_err()
+        };
+        for (extra, kind) in [
+            (
+                &["--direction", "up", "--limit", "1", "7"][..],
+                ErrorKind::InvalidValue,
+            ),
+            (
+                &["--direction", "newest", "--limit", "x", "7"],
+                ErrorKind::ValueValidation,
+            ),
+            (
+                &["--direction", "newest", "--limit", "-1", "7"],
+                ErrorKind::ValueValidation,
+            ),
+            (&["--limit", "1", "7"], ErrorKind::MissingRequiredArgument),
+            (
+                &["--direction", "newest", "7"],
+                ErrorKind::MissingRequiredArgument,
+            ),
+            (
+                &["--direction", "newest", "--limit", "1"],
+                ErrorKind::MissingRequiredArgument,
+            ),
+        ] {
+            let error = scan(extra);
+            assert_eq!(error.kind(), kind, "{extra:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn test_config_located_table_is_key_value_without_an_order_column() {
+        let config = target(parse(&["info", "--location", LOCATION]).unwrap())
+            .config(None)
+            .unwrap();
+        assert_eq!(config.tables[0].order_column, None);
+    }
+
     #[test]
     fn test_debug_assert_accepts_the_definition() {
         Cli::command().debug_assert();
@@ -937,11 +1144,22 @@ value_columns = ["value"]
         for args in [
             &["doctor", "-t", "kv"][..],
             &["get", "-t", "kv", "7"],
+            &[
+                "scan",
+                "-t",
+                "kv",
+                "--direction",
+                "newest",
+                "--limit",
+                "1",
+                "7",
+            ],
             &["info", "-t", "kv"],
         ] {
             let table = match parse(args).unwrap().command {
                 Command::Doctor { table, .. }
                 | Command::Get { table, .. }
+                | Command::Scan { table, .. }
                 | Command::Info { table, .. } => table,
                 Command::Serve { .. } => panic!("{args:?} is a one-shot"),
             };
@@ -1071,7 +1289,7 @@ value_columns = ["value"]
             panic!("a get");
         };
         assert_eq!(
-            columns,
+            columns.columns,
             [ColumnArg {
                 name: "detail".to_string(),
                 fields: vec![1, 2],

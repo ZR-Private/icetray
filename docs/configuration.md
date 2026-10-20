@@ -3,8 +3,9 @@
 ## The file
 
 The configuration is one file, TOML or JSON, read by `serve` and by the
-[one-shots](glossary.md) (`doctor`, `get`, and `info`). A document whose
-first non-whitespace character is `{` is JSON; anything else is TOML.
+[one-shots](glossary.md) (`doctor`, `get`, `scan`, and `info`). A
+document whose first non-whitespace character is `{` is JSON; anything
+else is TOML.
 icetray parses both into the same schema.
 
 - Every section is optional, and a section left out takes its defaults.
@@ -485,6 +486,7 @@ Commands:
   serve   Run the gRPC server
   doctor  Check tables against the optimal layout
   get     Look up keys in one table
+  scan    Read one key's rows in an ordered table
   info    Describe each table's current snapshot
 ```
 
@@ -498,6 +500,7 @@ icetray doctor --config icetray.toml
 icetray info --config icetray.toml --table kv
 icetray get --config icetray.toml --table kv --column value 42 43
 icetray get --location s3://warehouse/db/kv --value-column payload --column payload 42 43
+icetray scan --config icetray.toml --table events --direction newest --limit 10 --column payload 42
 ```
 
 - `serve` takes `-c, --config <PATH>` and nothing else. It is described
@@ -531,8 +534,39 @@ icetray get --location s3://warehouse/db/kv --value-column payload --column payl
   twice exits 64 before the table loads, and so does a field list that is
   not numbers. A value that does not parse as protobuf fails the run with
   exit 1, and the error names the table, column, and key. `get` reads a
-  key-value table; on an ordered table it loads the table and fails with
-  exit 1, since only `Scan` reads one.
+  key-value table; on an ordered table, one whose entry sets
+  `order_column`, it exits 64 before the table loads, with a hint to use
+  `scan`.
+- `scan` loads one ordered table and reads one key's rows with one
+  `Scan` ([Calling icetray](calling.md#reading-an-ordered-table)),
+  printing a [`row` line](#row) per row in the direction asked and then
+  one [`scan` line](#scan). It takes `--column` as `get` does, applied
+  to every row, and:
+
+  | Flag | Meaning |
+  |---|---|
+  | `--direction <DIRECTION>` | Required: `newest`, the highest order values first, or `oldest`, the lowest. |
+  | `--limit <N>` | Required: the most rows to print, from 1 to the table's [`max_scan_rows`](#tables). |
+  | `--start <ORDER>` | Only rows at or above this order value, in the form for the table's order type ([Order values](#order-values)). |
+  | `--before <ORDER>` | Only rows below this order value, in the same form. |
+  | `<KEY>` | The one key whose rows to read, in the form `get` takes ([Keys](#keys)). |
+
+  The `scan` line's `next`, present when rows remain past the last one
+  printed, is in the form `--start` and `--before` take: passed back as
+  `--before` reading newest first, or as `--start` reading oldest first,
+  with the other flags unchanged, it prints the next page. A key with no
+  rows prints only the `scan` line, with `rows` 0, and exits 0. `scan`
+  holds the request to the checks a `Scan` meets
+  ([Errors and retries](calling.md#errors-and-retries)), and exits 64
+  before the table loads for each one that needs no data file: a
+  key-value table, with a hint to use `get`; a direction other than
+  `newest` or `oldest`; a limit that is not a number, 0, or above
+  `max_scan_rows`; a bound or a key that does not parse as the table's
+  type; a `--start` at or above `--before`; and a `--column` that `get`
+  refuses. A failure the loaded table finds, such as a value that is not
+  protobuf, exits 1. `server.max_scan_bytes` bounds a gRPC response,
+  which `scan` does not send, so `scan` prints every row its limit
+  admits.
 
 ### Choosing the tables
 
@@ -545,7 +579,7 @@ The one-shots share one set of flags, grouped in their help as follows.
 | `-c, --config <PATH>` | The configuration file. |
 | `--location <URI>` | One table opened without a file; see below. Cannot be combined with `--config`. |
 | `--rewrite <FROM=TO>` | A location prefix rewrite, repeatable, under either target. |
-| `-t, --table <NAME>` | Selects a configured table, so it requires a configuration file. On `doctor` and `info` it limits the run to that table; on `get` it is required when the file lists more than one. |
+| `-t, --table <NAME>` | Selects a configured table, so it requires a configuration file. On `doctor` and `info` it limits the run to that table; on `get` and `scan` it is required when the file lists more than one. |
 
 **Located table (with --location)**
 
@@ -553,6 +587,7 @@ The one-shots share one set of flags, grouped in their help as follows.
 |---|---|---|
 | `--key-column <COLUMN>` | `key` | The key column, a name under `key_column`'s rule. |
 | `--value-column <NAME[:FORMAT]>` | none | A value column the table serves, with its format, `opaque` by default or `protobuf`; repeatable. A name holding a `:` takes its format after it, as `a:b:opaque`. An unknown format exits 64. The name follows `key_column`'s rule. With none, the table is served for key presence only. |
+| `--order-column <COLUMN>` | none | The order column, which makes the table an [ordered table](#tables) that `scan` reads, at the default `max_scan_rows`. The name follows `key_column`'s rule. With none, the table is a key-value table. |
 | `--ref <REF>` | `main` | The branch or tag to read. |
 | `--residency <RESIDENCY>` | `full` | `full` or `bloom`. `disk` requires a local directory, so it is available only through a configuration file. |
 
@@ -592,10 +627,9 @@ table named `table`.
 A located table runs with every `[server]` and `[storage]` default. Its
 value columns are the ones the `--value-column` flags list, or none, so
 the doctor checks only those columns' layout. A located table is a
-key-value table, and the command line has no flag for an order column,
-so `doctor` and `info` check an ordered table through a configuration
-file that sets its `order_column`. icetray refuses an ordered table
-opened with `--location` as `duplicate_keys`, since its keys repeat. Its
+key-value table unless `--order-column` names its order column; icetray
+refuses an ordered table opened without it as `duplicate_keys`, since
+its keys repeat. Its
 `lookups` is the best level its `--residency` reaches, `optimal` for
 `full` and `balanced` for `bloom`, and it is never strict, so the doctor
 reports a located table below that level with exit 2 rather than refusing
@@ -605,6 +639,7 @@ it.
 icetray doctor --location s3://warehouse/db/kv --value-column value
 icetray get --location s3://warehouse/db/kv/metadata/v3.metadata.json --value-column value --column value 42
 icetray info --location target/golden-warehouse/db/long_2m --value-column value
+icetray scan --location s3://warehouse/db/events --value-column payload --order-column ts --direction oldest --limit 100 --column payload 42
 ```
 
 ### Rewrite rules on the command line
@@ -627,13 +662,39 @@ Keys are given in the form for the table's key type:
 - a uuid hyphenated or as 32 hex digits.
 
 A [`lookup` line](#lookup)'s `key` is in this form, so passed back to
-`get` it looks up the same key.
+`get` it looks up the same key, and so is the `key` of a `row` and a
+`scan` line.
 
 A key that starts with `-` and is not a number goes after `--`:
-`icetray get --location ... -- -abc`. `get` reads the key type from the
-table's metadata and parses every key as that type before it loads any
-data file, so a key that does not parse exits 64 at once, with a hint
-giving the form.
+`icetray get --location ... -- -abc`. `get` and `scan` read the key type
+from the table's metadata and parse every key as that type before they
+load any data file, so a key that does not parse exits 64 at once, with a
+hint giving the form.
+
+### Order values
+
+`scan --start` and `--before` take an order value in the form for the
+table's order type, which `scan` reads from the table's metadata before
+it loads any data file:
+
+- an `int`, `long`, `date`, or timestamp as a long in the type's Iceberg
+  unit: days since 1970-01-01 for a `date`, microseconds since the epoch
+  for `timestamp` and `timestamptz`, and nanoseconds for `timestamp_ns`
+  and `timestamptz_ns`, as `Scan` takes it on the wire and the doctor's
+  lines print it. A timestamp is not taken as ISO-8601 text, so every
+  value a column can hold has one form, `timestamp` and `timestamptz`
+  alike;
+- a `string` as its text, with two escapes: `\` for a backslash and
+  ` ` for a zero byte. No command-line argument can hold a zero byte,
+  and a page read oldest first from a string column ends in one: its
+  `next` is the last row's value with a zero byte appended
+  ([Paging with `next`](calling.md#paging-with-next)). Any other
+  backslash exits 64, so `C:\temp` is written `C:\\temp`;
+- a `binary` or `fixed` value as hex, two digits per byte in either case,
+  with or without `0x`, as a binary key is given.
+
+A bound that does not parse exits 64 with a hint giving the form. A
+[`scan` line](#scan)'s `next` is in this form.
 
 ## Output
 
@@ -674,15 +735,18 @@ Three conventions hold for the lines below:
   and lowercase hex for `binary` and `fixed`. The number is exact as
   text, and a reader that parses JSON numbers as doubles loses precision
   above 2^53, as `timestamp_ns` and `timestamptz_ns` values are, so such
-  a reader parses these keys as 64-bit integers. Only a [`file` line](#file)
-  carries an order value, in `order.min` and `order.max`. When a `doctor
-  --files` run prints one whose magnitude exceeds 2^53 (9,007,199,254,740,992),
-  it logs one `warn` event on stderr for the table, with the table's name in
-  `table` and 2^53 in `max_exact`, saying such values are exact as JSON
-  text but lose precision in readers that parse numbers as doubles. A table
-  is named once per run, however many of its files carry such a value, and
-  stdout is the same with or without the event. `doctor` without `--files`
-  and `info` print no order value and never warn.
+  a reader parses these keys as 64-bit integers. A [`file` line](#file)
+  carries order values in `order.min` and `order.max`, a [`row`
+  line](#row) in `order`, and a [`scan` line](#scan) in `next`, which
+  holds a string's text with its escapes ([Order values](#order-values)).
+  When a `doctor --files` or `scan` run prints one whose magnitude exceeds
+  2^53 (9,007,199,254,740,992), it logs one `warn` event on stderr for
+  the table, with the table's name in `table` and 2^53 in `max_exact`,
+  saying such values are exact as JSON text but lose precision in readers
+  that parse numbers as doubles. A table is named once per run, however
+  many of its lines carry such a value, and stdout is the same with or
+  without the event. `doctor` without `--files` and `info` print no
+  order value and never warn.
 
 #### `table`
 
@@ -839,6 +903,37 @@ One per key, from `get`:
 | `gets` | The GETs this lookup issued. |
 | `elapsed_micros` | The lookup's time, in microseconds. |
 
+#### `row`
+
+One per row, from `scan`, in the direction asked:
+
+```json
+{"kind":"row","table":"events","key":"42","order":1760918400000000,"values":{"payload":{"base64":"eyJ0eXBlIjoi…","utf8":"{\"type\":\"…","bytes":96}}}
+```
+
+| Key | Value |
+|---|---|
+| `key` | The key, in the form `get` and `scan` take ([Keys](#keys)). |
+| `order` | The row's order value, in the form [above](#the-output-contract-version-1): a string as the value itself, without `scan`'s escapes. |
+| `values` | An object keyed by the `--column` names in the order given, each value as a [`lookup` line](#lookup)'s, or `null` for a null value; `{}` when no column was named. |
+
+#### `scan`
+
+One per run, from `scan`, after its `row` lines:
+
+```json
+{"kind":"scan","table":"events","key":"42","rows":10,"next":1760918340000000,"snapshot_id":"7128216514704790069","gets":3,"elapsed_micros":512}
+```
+
+| Key | Value |
+|---|---|
+| `key` | The key, in the form `get` and `scan` take ([Keys](#keys)). |
+| `rows` | The `row` lines printed. |
+| `next` | Present when rows remain past the last one printed: the next page's bound, in the form `--start` and `--before` take ([Order values](#order-values)), a number for an integer or time order type and a string otherwise. Reading newest first it is the last row's order value, passed back as `--before`; reading oldest first the least value above it, passed back as `--start`. Absent on the last page. |
+| `snapshot_id` | The snapshot the `Scan` read. |
+| `gets` | The GETs the `Scan` issued. |
+| `elapsed_micros` | The `Scan`'s time, in microseconds. |
+
 ## Exit codes
 
 The same codes apply to every command; the root help's footer lists them.
@@ -868,5 +963,7 @@ The same codes apply to every command; the root help's footer lists them.
   located-table flag without `--location` or with `--config`; a
   `--residency` other than `full` or `bloom`; a malformed `--rewrite`;
   `--table` with `--location`; a `--table` that no configured table has;
-  `get` without `--table` when several tables are configured; or a key
-  that does not parse.
+  `get` or `scan` without `--table` when several tables are configured;
+  `get` of an ordered table or `scan` of a key-value one; a key or a
+  `scan` bound that does not parse; a `--column` the table refuses; or a
+  `scan` direction, limit, or window that a `Scan` refuses.

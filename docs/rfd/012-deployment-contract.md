@@ -9,6 +9,10 @@
 > show beside their bound, and the series an alert keys on are exposed
 > from the start.
 
+> Updated 2026-10-20: `scan` joins the subcommands, reading one key's
+> rows of an ordered table as `get` reads keys of a key-value table, and
+> a located table can name its order column. See RFD 025.
+
 ## Problem
 
 icetray is open source and meant to be run by organizations other than
@@ -47,9 +51,9 @@ either syntax RFD 011 (Configuration) accepts, so a deployer whose pipeline
 emits JSON hands the file over as is. A running server follows a change to
 the file's tables without a restart (RFD 018 (Configuration reload)).
 
-`icetray serve` runs the server; `doctor` (RFD 016 (Doctor)), `get`, and
-`info` are subcommands of the same binary with the same flags for where
-tables come from. The image a deployer runs therefore carries the tool that
+`icetray serve` runs the server; `doctor` (RFD 016 (Doctor)), `get`,
+`scan`, and `info` are subcommands of the same binary with the same flags
+for where tables come from. The image a deployer runs therefore carries the tool that
 explains a refusal. An operator runs it as a pod of its own from that
 image, with the daemon's configuration and credentials, rather than inside
 a serving pod, where a full load would compete with the server for CPU and

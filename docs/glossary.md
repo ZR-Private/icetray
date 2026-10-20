@@ -76,7 +76,8 @@ first the least order value above it, sent as the next request's
 `next`](calling.md#paging-with-next).
 
 **One-shot.** A subcommand that opens tables, prints JSON lines, and exits:
-`doctor`, `get`, and `info`. Each loads its tables the way `serve` does.
+`doctor`, `get`, `scan`, and `info`. Each loads its tables the way `serve`
+does.
 See [the command line](configuration.md#the-command-line).
 
 **Optimal layout.** The Iceberg and Parquet layout at which icetray

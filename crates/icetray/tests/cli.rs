@@ -25,7 +25,8 @@ use icetray_core::metric::{
     LABEL_RESULT, LABEL_STATE, LABEL_TABLE, PROCESS_RSS_BYTES, TABLE_STATE,
 };
 use icetray_core::{
-    ColumnRead, Key, KeyType, MAX_FIELD_NUMBER, Row, SnapshotId, TableState, bucket,
+    ColumnRead, Direction, Key, KeyType, MAX_FIELD_NUMBER, OrderValue, Row, SnapshotId, TableState,
+    bucket,
 };
 use icetray_testkit::aws_catalog::{CatalogEntry, FakeAwsCatalog};
 use icetray_testkit::fixture::{
@@ -36,8 +37,8 @@ use icetray_testkit::layout::{Layout, VALUE_COLUMN};
 use icetray_testkit::protobuf;
 use icetray_testkit::verify::{data_files, remove_data_files, series_value, zero_column_chunks};
 use icetray_testkit::{
-    DeleteForm, Fixture, FixtureSpec, Nulls, ORDER_COLUMN, Order, OrderKind, Ordered, ValueKind,
-    memory_catalog_local, write_fixture,
+    DeleteForm, Fixture, FixtureSpec, Nulls, ORDER_COLUMN, Order, OrderKind, Ordered, ScanRows,
+    TestScan, ValueKind, memory_catalog_local, order_value, write_fixture,
 };
 use serde_json::Value as Json;
 use tonic::transport::Channel;
@@ -1534,6 +1535,484 @@ async fn test_get_needs_a_table_name_when_several_are_configured() -> TestResult
     assert_eq!(got.len(), 1);
     assert_eq!(got[0]["table"], TABLE_A);
     assert_eq!(got[0]["presence"], "present");
+    Ok(())
+}
+
+/// The rows a `scan` page of the paging tests holds: fewer than a key's
+/// `ORDER_ROWS_PER_KEY`, and not a divisor of them, so the last page is
+/// short.
+const SCAN_PAGE_ROWS: u32 = 3;
+
+/// The pages a key of `ORDER_ROWS_PER_KEY` rows takes at
+/// `SCAN_PAGE_ROWS`, past which a paging loop has run away.
+const SCAN_PAGES_AT_MOST: usize = 3;
+
+/// The word `scan --direction` takes for `direction`.
+fn direction_flag(direction: Direction) -> &'static str {
+    match direction {
+        Direction::NewestFirst => "newest",
+        Direction::OldestFirst => "oldest",
+    }
+}
+
+/// The text `--start` and `--before` take for `value`, built without the
+/// code under test: a long's digits, a string as it is, which a fixture's
+/// zero-padded digits need no escape for, and bytes as `OrderValue`
+/// displays them, `0x` and lowercase hex.
+fn bound_text(value: &OrderValue) -> String {
+    match value {
+        OrderValue::Long(value) => value.to_string(),
+        OrderValue::Str(text) => {
+            assert!(!text.contains(['\\', '\0']), "{text:?} needs no escape");
+            text.clone()
+        }
+        OrderValue::Bytes(_) => value.to_string(),
+    }
+}
+
+/// The `next` a `scan` line prints for `value`, built without the code under
+/// test: a long as a JSON number, bytes as `0x` and lowercase hex, and a
+/// string as its text with a zero byte as `\0`; a fixture's strings hold
+/// no backslash, the one other character `scan` escapes.
+fn next_json(value: &OrderValue) -> Json {
+    match value {
+        OrderValue::Long(value) => Json::from(*value),
+        OrderValue::Str(text) => {
+            assert!(!text.contains('\\'), "{text:?} holds no backslash");
+            Json::String(text.replace('\0', "\\0"))
+        }
+        OrderValue::Bytes(_) => Json::String(value.to_string()),
+    }
+}
+
+/// A `scan` line's `next` as a caller pastes it back, what `jq -r .next`
+/// prints: a number's digits or a string's contents.
+fn pasted(next: &Json) -> String {
+    match next {
+        Json::Number(number) => number.to_string(),
+        Json::String(text) => text.clone(),
+        other @ (Json::Null | Json::Bool(_) | Json::Array(_) | Json::Object(_)) => {
+            panic!("next is a number or a string, got {other}")
+        }
+    }
+}
+
+/// One `scan` of `key` reading `VALUE_COLUMN` on the table `target` names,
+/// as `scan` asks, the bounds given as `start` and `before` text.
+fn scan_run(
+    target: &[&str],
+    key: &str,
+    scan: &TestScan,
+    start: Option<&str>,
+    before: Option<&str>,
+) -> Output {
+    let limit = scan.limit.to_string();
+    let mut args = vec!["scan"];
+    args.extend_from_slice(target);
+    args.extend([
+        "--direction",
+        direction_flag(scan.direction),
+        "--limit",
+        &limit,
+        "--column",
+        VALUE_COLUMN,
+    ]);
+    for (flag, text) in [("--start", start), ("--before", before)] {
+        if let Some(text) = text {
+            args.extend([flag, text]);
+        }
+    }
+    args.push(key);
+    run(&args, &[])
+}
+
+/// A `scan` run's stdout: its `row` lines, each of `table` and `key`, and
+/// its one `scan` line after them, which counts them.
+fn scan_lines(output: &Output, table: &str, key: &str) -> (Vec<Json>, Json) {
+    let mut got = lines(&output.stdout);
+    let call = got.pop().expect("a scan line");
+    assert_eq!(call["kind"], "scan", "{call}");
+    assert_eq!(call["table"], table);
+    assert_eq!(call["key"], key);
+    assert_eq!(call["rows"], Json::from(got.len()), "{call}");
+    assert!(call["snapshot_id"].is_string(), "{call}");
+    assert!(call["gets"].is_u64() && call["elapsed_micros"].is_u64());
+    for row in &got {
+        assert_eq!(row["kind"], "row", "{row}");
+        assert_eq!(row["table"], table);
+        assert_eq!(row["key"], key);
+    }
+    (got, call)
+}
+
+/// Asserts `rows`, a run's `row` lines, are the model's `expected` rows of
+/// a fixture ordered by `kind`: each row's order value as the doctor's lines
+/// carry one, and its `VALUE_COLUMN` value in base64 with its length, or
+/// `null` for a null.
+fn assert_rows(rows: &[Json], expected: &ScanRows, kind: OrderKind, context: &str) {
+    assert_eq!(rows.len(), expected.len(), "{context}");
+    for (row, (order, values)) in rows.iter().zip(expected) {
+        assert_eq!(
+            row["order"],
+            serde_json::to_value(order_value(kind, *order)).expect("an order value serializes"),
+            "{context}"
+        );
+        let value = &row["values"][VALUE_COLUMN];
+        match &values[0] {
+            Some(bytes) => {
+                assert_eq!(
+                    value["base64"],
+                    Json::String(base64::engine::general_purpose::STANDARD.encode(bytes)),
+                    "{context}"
+                );
+                assert_eq!(value["bytes"], Json::from(bytes.len()), "{context}");
+            }
+            None => assert_eq!(*value, Json::Null, "{context}"),
+        }
+    }
+}
+
+/// Reads `key`'s rows inside `window` (raw order values) in `direction`,
+/// one page of `SCAN_PAGE_ROWS` at a time, each page after the first
+/// bounded by the `next` the page before printed, pasted back as `scan`
+/// says: as `--before` newest first and as `--start` oldest first. The
+/// first page and its `next` are the model's (`Fixture::expected_scan`),
+/// and the pages together are every row of the window, as the model gives
+/// them unpaged.
+fn assert_pages_to_the_end(
+    target: &[&str],
+    table: &str,
+    fixture: &Fixture,
+    kind: OrderKind,
+    direction: Direction,
+    window: (Option<i64>, Option<i64>),
+) {
+    let key = fixture.key(SAMPLE[1]);
+    let key_text = key.to_string();
+    let page = TestScan {
+        direction,
+        limit: SCAN_PAGE_ROWS,
+        start: window.0,
+        before: window.1,
+    };
+    let context = format!("{kind:?} {direction:?} {window:?}");
+    let text = |raw: Option<i64>| raw.map(|raw| bound_text(&order_value(kind, raw)));
+    let (mut start, mut before) = (text(page.start), text(page.before));
+    let (first_rows, first_last) = fixture.expected_scan(&key, &[VALUE_COLUMN], &page);
+    let mut read: Vec<Json> = Vec::new();
+    for at in 0.. {
+        assert!(
+            at < SCAN_PAGES_AT_MOST,
+            "{context}: the pages ran past the end"
+        );
+        let output = scan_run(
+            target,
+            &key_text,
+            &page,
+            start.as_deref(),
+            before.as_deref(),
+        );
+        assert_exit(&output, EXIT_OK);
+        let (rows, call) = scan_lines(&output, table, &key_text);
+        if at == 0 {
+            assert_rows(&rows, &first_rows, kind, &context);
+            let expected = first_last.and_then(|last| page.next_after(kind, last));
+            match (expected, call.get("next")) {
+                (None, None) => {}
+                (Some(expected), Some(next)) => {
+                    assert_eq!(next, &next_json(&expected), "{context}");
+                }
+                (expected, next) => panic!("{context}: next {next:?}, the model's {expected:?}"),
+            }
+        }
+        read.extend(rows);
+        let Some(next) = call.get("next") else {
+            break;
+        };
+        match direction {
+            Direction::NewestFirst => before = Some(pasted(next)),
+            Direction::OldestFirst => start = Some(pasted(next)),
+        }
+    }
+    let every_row = TestScan {
+        limit: DEFAULT_MAX_SCAN_ROWS,
+        ..page
+    };
+    let (all, last) = fixture.expected_scan(&key, &[VALUE_COLUMN], &every_row);
+    assert_eq!(
+        last, None,
+        "{context}: the model's one page holds every row"
+    );
+    assert!(!all.is_empty(), "{context}: the window holds rows");
+    assert_rows(&read, &all, kind, &context);
+}
+
+/// `scan` reads a key of an ordered table in either direction, inside
+/// every kind of window, and paging by each `scan` line's `next`, pasted
+/// back, reads every row of the window exactly once, as the model holds
+/// them, ending on a page with no `next`.
+#[tokio::test]
+async fn test_scan_pages_by_next_to_the_end_in_both_directions_and_windows() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let kind = OrderKind::Timestamp;
+    let fixture = local_fixture(dir.path(), ordered_spec("events_scan", ORDER_STEP)).await?;
+    let config = ordered_config(dir.path(), "scan", &fixture)?;
+    let target = ["--config", config.as_str()];
+    let second = ORDER_START + ORDER_STEP;
+    let last = ORDER_START + ORDER_STEP * i64::try_from(ORDER_ROWS_PER_KEY - 1)?;
+    let windows = [
+        (None, None),
+        (Some(second), None),
+        (None, Some(last)),
+        (Some(second), Some(last)),
+        (Some(second + 1), Some(last - 1)),
+    ];
+    for direction in [Direction::NewestFirst, Direction::OldestFirst] {
+        for window in windows {
+            assert_pages_to_the_end(&target, TABLE_A, &fixture, kind, direction, window);
+        }
+    }
+    Ok(())
+}
+
+/// A string order column pages oldest first through a `next` that ends in
+/// a zero byte, printed as `\0`, and a binary one through hex, on a table
+/// a configuration file names and on one `--location` opens with
+/// `--order-column`.
+#[tokio::test]
+async fn test_scan_pages_a_string_and_a_binary_order_column_by_their_printed_next() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    for kind in [OrderKind::Str, OrderKind::Bin] {
+        let name = format!("events_{kind:?}").to_lowercase();
+        let fixture = local_fixture(
+            dir.path(),
+            ordered_spec_of(&name, kind, ORDER_START, ORDER_STEP),
+        )
+        .await?;
+        let config = ordered_config(dir.path(), &name, &fixture)?;
+        let located = [
+            "--location",
+            fixture.metadata_location(),
+            "--value-column",
+            VALUE_COLUMN,
+            "--order-column",
+            ORDER_COLUMN,
+        ];
+        let targets = [
+            (&["--config", config.as_str()][..], TABLE_A),
+            (&located[..], fixture.ident().name()),
+        ];
+        for (target, table) in targets {
+            for direction in [Direction::NewestFirst, Direction::OldestFirst] {
+                assert_pages_to_the_end(target, table, &fixture, kind, direction, (None, None));
+            }
+        }
+    }
+    let fixture = local_fixture(
+        dir.path(),
+        ordered_spec_of("events_text", OrderKind::Str, ORDER_START, ORDER_STEP),
+    )
+    .await?;
+    let config = ordered_config(dir.path(), "text", &fixture)?;
+    let key = fixture.key(SAMPLE[1]).to_string();
+    let oldest = TestScan {
+        direction: Direction::OldestFirst,
+        limit: 1,
+        start: None,
+        before: None,
+    };
+    let output = scan_run(&["--config", &config], &key, &oldest, None, None);
+    assert_exit(&output, EXIT_OK);
+    let (rows, call) = scan_lines(&output, TABLE_A, &key);
+    let Json::String(first) = &rows[0]["order"] else {
+        panic!("a string order value: {}", rows[0]);
+    };
+    assert_eq!(
+        call["next"],
+        Json::String(format!("{first}\\0")),
+        "the least string above the first, its zero byte escaped"
+    );
+    Ok(())
+}
+
+/// A key the table holds no row of is an answer: a `scan` line of no rows
+/// and no `next`, exit 0.
+#[tokio::test]
+async fn test_scan_of_a_key_with_no_rows_prints_one_scan_line() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let fixture = local_fixture(dir.path(), ordered_spec("events_none", ORDER_STEP)).await?;
+    let config = ordered_config(dir.path(), "none", &fixture)?;
+    let key = fixture.key(IDS_2K.end).to_string();
+    let output = scan_run(
+        &["--config", &config],
+        &key,
+        &TestScan::default(),
+        None,
+        None,
+    );
+    assert_exit(&output, EXIT_OK);
+    let (rows, call) = scan_lines(&output, TABLE_A, &key);
+    assert!(rows.is_empty());
+    assert_eq!(call["rows"], Json::from(0));
+    assert!(call.get("next").is_none(), "{call}");
+    Ok(())
+}
+
+/// `get` of an ordered table and `scan` of a key-value one are usage
+/// errors found from the configuration, before the load: with every data
+/// file gone, so a load fails with exit 1, each exits 64 with a hint
+/// naming the command that reads the table.
+#[tokio::test]
+async fn test_get_of_an_ordered_table_and_scan_of_a_key_value_one_are_usage_errors() -> TestResult {
+    let ordered_dir = tempfile::tempdir()?;
+    let ordered =
+        local_fixture(ordered_dir.path(), ordered_spec("events_kind", ORDER_STEP)).await?;
+    let config = ordered_config(ordered_dir.path(), "kind", &ordered)?;
+    assert!(remove_data_files(ordered_dir.path())? > 0);
+    let key = ordered.key(SAMPLE[1]).to_string();
+    let get = run(&["get", "--config", &config, &key], &[]);
+    assert_exit(&get, EXIT_USAGE);
+    assert!(get.stdout.is_empty());
+    assert!(assert_plain_error(&get), "the hint names scan");
+    let located_get = run(
+        &[
+            "get",
+            "--location",
+            ordered.metadata_location(),
+            "--order-column",
+            ORDER_COLUMN,
+            &key,
+        ],
+        &[],
+    );
+    assert_exit(&located_get, EXIT_USAGE);
+    let scan_ordered = scan_run(
+        &["--config", &config],
+        &key,
+        &TestScan::default(),
+        None,
+        None,
+    );
+    assert_exit(&scan_ordered, EXIT_FAILURE);
+
+    let kv_dir = tempfile::tempdir()?;
+    let kv = local_fixture(kv_dir.path(), FixtureSpec::small("kv_kind", KeyType::Long)).await?;
+    assert!(remove_data_files(kv_dir.path())? > 0);
+    let key = kv.key(SAMPLE[0]).to_string();
+    let scan = scan_run(&location(&kv), &key, &TestScan::default(), None, None);
+    assert_exit(&scan, EXIT_USAGE);
+    assert!(scan.stdout.is_empty());
+    assert!(assert_plain_error(&scan), "the hint names get");
+    Ok(())
+}
+
+/// Every fault of a `scan` request that needs no data file is a usage
+/// error before the load: a direction or a limit clap does not take, a
+/// limit of 0 or above the table's `max_scan_rows`, a bound or a key that
+/// is not text of the table's type, and an empty window. With every data
+/// file gone, the same request without its fault exits 1, so each 64 came
+/// before the load.
+#[tokio::test]
+async fn test_scan_refuses_a_bad_direction_limit_bound_or_key_before_the_load() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let fixture = local_fixture(dir.path(), ordered_spec("events_bad", ORDER_STEP)).await?;
+    let config = ordered_config(dir.path(), "bad", &fixture)?;
+    assert!(remove_data_files(dir.path())? > 0);
+    let key = fixture.key(SAMPLE[1]).to_string();
+    let above = (DEFAULT_MAX_SCAN_ROWS + 1).to_string();
+    let start = ORDER_START.to_string();
+    let base = ["scan", "--config", config.as_str()];
+    let cases: [(&[&str], bool); 9] = [
+        (&["--direction", "up", "--limit", "1", &key], false),
+        (&["--direction", "newest", "--limit", "x", &key], false),
+        (&["--direction", "newest", "--limit", "0", &key], false),
+        (&["--direction", "newest", "--limit", &above, &key], false),
+        (
+            &[
+                "--direction",
+                "newest",
+                "--limit",
+                "1",
+                "--start",
+                "abc",
+                &key,
+            ],
+            true,
+        ),
+        (
+            &[
+                "--direction",
+                "oldest",
+                "--limit",
+                "1",
+                "--before",
+                "1.5",
+                &key,
+            ],
+            true,
+        ),
+        (
+            &[
+                "--direction",
+                "oldest",
+                "--limit",
+                "1",
+                "--start",
+                &start,
+                "--before",
+                &start,
+                &key,
+            ],
+            false,
+        ),
+        (&["--direction", "newest", "--limit", "1", "abc"], true),
+        (&["--direction", "newest", "--limit", "1"], false),
+    ];
+    for (extra, hinted) in cases {
+        let output = run(&[&base[..], extra].concat(), &[]);
+        assert_exit(&output, EXIT_USAGE);
+        assert!(output.stdout.is_empty(), "{extra:?}");
+        if hinted {
+            assert!(
+                assert_plain_error(&output),
+                "{extra:?}: the form is the hint"
+            );
+        }
+    }
+    let unloadable = run(
+        &[&base[..], &["--direction", "newest", "--limit", "1", &key]].concat(),
+        &[],
+    );
+    assert_exit(&unloadable, EXIT_FAILURE);
+    Ok(())
+}
+
+/// A `scan` whose lines carry a long order value past 2^53, on a `row`
+/// line or as `next`, logs the one warning for its table on stderr, and
+/// one whose values stay within it logs none; stdout carries the exact
+/// number either way.
+#[tokio::test]
+async fn test_scan_warns_when_a_line_carries_an_order_past_2_pow_53() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    for (name, last, warns) in [
+        ("scan_at_limit", EXACT_ORDER, false),
+        ("scan_past_limit", EXACT_ORDER + 1, true),
+    ] {
+        let fixture = nanosecond_fixture(dir.path(), name, last).await?;
+        let config = ordered_config(dir.path(), name, &fixture)?;
+        let key = fixture.key(SAMPLE[1]).to_string();
+        let newest = TestScan {
+            limit: 1,
+            ..TestScan::default()
+        };
+        let output = scan_run(&["--config", &config], &key, &newest, None, None);
+        assert_exit(&output, EXIT_OK);
+        let expected: &[String] = if warns { &[TABLE_A.to_string()] } else { &[] };
+        assert_eq!(precision_warnings(&output), expected, "{name}");
+        let (rows, call) = scan_lines(&output, TABLE_A, &key);
+        assert_eq!(rows[0]["order"], Json::from(last), "{name}");
+        assert_eq!(call["next"], Json::from(last), "{name}");
+    }
     Ok(())
 }
 

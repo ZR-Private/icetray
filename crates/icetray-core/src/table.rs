@@ -1498,22 +1498,24 @@ impl Table {
             .ok_or_else(|| self.not_ready())
     }
 
-    /// The key type of the snapshot the ref names now, from that snapshot's
-    /// own schema, with no data file read: a table root's version hint and
+    /// The layout of the snapshot the ref names now, its key type and an
+    /// ordered table's order type among it, from that snapshot's own
+    /// schema, with no data file read: a table root's version hint and
     /// metadata file, a metadata file alone, or one catalog call. What a
-    /// caller parses command-line keys under before it pays for a `load`.
-    /// The schema and partition-spec faults a load would refuse are refused
-    /// here first, as the load refuses them. A load afterward resolves the
-    /// source again, and a key of a type its generation no longer has is
-    /// refused at lookup as `Error::KeyType`. Serialized with `load` and
-    /// `refresh`, and bounded as a load from nothing is.
-    pub async fn resolve_key_type(&self) -> Result<KeyType> {
+    /// caller parses command-line keys and bounds under before it pays for
+    /// a `load`. The schema and partition-spec faults a load would refuse
+    /// are refused here first, as the load refuses them. A load afterward
+    /// resolves the source again, and a key of a type its generation no
+    /// longer has is refused at lookup as `Error::KeyType`, a bound of
+    /// another variant at Scan as `Error::ScanRequest`. Serialized with
+    /// `load` and `refresh`, and bounded as a load from nothing is.
+    pub async fn resolve_layout(&self) -> Result<TableLayout> {
         let _serialized = self.serial.lock().await;
         self.within_deadline(async {
             let resolved = self.source.resolve(&self.storage).await?;
             let snapshot = self.ref_snapshot(&resolved)?;
             let config = self.config.load();
-            Ok(TableLayout::for_entry(&config, &resolved, &snapshot)?.key_type)
+            Ok(TableLayout::for_entry(&config, &resolved, &snapshot)?)
         })
         .await
         .map_err(|failed| *failed.error)
@@ -3175,13 +3177,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_resolve_key_type_reads_the_metadata_alone_and_loads_nothing() {
+    async fn test_resolve_layout_reads_the_metadata_alone_and_loads_nothing() {
         let (fixture, _) = two_bucket_table().await;
         let table = table_over(&fixture, fixture.config(Residency::Full, None)).await;
-        assert_eq!(table.resolve_key_type().await.unwrap(), KeyType::Long);
+        let layout = table.resolve_layout().await.unwrap();
+        assert_eq!(layout.key_type, KeyType::Long);
+        assert_eq!(layout.order, None, "a key-value table has no order column");
         assert_eq!(fixture.gets(), RESOLVE_GETS, "no data file is read");
         assert!(table.current().is_none());
         assert!(matches!(table.state(), TableState::Loading));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_layout_gives_an_ordered_table_s_order_type_before_any_load() {
+        let rows = ordered_rows(&[KEY_STEP], SCAN_ROWS_PER_KEY);
+        let (ordered, _fixture, _gauged) =
+            unloaded_ordered_table_over(&[&rows], WriterLayout::contract(), DEFAULT_BATCH_FAN_OUT)
+                .await;
+        let layout = ordered.resolve_layout().await.unwrap();
+        assert_eq!(
+            layout.order.map(|order| order.order_type),
+            Some(crate::order::OrderType::Long)
+        );
+        assert!(ordered.current().is_none());
     }
 
     #[tokio::test]

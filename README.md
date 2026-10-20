@@ -151,9 +151,18 @@ and one for the order column, as in this `Scan` request:
 }
 ```
 
+`icetray scan` runs the same `Scan` from the command line and prints each
+row as a JSON line, then a line whose `next` is passed back as `--before`
+for the next page:
+
+```sh
+icetray scan --config icetray.toml --table events --direction newest --limit 100 --column payload 42
+```
+
 [Ordered tables](docs/table-layout.md#ordered-tables) covers the writer
-recipe, and [Calling icetray](docs/calling.md#reading-an-ordered-table)
-the calls and paging.
+recipe, [Calling icetray](docs/calling.md#reading-an-ordered-table) the
+calls and paging, and [the command line](docs/configuration.md#the-command-line)
+`scan`'s flags and lines.
 
 ### Every response comes from one published snapshot
 

@@ -9,16 +9,18 @@ use std::fmt;
 use std::io::Write as _;
 
 use base64::Engine as _;
+use bytes::Bytes;
 use icetray_core::generation::{Lookup, Row};
 use icetray_core::{
-    ErrorKind, FileReport, Finding, Key, OrderValue, RefusalReason, SnapshotId, TableSummary,
-    Unwalked,
+    ErrorKind, FileReport, Finding, Key, OrderValue, RefusalReason, ScanLookup, ScanRow,
+    SnapshotId, TableSummary, Unwalked,
 };
 use serde::Serialize;
 use serde::ser::SerializeMap as _;
 
 use crate::error::CliError;
 use crate::key_text;
+use crate::order_text::OrderText;
 
 /// The kind of a line, its first key: the thing the line describes.
 /// Serialized as the lowercase name.
@@ -38,6 +40,11 @@ pub enum Kind {
     Unwalked,
     /// One lookup of a `get` run, as `icetray_lookups_total` counts it.
     Lookup,
+    /// One row a `scan` run returned.
+    Row,
+    /// The Scan of a `scan` run, after its rows, as `icetray_scans_total`
+    /// counts it.
+    Scan,
 }
 
 /// A lookup's outcome as the `lookup` line carries it; the same two values
@@ -61,7 +68,7 @@ impl Presence {
     }
 }
 
-/// One value as a `lookup` line carries it: standard base64 with padding,
+/// One value as a `lookup` or `row` line carries it: standard base64 with padding,
 /// the text when its bytes are UTF-8, and its length.
 #[derive(Debug, Serialize)]
 pub struct ValueText {
@@ -89,6 +96,19 @@ impl ValueText {
 /// that order, a null value as JSON `null`.
 #[derive(Debug)]
 pub struct Values(Vec<(String, Option<ValueText>)>);
+
+impl Values {
+    /// `values`, one per column of `columns`, by name.
+    fn of(columns: &[&str], values: &[Option<Bytes>]) -> Self {
+        Self(
+            columns
+                .iter()
+                .zip(values)
+                .map(|(&column, value)| (column.to_string(), value.as_deref().map(ValueText::of)))
+                .collect(),
+        )
+    }
+}
 
 impl Serialize for Values {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -305,15 +325,7 @@ impl<'a> LookupLine<'a> {
         elapsed_micros: u64,
     ) -> Self {
         let values = match &lookup.row {
-            Row::Present(values) => Some(Values(
-                columns
-                    .iter()
-                    .zip(values)
-                    .map(|(&column, value)| {
-                        (column.to_string(), value.as_deref().map(ValueText::of))
-                    })
-                    .collect(),
-            )),
+            Row::Present(values) => Some(Values::of(columns, values)),
             Row::Absent => None,
         };
         Self {
@@ -322,6 +334,72 @@ impl<'a> LookupLine<'a> {
             key: key_text::text(key),
             presence: Presence::of(&lookup.row),
             values,
+            snapshot_id: lookup.snapshot_id,
+            gets,
+            elapsed_micros,
+        }
+    }
+}
+
+/// One row of a `scan` run, a `row` line: the key as `lookup` carries it,
+/// the row's order value as the doctor's `file` lines carry one, and its
+/// `values` by column name in the order named, as a `lookup` line's;
+/// `{}` when no column was named.
+#[derive(Debug, Serialize)]
+pub struct RowLine<'a> {
+    kind: Kind,
+    table: &'a str,
+    key: String,
+    order: &'a OrderValue,
+    values: Values,
+}
+
+impl<'a> RowLine<'a> {
+    /// The line for `row` of `key` on `table`, whose Scan named `columns`.
+    pub fn new(table: &'a str, key: &Key, columns: &[&str], row: &'a ScanRow) -> Self {
+        Self {
+            kind: Kind::Row,
+            table,
+            key: key_text::text(key),
+            order: &row.order,
+            values: Values::of(columns, &row.values),
+        }
+    }
+}
+
+/// The Scan of a `scan` run, a `scan` line after its `row` lines: the key,
+/// the rows returned, `next` when live rows remain past them, in the form
+/// `--start` and `--before` take (`OrderText`), the snapshot answered from,
+/// the GETs the Scan issued, and the time it took.
+#[derive(Debug, Serialize)]
+pub struct ScanLine<'a> {
+    kind: Kind,
+    table: &'a str,
+    key: String,
+    rows: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next: Option<OrderText<'a>>,
+    snapshot_id: SnapshotId,
+    gets: u64,
+    elapsed_micros: u64,
+}
+
+impl<'a> ScanLine<'a> {
+    /// The line for `lookup`, a Scan of `key` on `table` that issued `gets`
+    /// GETs and took `elapsed_micros`.
+    pub fn new(
+        table: &'a str,
+        key: &Key,
+        lookup: &'a ScanLookup,
+        gets: u64,
+        elapsed_micros: u64,
+    ) -> Self {
+        Self {
+            kind: Kind::Scan,
+            table,
+            key: key_text::text(key),
+            rows: lookup.scanned.rows.len(),
+            next: lookup.scanned.next.as_ref().map(OrderText),
             snapshot_id: lookup.snapshot_id,
             gets,
             elapsed_micros,
@@ -345,26 +423,38 @@ fn loses_precision_as_json(order: &OrderValue) -> bool {
     }
 }
 
-/// Whether any of `files`' `file` lines carries a long order value that
-/// `loses_precision_as_json`. Only a `file` line carries an order value: no
-/// other line of `doctor` or `info` does.
-fn carries_inexact_order(files: &[FileReport]) -> bool {
+/// The order values `files`' `file` lines carry, each file's least and
+/// greatest. Of the lines of `doctor` and `info`, only a `file` line
+/// carries one.
+pub fn file_orders(files: &[FileReport]) -> impl Iterator<Item = &OrderValue> {
     files
         .iter()
         .filter_map(|file| file.order.as_ref())
-        .any(|order| loses_precision_as_json(&order.min) || loses_precision_as_json(&order.max))
+        .flat_map(|order| [&order.min, &order.max])
+}
+
+/// The order values a `scan` run's lines carry: each `row` line's, and the
+/// `scan` line's `next`.
+pub fn scan_orders(lookup: &ScanLookup) -> impl Iterator<Item = &OrderValue> {
+    let scanned = &lookup.scanned;
+    scanned
+        .rows
+        .iter()
+        .map(|row| &row.order)
+        .chain(scanned.next.as_ref())
 }
 
 /// Writes the one warning of `table` on stderr, through the log stream, when
-/// its `file` lines carry a long order value past 2^53. A run calls it once
-/// per table, after printing the table's `file` lines, so each affected
-/// table is named once. It changes nothing on stdout.
-pub fn warn_if_inexact_order(table: &str, files: &[FileReport]) {
-    if carries_inexact_order(files) {
+/// `orders`, the order values of the lines a run printed for it, hold a
+/// long past 2^53 (`loses_precision_as_json`). A run calls it once per
+/// table, after printing the table's lines, so each affected table is
+/// named once. It changes nothing on stdout.
+pub fn warn_if_inexact_order<'a>(table: &str, orders: impl IntoIterator<Item = &'a OrderValue>) {
+    if orders.into_iter().any(loses_precision_as_json) {
         tracing::warn!(
             table,
             max_exact = MAX_EXACT_JSON_INTEGER,
-            "file lines carry order values past 2^53, which are exact as JSON text but lose precision in readers that parse numbers as doubles"
+            "lines carry order values past 2^53, which are exact as JSON text but lose precision in readers that parse numbers as doubles"
         );
     }
 }
@@ -728,6 +818,12 @@ mod tests {
             distinct_keys: DISTINCT_KEYS.to_vec(),
         });
         file
+    }
+
+    /// Whether `files`' order values hold one a double-parsing reader
+    /// rounds.
+    fn carries_inexact_order(files: &[FileReport]) -> bool {
+        file_orders(files).any(loses_precision_as_json)
     }
 
     #[test]

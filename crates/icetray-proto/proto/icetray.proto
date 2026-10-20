@@ -2,7 +2,7 @@
 // key's rows in order, over Apache Iceberg tables, served over gRPC.
 // Clients in any language are generated from this file; icetray ships no
 // hand-written client. icetray emits JSON only as the output of the
-// operator subcommands (`doctor`, `get`, `info`); the transport is
+// operator subcommands (`doctor`, `get`, `scan`, `info`); the transport is
 // protobuf over gRPC.
 //
 // Every comment states what a caller may rely on, never how the server

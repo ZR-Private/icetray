@@ -1,7 +1,7 @@
 //! The one binary. `serve` is the daemon: the gRPC service, the table
 //! lifecycle, the poll loop, and the twelve-factor surface of RFD 012.
-//! `doctor`, `get`, and `info` are one-shot subcommands that print JSON
-//! lines. This file parses the command line, raises the open-file limit,
+//! `doctor`, `get`, `scan`, and `info` are one-shot subcommands that print
+//! JSON lines. This file parses the command line, raises the open-file limit,
 //! builds the runtime, and turns the library's typed outcomes into exit
 //! codes; everything else is in the library.
 
@@ -83,6 +83,18 @@ async fn run(cli: Cli, raised: io::Result<u64>) -> ExitCode {
         } => {
             run_oneshot(&target, table, raised, |config, table| async move {
                 oneshot::get(&config, table.as_deref(), &columns, &keys)
+                    .await
+                    .map(|()| ExitCode::from(EXIT_OK))
+            })
+            .await
+        }
+        Command::Scan {
+            target,
+            table,
+            request,
+        } => {
+            run_oneshot(&target, table, raised, |config, table| async move {
+                oneshot::scan(&config, table.as_deref(), &request)
                     .await
                     .map(|()| ExitCode::from(EXIT_OK))
             })

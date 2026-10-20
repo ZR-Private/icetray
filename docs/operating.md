@@ -619,7 +619,7 @@ through settings, mounted files, and environment variables.
   container image, `ghcr.io/<owner>/icetray:<version>`, for both: the
   release binary on Ubuntu 24.04, running as the image's `ubuntu` user,
   uid 1000, with `icetray serve` as its command. The image also includes
-  `doctor`, `get`, and `info`. In the image's name, `<owner>` is the
+  `doctor`, `get`, `scan`, and `info`. In the image's name, `<owner>` is the
   GitHub owner of the repository that publishes the release, in lower
   case, and `<version>` is the release's tag without its `v`, such as
   `0.2.0`.

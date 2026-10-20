@@ -31,7 +31,16 @@ pub fn parse(text: &str, key_type: KeyType) -> Result<Key, KeyTextFault> {
                 text: text.to_string(),
             }),
         KeyType::String => Ok(Key::Str(text.to_string())),
-        KeyType::Binary => parse_hex(text).map(Key::Bytes),
+        KeyType::Binary => parse_hex(text)
+            .map(Key::Bytes)
+            .map_err(|fault| match fault {
+                HexFault::OddLength => KeyTextFault::OddHexLength {
+                    text: text.to_string(),
+                },
+                HexFault::NotHex => KeyTextFault::NotHex {
+                    text: text.to_string(),
+                },
+            }),
         KeyType::Uuid => uuid::Uuid::parse_str(text)
             .map(|uuid| Key::Uuid(uuid.into_bytes()))
             .map_err(|_| KeyTextFault::NotAUuid {
@@ -53,31 +62,40 @@ pub fn text(key: &Key) -> String {
     }
 }
 
-/// The bytes `text` spells in hex. The length is checked before the digits,
-/// so `abc` is an odd length and `zz` is not hex. Every byte of a pair must
-/// be a hex digit before the pair is converted: `u8::from_str_radix` accepts
-/// a leading `+`, which is not hex.
-fn parse_hex(text: &str) -> Result<Vec<u8>, KeyTextFault> {
+/// Why text is not bytes in hex (`parse_hex`); the caller names the text
+/// and what it was for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum HexFault {
+    /// An odd number of digits, so a byte is half given.
+    #[error("an odd number of hex digits")]
+    OddLength,
+    /// A character that is not a hex digit.
+    #[error("not hex")]
+    NotHex,
+}
+
+/// The bytes `text` spells in hex, lowercase or uppercase, with or without
+/// a `0x` prefix: the form of a binary key and of a binary or fixed order
+/// value. The length is checked before the digits, so `abc` is an odd
+/// length and `zz` is not hex. Every byte of a pair must be a hex digit
+/// before the pair is converted: `u8::from_str_radix` accepts a leading
+/// `+`, which is not hex.
+pub(crate) fn parse_hex(text: &str) -> Result<Vec<u8>, HexFault> {
     let hex = HEX_PREFIXES
         .iter()
         .find_map(|prefix| text.strip_prefix(prefix))
         .unwrap_or(text);
     if !hex.len().is_multiple_of(HEX_DIGITS_PER_BYTE) {
-        return Err(KeyTextFault::OddHexLength {
-            text: text.to_string(),
-        });
+        return Err(HexFault::OddLength);
     }
-    let not_hex = || KeyTextFault::NotHex {
-        text: text.to_string(),
-    };
     hex.as_bytes()
         .chunks(HEX_DIGITS_PER_BYTE)
         .map(|pair| {
             if !pair.iter().all(u8::is_ascii_hexdigit) {
-                return Err(not_hex());
+                return Err(HexFault::NotHex);
             }
-            let digits = std::str::from_utf8(pair).map_err(|_| not_hex())?;
-            u8::from_str_radix(digits, HEX_RADIX).map_err(|_| not_hex())
+            let digits = std::str::from_utf8(pair).map_err(|_| HexFault::NotHex)?;
+            u8::from_str_radix(digits, HEX_RADIX).map_err(|_| HexFault::NotHex)
         })
         .collect()
 }

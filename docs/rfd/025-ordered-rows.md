@@ -14,6 +14,19 @@
 > message names no `max_scan_rows`; a limit above `max_scan_rows` stays
 > a fault the table's configuration finds.
 
+> Updated 2026-10-20: `icetray scan` runs one Scan from the command line
+> through the same checks, a wrong-kind table refused from its
+> configuration before any load, and `get` of an ordered table likewise.
+> Its bounds and its printed `next` take one text form per order type: a
+> time type as a long in Iceberg's unit, as the wire carries it, rather
+> than ISO-8601 text, whose years stop at 9999 while a microsecond
+> column's longs reach about 292,000 years from the epoch, and which
+> would give `timestamp` and `timestamptz` different forms; and a string
+> as its text with a backslash written `\\` and a zero byte `\0`, since
+> no argument holds the zero byte an oldest-first `next` ends in. The
+> command does not apply `server.max_scan_bytes`, which bounds a gRPC
+> response.
+
 ## Problem
 
 icetray serves tables with at most one row per key, and that remains its
