@@ -105,9 +105,9 @@ table = "profiles"
 | `max_in_flight` | count | `1024` | The most `Get`, `MultiGet`, `Scan`, and `MultiScan` calls in flight at once. icetray refuses one more immediately with `RESOURCE_EXHAUSTED`; calls are never queued. |
 | `max_multi_get_values` | count | `1000` | The most values one `MultiGet` may request: its keys times the columns it requests, a presence-only request counting one per key. icetray rejects a larger request with `INVALID_ARGUMENT` before any lookup. Zero is invalid, as `server.max_multi_get_values 0 is not above zero`. |
 | `batch_fan_out` | count | `64` | The most GETs one `MultiGet`, `Scan`, or `MultiScan` holds in flight at once, across every key and column it requests. Each GET holds one slot until it ends: for a lookup, a key page under `bloom`, a value page, or a dictionary page; for a `Scan`, a span of pages, a dictionary page, or a key page under `bloom`. A page served from the page cache or the scan cache takes none. When a batch needs more GETs than this, icetray issues the rest as slots free. Each GET has at most one hedge beside it. Above about 128, a cold batch against S3 gets no faster ([Performance and tuning](performance.md#multiget-fan-out)). Zero is invalid, as `server.batch_fan_out 0 is not above zero`. |
-| `max_multi_scan_values` | count | `4000` | The most values one `MultiScan` may request: its keys times its limit times one more than its requested columns. icetray rejects a larger call with `INVALID_ARGUMENT` before it reads any key. Zero is invalid, as `server.max_multi_scan_values 0 is not above zero`. |
+| `max_multi_scan_values` | count | `4000` | The most values one `MultiScan` may request: its keys times its limit times one more than its requested columns. icetray rejects a larger call with `INVALID_ARGUMENT` before it reads any key. Zero is invalid, as `server.max_multi_scan_values 0 is not above zero`, and so is a value below twice any ordered table's `max_scan_rows`, defaulted ones included, as `server.max_multi_scan_values 1000 is below twice tables[0].max_scan_rows 1000, so a MultiScan of one key at the full limit and one column would be refused`. |
 | `max_scan_bytes` | bytes | `4194304` (4 MiB) | The most bytes one `Scan` or `MultiScan` response may encode to, the default being a gRPC client's default limit on a message it receives. icetray measures the response it would send and refuses a larger one with `FAILED_PRECONDITION`, sending no rows and naming the size, the bound, and the rows (`Scan`) or leading keys' results (`MultiScan`) that would fit; a `Scan` counts as an `error` in `icetray_scans_total`, and a `MultiScan` counts each key it read as one. `TableInfo` reports it in `max_scan_bytes` for every ordered table. An owner whose clients accept larger messages raises it. Like every setting outside `[[tables]]`, a change applies on restart. Zero is invalid, as `server.max_scan_bytes 0 is not above zero`. |
-| `scan_deadline` | duration | `"5s"` | The longest a `Scan` may run, and the longest each GET of it, span or key page, may run. Past it the call fails with `DEADLINE_EXCEEDED`. |
+| `scan_deadline` | duration | `"5s"` | The longest a `Scan` may run, and the longest each GET of any Scan, span or key page, may run, in a `MultiScan` too. Past it the call fails with `DEADLINE_EXCEEDED`. |
 | `multi_scan_deadline` | duration | `"15s"` | The longest a whole `MultiScan` may run, whatever its size. |
 | `scan_page_cache_bytes` | bytes | `268435456` (256 MiB) | The memory budget of the cache for the pages an ordered table's span GETs fetch. It is separate from `page_cache_bytes` and never spills to the disk level, so a scan evicts only other scans' pages. Its minimum is `page_cache_bytes`'s, as the note below states it. |
 | `load_deadline` | duration | `"30m"` | The longest a build may run while no generation of the table is serving: a first load, or a retry after one failed. |
@@ -661,13 +661,13 @@ kind makes a new version, which this page will name. Before 1.0.0,
 version 1 changes in place with any release
 ([Stability](../CONTRIBUTING.md#stability)).
 
-Two conventions hold for every line:
+Three conventions hold for the lines below:
 
 - A snapshot id is a decimal string, `"7128216514704790069"`, because an
   id above 2^53 loses digits as a JSON number in most readers.
 - A key that does not apply is `null` rather than absent, except where a
   line kind below says otherwise, as the `table` line does for `order`
-  and `lookup_cost`.
+  and `lookup_cost`, and the `file` line for `order`.
 - An order value is a JSON number for an order type that travels as a
   long (`int`, `long`, `date`, and the timestamp types), in the type's
   unit; a JSON string for a `string` order column; and a string of `0x`

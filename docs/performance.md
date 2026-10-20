@@ -298,7 +298,8 @@ because the writer gave each file a 1 MiB filter whatever its key count.
 [Memory](operating.md#memory) turns these figures into a container memory
 limit: the predicted bytes for each table's residency, doubled for a
 table a refresh can rewrite wholesale or a reload can change, plus the
-page cache, plus a third of that total for the process.
+page cache and, on a replica serving an ordered table, the scan cache,
+plus a third of that total for the process.
 
 ## The page cache
 

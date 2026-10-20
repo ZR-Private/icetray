@@ -6,6 +6,9 @@
 > Updated 2026-10-04: a plan is deleted once its work has landed, so
 > `docs/plans/` is often absent.
 
+> Updated 2026-10-19: a setting's default is left to the configuration
+> reference unless the value is itself the decision.
+
 ## Problem
 
 Decisions in a small project get made in conversation, often with an AI

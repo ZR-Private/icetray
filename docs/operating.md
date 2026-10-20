@@ -327,7 +327,9 @@ level.
   other value must be at least one 4 MiB block.
 
 `index_budget_bytes` bounds the chunk files of every table together, and
-icetray checks it when a load begins. icetray keeps the serving
+icetray checks it when a load begins and, for an ordered table with a
+`string` or `binary` order column, again as it writes each chunk file
+([Configuration](configuration.md#storagelocal)). icetray keeps the serving
 generation's chunk files until the new generation has swapped in, so a
 table rewritten wholesale needs about twice its steady footprint, which
 the doctor reports as `predicted.disk_bytes`.
@@ -616,7 +618,7 @@ through settings, mounted files, and environment variables.
   `doctor`, `get`, and `info`. In the image's name, `<owner>` is the
   GitHub owner of the repository that publishes the release, in lower
   case, and `<version>` is the release's tag without its `v`, such as
-  `0.1.0`.
+  `0.2.0`.
 - icetray reads the configuration path from `ICETRAY_CONFIG`, so a pod
   passes no flags. icetray reads TOML and JSON into the same schema. A
   container's configuration sets `listen` and `metrics_listen` to

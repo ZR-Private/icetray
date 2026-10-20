@@ -111,6 +111,11 @@ whose resident bytes exceed its `resident_budget_bytes`, or a load of
 `disk` tables whose chunk files would exceed
 `storage.local.index_budget_bytes`. A `full` table's resident bytes count
 its delete state at a bound taken from the manifests.
+For an ordered table with a `string` or `binary` order column, whose
+order fences the footer gives only by estimate, icetray checks again
+once the files are built: the exact resident bytes against
+`resident_budget_bytes`, and each chunk file at its exact length against
+`index_budget_bytes` before it writes it.
 `resident_budget_bytes` is configured in
 [`[[tables]]`](configuration.md#tables) and `index_budget_bytes` in
 [`[storage.local]`](configuration.md#storagelocal). A `disk` table

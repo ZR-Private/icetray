@@ -1,5 +1,8 @@
 # Ordered scan costs and the key-value path beside them
 
+> Updated 2026-10-20: the Scan answer this analysis checks for `more` now
+> carries `next`, the bound of the next page, in its place.
+
 Measured 2026-10-13 on one Apple M3 Pro, with an allocation fix measured
 again on 2026-10-14. The measurement answers two questions RFD 025
 (Ordered rows per key) raises. First, whether the key-value path keeps

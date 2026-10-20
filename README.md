@@ -160,8 +160,8 @@ the calls and paging.
 When a writer moves the ref, icetray loads the new snapshot alongside the
 serving one, reuses the index of every unchanged data file, verifies the
 new files, and swaps the snapshot in atomically. Every response carries
-the id of the snapshot it was read from, and a `MultiGet` reads all of
-its keys from one snapshot. icetray refuses a snapshot it would serve
+the id of the snapshot it was read from, and a `MultiGet` or `MultiScan`
+reads all of its keys from one snapshot. icetray refuses a snapshot it would serve
 incorrectly, such as one with unsorted files, duplicate keys, or equality
 deletes, and keeps serving the last good snapshot.
 [Refresh and reload](docs/operating.md#refresh-and-reload) covers the
