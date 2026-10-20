@@ -1654,7 +1654,16 @@ pub enum RewriteTextFault {
     /// The halves make a rule the file would refuse, named as the text
     /// names them: `FROM` or `TO`.
     #[error("{} is empty", .0.half().to_ascii_uppercase())]
-    Rule(#[from] RewriteFault),
+    Rule(RewriteFault),
+}
+
+/// By hand, not `#[from]`: thiserror makes a `#[from]` field the error's
+/// `source()`, and a reporter that walks the chain would print the fault a
+/// second time under the variant's own message.
+impl From<RewriteFault> for RewriteTextFault {
+    fn from(fault: RewriteFault) -> Self {
+        Self::Rule(fault)
+    }
 }
 
 /// Why a rewrite rule is unusable (`RewriteRule::fault`).
@@ -4295,16 +4304,18 @@ locaton = "typo"
         }
     }
 
-    /// A file's rule names its empty half as the file's field, and text
-    /// as the `FROM=TO` the command line takes.
+    /// The text fault's message already names the empty half, so the fault
+    /// it carries is not also its source, which a chain would print again.
     #[test]
-    fn test_fmt_rewrite_fault_names_the_half_as_its_source_does() {
-        assert_eq!(RewriteFault::EmptyFrom.to_string(), "from is empty");
-        assert_eq!(RewriteFault::EmptyTo.to_string(), "to is empty");
-        let text = |text: &str| text.parse::<RewriteRule>().unwrap_err().to_string();
-        assert_eq!(text("=s3://b/"), "FROM is empty");
-        assert_eq!(text("s3://a/="), "TO is empty");
-        assert_eq!(text("no-separator"), "no = separates FROM from TO");
+    fn test_source_rewrite_text_fault_carries_no_source() {
+        for fault in [RewriteFault::EmptyFrom, RewriteFault::EmptyTo] {
+            let text_fault = RewriteTextFault::from(fault);
+            assert_eq!(text_fault, RewriteTextFault::Rule(fault));
+            assert!(
+                std::error::Error::source(&text_fault).is_none(),
+                "{fault:?}"
+            );
+        }
     }
 
     #[test]
