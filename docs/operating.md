@@ -332,7 +332,11 @@ icetray checks it when a load begins and, for an ordered table with a
 ([Configuration](configuration.md#storagelocal)). icetray keeps the serving
 generation's chunk files until the new generation has swapped in, so a
 table rewritten wholesale needs about twice its steady footprint, which
-the doctor reports as `predicted.disk_bytes`.
+the doctor reports as `predicted.disk_bytes`. A load that writes a chunk
+file over one already on disk counts that file's bytes twice until the
+load ends, so a load can be refused as `over_budget` when the budget is
+within about one chunk file of full; the chunk files never exceed the
+budget.
 
 A lookup in a `disk` table costs one local read and, on a cold hit, one
 GET per value column it requests. The local read is a memory copy while
