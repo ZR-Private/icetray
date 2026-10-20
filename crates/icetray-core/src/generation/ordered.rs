@@ -729,19 +729,29 @@ async fn refuse_duplicate_rows(
         .await
 }
 
+/// Where a merge of `refuse_duplicate_rows` stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Outcome {
+    /// It steps, or waits for its next step.
+    Running,
+    /// It failed or stopped.
+    Ended,
+    /// It passed, and so ended.
+    Passed,
+}
+
 /// The merges of `refuse_duplicate_rows`, in group order, between their
-/// steps: what each holds while it waits, whether it has ended, and the
-/// first that failed.
+/// steps: what each holds while it waits, where each stands, and the first
+/// that failed.
 struct Merges {
     /// Each merge's state between steps: `None` while it steps on the
     /// blocking pool, and once it has ended and dropped what it held.
     states: Vec<Option<MergeState>>,
     /// Each merge's `MergeState::stop`, which a step under way reads.
     stops: Vec<Arc<AtomicBool>>,
-    /// Whether each merge has ended: passed, failed, or stopped.
-    ended: Vec<bool>,
-    /// Whether each merge passed.
-    passed: Vec<bool>,
+    /// Where each merge stands, which `ReadAhead` reads when a read for it
+    /// lands.
+    outcomes: Vec<Outcome>,
     /// The location of each merge's first checked file, which names a
     /// canceled step of it.
     firsts: Vec<String>,
@@ -787,8 +797,7 @@ impl Merges {
             .collect();
         Self {
             stops: states.iter().map(|state| Arc::clone(&state.stop)).collect(),
-            ended: vec![false; states.len()],
-            passed: vec![false; states.len()],
+            outcomes: vec![Outcome::Running; states.len()],
             states: states.into_iter().map(Some).collect(),
             firsts,
             failed: None,
@@ -853,8 +862,11 @@ impl Merges {
         let before = self
             .failed
             .as_ref()
-            .map_or(self.passed.len(), |(at, _)| *at);
-        if !self.passed[..before].iter().all(|&passed| passed) {
+            .map_or(self.outcomes.len(), |(at, _)| *at);
+        if !self.outcomes[..before]
+            .iter()
+            .all(|&outcome| outcome == Outcome::Passed)
+        {
             return None;
         }
         Some(match self.failed.take() {
@@ -885,7 +897,8 @@ impl Merges {
     fn next_step(&mut self, ahead: &ReadAhead) -> Option<(usize, MergeState)> {
         let merge = self.states.iter().enumerate().position(|(merge, state)| {
             state.as_ref().is_some_and(|state| {
-                !self.ended[merge] && (state.waiting == 0 || !ahead.landed[merge].is_empty())
+                self.outcomes[merge] == Outcome::Running
+                    && (state.waiting == 0 || !ahead.landed[merge].is_empty())
             })
         })?;
         let state = self.states[merge]
@@ -897,7 +910,7 @@ impl Merges {
     /// Takes `one` as landed (`ReadAhead::land`), failing its merge when it
     /// failed.
     fn land(&mut self, one: Landed, ahead: &mut ReadAhead) {
-        if let Some((merge, error)) = ahead.land(one) {
+        if let Some((merge, error)) = ahead.land(one, &self.outcomes) {
             self.fail(merge, error, ahead);
         }
     }
@@ -916,7 +929,7 @@ impl Merges {
             Ok(stepped) => stepped,
             Err(LostStep { canceled, owned }) => {
                 ahead.release(owned);
-                if !self.ended[merge] {
+                if self.outcomes[merge] == Outcome::Running {
                     let error = Error::verify_canceled(&self.firsts[merge], canceled);
                     self.fail(merge, error, ahead);
                 }
@@ -924,7 +937,7 @@ impl Merges {
             }
         };
         self.states[merge] = Some(state);
-        if self.ended[merge] {
+        if self.outcomes[merge] != Outcome::Running {
             self.retire(merge, ahead);
             return;
         }
@@ -934,8 +947,8 @@ impl Merges {
                 if let Some(state) = &self.states[merge] {
                     self.compared += state.heads.compared;
                 }
-                self.passed[merge] = true;
                 self.end(merge, ahead);
+                self.outcomes[merge] = Outcome::Passed;
             }
             Ok(Progress::Stopped) => self.end(merge, ahead),
             Err(error) => self.fail(merge, error, ahead),
@@ -950,8 +963,8 @@ impl Merges {
             return;
         }
         self.failed = Some((merge, error));
-        for later in merge..self.ended.len() {
-            if !self.ended[later] {
+        for later in merge..self.outcomes.len() {
+            if self.outcomes[later] == Outcome::Running {
                 self.end(later, ahead);
             }
         }
@@ -962,7 +975,7 @@ impl Merges {
     /// holds is dropped, now when it waits between steps, else once its
     /// step returns.
     fn end(&mut self, merge: usize, ahead: &mut ReadAhead) {
-        self.ended[merge] = true;
+        self.outcomes[merge] = Outcome::Ended;
         self.stops[merge].store(true, atomic::Ordering::Relaxed);
         ahead.end(merge);
         self.retire(merge, ahead);
@@ -998,9 +1011,6 @@ struct ReadAhead {
     merges: Vec<Range<usize>>,
     /// Each cursor's merge.
     merge_of: Vec<usize>,
-    /// Whether each merge has ended, so that what is read for it is
-    /// dropped.
-    ended: Vec<bool>,
     /// Each cursor's row groups not yet read, in file order.
     unread: Vec<VecDeque<PairRead>>,
     /// How many of each cursor's row groups are read or being read.
@@ -1077,7 +1087,6 @@ impl ReadAhead {
                 .enumerate()
                 .flat_map(|(merge, reads)| std::iter::repeat_n(merge, reads.len()))
                 .collect(),
-            ended: vec![false; merges.len()],
             unread: reads
                 .iter()
                 .map(|(at, groups)| {
@@ -1148,18 +1157,20 @@ impl ReadAhead {
     }
 
     /// Takes `landed` as landed and starts the reads the slot it frees
-    /// lets start, while merges step. A read for a merge that has ended is
-    /// dropped, its bytes with it; a read that failed fails its merge, and
-    /// is that merge with its error.
-    fn land(&mut self, landed: Landed) -> Option<(usize, Error)> {
+    /// lets start, while merges step, each merge standing as `outcomes`
+    /// says. A read for a merge that has ended is dropped, its bytes with
+    /// it; a read that failed fails its merge, and is that merge with its
+    /// error.
+    fn land(&mut self, landed: Landed, outcomes: &[Outcome]) -> Option<(usize, Error)> {
         let merge = self.merge_of[landed.cursor];
+        let running = outcomes[merge] == Outcome::Running;
         let failed = match landed.read {
-            Some(Ok(chunks)) if !self.ended[merge] => {
+            Some(Ok(chunks)) if running => {
                 let cursor = landed.cursor - self.merges[merge].start;
                 self.landed[merge].push((cursor, landed.place, chunks));
                 None
             }
-            Some(Err(error)) if !self.ended[merge] => {
+            Some(Err(error)) if running => {
                 self.release(landed.bytes);
                 Some((merge, error))
             }
@@ -1176,7 +1187,6 @@ impl ReadAhead {
     /// row groups not yet read are not read, and its reads landed and not
     /// yet taken are dropped.
     fn end(&mut self, merge: usize) {
-        self.ended[merge] = true;
         for abort in self.aborts[merge].drain(..) {
             abort.abort();
         }
@@ -2719,7 +2729,10 @@ mod tests {
         ahead.start();
         assert_eq!(ahead.in_flight.len(), 2, "the wanted read and one ahead");
         let one = ahead.in_flight.next().await.unwrap();
-        assert!(ahead.land(one).is_none(), "the read succeeds");
+        assert!(
+            ahead.land(one, &[Outcome::Running]).is_none(),
+            "the read succeeds"
+        );
         assert_eq!(ahead.in_flight.len(), 2, "the freed slot starts a read");
         assert_eq!(
             ahead.issued[0], groups,
