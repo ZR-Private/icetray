@@ -1651,8 +1651,9 @@ pub enum RewriteTextFault {
     /// No `=` separates `FROM` from `TO`.
     #[error("no = separates FROM from TO")]
     NoSeparator,
-    /// The halves make a rule the file would refuse.
-    #[error(transparent)]
+    /// The halves make a rule the file would refuse, named as the text
+    /// names them: `FROM` or `TO`.
+    #[error("{} is empty", .0.half().to_ascii_uppercase())]
     Rule(#[from] RewriteFault),
 }
 
@@ -1665,6 +1666,16 @@ pub enum RewriteFault {
     /// The `to` prefix is empty.
     #[error("to is empty")]
     EmptyTo,
+}
+
+impl RewriteFault {
+    /// The field of the rule that is empty, as a file names it.
+    fn half(self) -> &'static str {
+        match self {
+            Self::EmptyFrom => "from",
+            Self::EmptyTo => "to",
+        }
+    }
 }
 
 /// The optional local directory (RFD 017, RFD 012): chunk files for disk
@@ -4276,6 +4287,18 @@ locaton = "typo"
         for (text, fault) in cases {
             assert_eq!(text.parse::<RewriteRule>(), Err(fault), "{text:?}");
         }
+    }
+
+    /// A file's rule names its empty half as the file's field, and text
+    /// as the `FROM=TO` the command line takes.
+    #[test]
+    fn test_fmt_rewrite_fault_names_the_half_as_its_source_does() {
+        assert_eq!(RewriteFault::EmptyFrom.to_string(), "from is empty");
+        assert_eq!(RewriteFault::EmptyTo.to_string(), "to is empty");
+        let text = |text: &str| text.parse::<RewriteRule>().unwrap_err().to_string();
+        assert_eq!(text("=s3://b/"), "FROM is empty");
+        assert_eq!(text("s3://a/="), "TO is empty");
+        assert_eq!(text("no-separator"), "no = separates FROM from TO");
     }
 
     #[test]
