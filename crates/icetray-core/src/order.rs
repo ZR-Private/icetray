@@ -40,7 +40,8 @@ pub enum OrderType {
     Fixed(u32),
 }
 
-/// Which `OrderValue` variant an order type's values travel as.
+/// Which `OrderValue` variant an order type's values travel as. Display
+/// gives its wire name, as the protobuf `OrderValue`'s oneof names it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum OrderVariant {
     /// `OrderValue::Long`: integer and time types.
@@ -49,6 +50,16 @@ pub enum OrderVariant {
     Str,
     /// `OrderValue::Bytes`: binary and fixed.
     Bin,
+}
+
+impl fmt::Display for OrderVariant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Long => "long",
+            Self::Str => "str",
+            Self::Bin => "bin",
+        })
+    }
 }
 
 /// Whether a file's order column holds the values its Iceberg type means
@@ -294,6 +305,15 @@ pub enum OrderValue {
 }
 
 impl OrderValue {
+    /// The variant this value travels as.
+    pub fn variant(&self) -> OrderVariant {
+        match self {
+            Self::Long(_) => OrderVariant::Long,
+            Self::Str(_) => OrderVariant::Str,
+            Self::Bytes(_) => OrderVariant::Bin,
+        }
+    }
+
     /// The least order value above this one, in the order a Scan compares
     /// them: one more for a long, and for a string or bytes the value with
     /// one zero byte appended, which sorts after it and before every other
@@ -533,6 +553,19 @@ mod tests {
         assert_eq!(OrderType::String.variant(), OrderVariant::Str);
         assert_eq!(OrderType::Binary.variant(), OrderVariant::Bin);
         assert_eq!(OrderType::Fixed(WIDTH).variant(), OrderVariant::Bin);
+    }
+
+    #[test]
+    fn test_variant_of_a_value_is_its_type_s_and_displays_as_the_oneof_names_it() {
+        let values = [
+            (OrderValue::Long(0), OrderType::Long, "long"),
+            (OrderValue::Str(String::new()), OrderType::String, "str"),
+            (OrderValue::Bytes(Vec::new()), OrderType::Binary, "bin"),
+        ];
+        for (value, order, name) in values {
+            assert_eq!(value.variant(), order.variant(), "{value}");
+            assert_eq!(value.variant().to_string(), name);
+        }
     }
 
     /// How `order` admits the one column of the Parquet schema `column`,

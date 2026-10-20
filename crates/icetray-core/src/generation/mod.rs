@@ -3420,6 +3420,7 @@ mod tests {
     use crate::local::testing as local_testing;
     use crate::manifest::UNBUCKETED;
     use crate::manifest::testing::{self as manifest_testing, DATA_DIR, Partition, unpartitioned};
+    use crate::storage::FILE_PREFIX;
     use crate::storage::testing::{MEM_PREFIX, MemStore};
 
     /// Snapshot `id` at `sequence` committed at `millis`, for
@@ -5985,7 +5986,7 @@ mod tests {
             .add_long_file("x", &keys_from(above, E2E_KEYS), 0)
             .await;
         let path = table.path_of("x");
-        let on_disk = std::path::Path::new(path.strip_prefix("file://").unwrap());
+        let on_disk = std::path::Path::new(path.strip_prefix(FILE_PREFIX).unwrap());
         let bytes = Bytes::from(std::fs::read(on_disk).unwrap());
         let metadata = ParquetMetaDataReader::new()
             .with_page_index_policy(PageIndexPolicy::Required)

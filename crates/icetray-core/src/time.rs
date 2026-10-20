@@ -19,6 +19,12 @@ pub fn micros(elapsed: Duration) -> u64 {
     u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)
 }
 
+/// Whole microseconds as an elapsed time: the inverse of `micros`, for a
+/// caller that stores a duration as that count and reads it back.
+pub fn from_micros(micros: u64) -> Duration {
+    Duration::from_micros(micros)
+}
+
 /// The wall clock now as a timestamp, for every caller that keeps time in
 /// `jiff`; a caller that needs "now" never names the clock itself. The one
 /// other read of the clock is `system_now`, for the SDK boundary.
@@ -181,6 +187,18 @@ mod tests {
             ONE_AND_A_HALF_SECONDS_MICROS
         );
         assert_eq!(super::micros(Duration::ZERO), 0);
+    }
+
+    #[test]
+    fn test_from_micros_reads_back_what_micros_gives() {
+        assert_eq!(
+            super::from_micros(ONE_AND_A_HALF_SECONDS_MICROS),
+            ONE_AND_A_HALF_SECONDS
+        );
+        assert_eq!(
+            super::from_micros(super::micros(ONE_AND_A_HALF_SECONDS)),
+            ONE_AND_A_HALF_SECONDS
+        );
     }
 
     /// One nanosecond short of a microsecond; truncates to 0.

@@ -1632,8 +1632,7 @@ impl std::str::FromStr for RewriteRule {
         };
         match rule.fault() {
             None => Ok(rule),
-            Some(RewriteFault::EmptyFrom) => Err(RewriteTextFault::EmptyFrom),
-            Some(RewriteFault::EmptyTo) => Err(RewriteTextFault::EmptyTo),
+            Some(fault) => Err(fault.into()),
         }
     }
 }
@@ -1645,20 +1644,16 @@ impl fmt::Display for RewriteRule {
     }
 }
 
-/// Why `FROM=TO` text is not a rewrite rule (`RewriteRule::from_str`): the
-/// faults `RewriteRule::fault` finds in a file's rule, named by the halves
-/// of the text.
+/// Why `FROM=TO` text is not a rewrite rule (`RewriteRule::from_str`): no
+/// separator, or a fault `RewriteRule::fault` finds in a file's rule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RewriteTextFault {
     /// No `=` separates `FROM` from `TO`.
     #[error("no = separates FROM from TO")]
     NoSeparator,
-    /// `FROM` is empty, so the rule would rewrite every location.
-    #[error("FROM is empty")]
-    EmptyFrom,
-    /// `TO` is empty, so every location it matches would become relative.
-    #[error("TO is empty")]
-    EmptyTo,
+    /// The halves make a rule the file would refuse.
+    #[error(transparent)]
+    Rule(#[from] RewriteFault),
 }
 
 /// Why a rewrite rule is unusable (`RewriteRule::fault`).
@@ -4274,9 +4269,9 @@ locaton = "typo"
     fn test_from_str_rewrite_rule_refuses_a_rule_the_file_would_refuse() {
         let cases = [
             ("no-separator", RewriteTextFault::NoSeparator),
-            ("=s3://b/", RewriteTextFault::EmptyFrom),
-            ("s3://a/=", RewriteTextFault::EmptyTo),
-            ("=", RewriteTextFault::EmptyFrom),
+            ("=s3://b/", RewriteTextFault::Rule(RewriteFault::EmptyFrom)),
+            ("s3://a/=", RewriteTextFault::Rule(RewriteFault::EmptyTo)),
+            ("=", RewriteTextFault::Rule(RewriteFault::EmptyFrom)),
         ];
         for (text, fault) in cases {
             assert_eq!(text.parse::<RewriteRule>(), Err(fault), "{text:?}");

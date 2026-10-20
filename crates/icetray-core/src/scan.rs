@@ -184,9 +184,7 @@ impl fmt::Display for ScanRequestFault {
                 got,
             } => write!(
                 f,
-                "{bound} is an order value of variant {}, not the table's variant, {}",
-                variant_name(*got),
-                variant_name(*expected)
+                "{bound} is an order value of variant {got}, not the table's variant, {expected}"
             ),
             Self::EmptyWindow => {
                 f.write_str("start is at or above before, so the window holds no order value")
@@ -210,24 +208,6 @@ impl fmt::Display for ScanRequestFault {
 /// `one` for a count of 1, else `many`.
 fn plural(count: usize, one: &'static str, many: &'static str) -> &'static str {
     if count == 1 { one } else { many }
-}
-
-/// The wire name of an order variant, as `OrderValue`'s oneof names it.
-fn variant_name(variant: OrderVariant) -> &'static str {
-    match variant {
-        OrderVariant::Long => "long",
-        OrderVariant::Str => "str",
-        OrderVariant::Bin => "bin",
-    }
-}
-
-/// The variant `value` travels as.
-fn variant_of(value: &OrderValue) -> OrderVariant {
-    match value {
-        OrderValue::Long(_) => OrderVariant::Long,
-        OrderValue::Str(_) => OrderVariant::Str,
-        OrderValue::Bytes(_) => OrderVariant::Bin,
-    }
 }
 
 /// The limit `bounds` asks for, checked against `max_scan_rows`: a limit of
@@ -258,12 +238,12 @@ pub(crate) fn check_bounds(
         (BoundSide::Before, &bounds.before),
     ] {
         if let Some(bound) = bound
-            && variant_of(bound) != expected
+            && bound.variant() != expected
         {
             return Err(ScanRequestFault::BoundVariant {
                 bound: side,
                 expected,
-                got: variant_of(bound),
+                got: bound.variant(),
             });
         }
     }

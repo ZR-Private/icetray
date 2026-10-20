@@ -7618,7 +7618,7 @@ mod tests {
         let ((), series) = recorded(async {
             let (table, fixture, _gauged, keys) = two_keys_in_two_files().await;
             let path = fixture.path_of("f1");
-            std::fs::remove_file(path.strip_prefix("file://").unwrap()).unwrap();
+            std::fs::remove_file(path.strip_prefix(FILE_PREFIX).unwrap()).unwrap();
             let bounds = ScanBounds {
                 limit: u32::try_from(SCAN_ROWS_PER_KEY).unwrap(),
                 ..oldest_first()
@@ -7921,7 +7921,7 @@ mod tests {
             let mut call = Box::pin(table.multi_scan(&keys, &BOTH_READS, &bounds));
             let runs = until_only_the_cold_key_waits(&table, &gauged, &mut call).await;
             let path = fixture.path_of("f1");
-            std::fs::remove_file(path.strip_prefix("file://").unwrap()).unwrap();
+            std::fs::remove_file(path.strip_prefix(FILE_PREFIX).unwrap()).unwrap();
             gauged.release();
             let failed = call.await;
             let Err(Error::Cache(CacheError::Fetch(failed))) = failed else {

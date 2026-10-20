@@ -1826,14 +1826,16 @@ fn distinct_mins_ratio(metadata: &ParquetMetaData, key_leaf: usize, fences: &[Ve
     let Some(index) = metadata.column_index() else {
         return DISTINCT_MINS_UNOBSERVABLE;
     };
-    let (mut pages, mut distinct, mut first_keys) = (0, 0, 0);
+    let (mut distinct, mut first_keys) = (0, 0);
     for (columns, group_fences) in index.iter().zip(fences) {
-        let (listed, different) = match columns.get(key_leaf) {
-            Some(ColumnIndexMetaData::INT64(native)) => tally(native.min_values_iter().flatten()),
+        distinct += match columns.get(key_leaf) {
+            Some(ColumnIndexMetaData::INT64(native)) => {
+                distinct_count(native.min_values_iter().flatten())
+            }
             Some(
                 ColumnIndexMetaData::BYTE_ARRAY(bytes)
                 | ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(bytes),
-            ) => tally(bytes.min_values_iter().flatten()),
+            ) => distinct_count(bytes.min_values_iter().flatten()),
             Some(
                 ColumnIndexMetaData::NONE
                 | ColumnIndexMetaData::BOOLEAN(_)
@@ -1844,22 +1846,19 @@ fn distinct_mins_ratio(metadata: &ParquetMetaData, key_leaf: usize, fences: &[Ve
             )
             | None => continue,
         };
-        pages += listed;
-        distinct += different;
-        first_keys += group_fences.iter().collect::<BTreeSet<_>>().len();
+        first_keys += distinct_count(group_fences.iter());
     }
-    if pages == 0 {
+    if distinct == 0 {
         DISTINCT_MINS_UNOBSERVABLE
     } else {
         approx::ratio(approx::count(distinct), approx::count(first_keys))
     }
 }
 
-/// How many of `mins` there are, and how many of them differ.
-fn tally<T: Ord>(mins: impl Iterator<Item = T>) -> (usize, usize) {
-    let mins: Vec<T> = mins.collect();
-    let distinct = mins.iter().collect::<BTreeSet<_>>().len();
-    (mins.len(), distinct)
+/// How many of `values` differ: none exactly when there are none, as for
+/// an index that lists no page.
+fn distinct_count<T: Ord>(values: impl Iterator<Item = T>) -> usize {
+    values.collect::<BTreeSet<_>>().len()
 }
 
 /// Whether the manifest's key bounds are present and not truncated: both
@@ -2462,6 +2461,7 @@ mod tests {
     use crate::manifest::testing::{
         KEY_COLUMN, Partition, VALUE_COLUMN, bucket_spec, unpartitioned,
     };
+    use crate::storage::FILE_PREFIX;
 
     /// A bucket count beside the fixture's `TWO`.
     const ONE: u32 = 1;
@@ -4504,7 +4504,7 @@ mod tests {
     async fn test_examine_leaves_a_column_unwalked_when_its_page_read_fails() {
         let (table, generation) = files_of_values(&[Some(b"\x08\x01")]).await;
         let path = table.path_of("f0");
-        std::fs::remove_file(path.strip_prefix("file://").unwrap()).unwrap();
+        std::fs::remove_file(path.strip_prefix(FILE_PREFIX).unwrap()).unwrap();
         let examined = examine(
             &generation,
             Level::Optimal,
