@@ -93,7 +93,7 @@ The first run of either downloads the Iceberg runtime from Maven
 Central. The groups together are about 4.4 GB, most of it the two
 tables of 16 KiB values.
 
-A full run leaves out one more group, `reference`: four ordered tables
+A full run leaves out one more group, `reference`: five ordered tables
 near a production table's size, which `--only reference` writes. Each
 holds 200,000 long keys in 64 buckets and about 20 million rows: most
 keys hold 1 to 20 rows, about one in ten holds hundreds, and about one in
@@ -101,21 +101,29 @@ keys hold 1 to 20 rows, about one in ten holds hundreds, and about one in
 instant, and its value 128 bytes of hex digests; the testkit's
 `golden.rs` derives every row from its key's index, and the tests read
 the key count from the table property `golden.reference-keys`. Spark
-writes each table as an initial load and four appends of later rows of
-some keys, then `ref_compacted`, `ref_string`, and `ref_large_files`
-compact it with a sort by key and order value:
+writes each table as an initial load and appends of later rows of some
+keys, four of them but in `ref_large_appended`, then `ref_compacted`,
+`ref_string`, and `ref_large_files` compact it with a sort by key and
+order value:
 
 - `ref_compacted`: the recipe's sizes, one file of one row group a bucket.
 - `ref_appended`: the writes uncompacted, five files a bucket.
 - `ref_string`: `ref_compacted` with each instant as ISO-8601 UTC text.
 - `ref_large_files`: row groups of 6 MiB, about four in each bucket's file.
+- `ref_large_appended`: the initial load in `ref_large_files`' sizes, then
+  eight appends uncompacted: nine files a bucket, 576 in all, the first
+  of three or four row groups and each append's of one, 2.2 GB, most of
+  the appends' bytes their 1 MiB bloom filters. A load's uniqueness
+  merges start a cursor on each of its files, more than the 512 reads a
+  load of four worker threads holds in flight.
 
 After each compaction the recipe expires the older snapshots and
 removes the files no snapshot lists, so a table root holds only its live
 files. On the 4-CPU, 8 GiB colima VM `dev/runtime.sh` starts, the group
-takes about four minutes, about a minute a table, and the warehouse grows
-by about 7 GB. The VM's disk also grows while Spark spills, and does not
-shrink, so keep about twice that free before writing the group.
+takes about five minutes, about a minute a table (`ref_large_appended`
+alone, `--only ref_large_appended`, about 50 seconds), and the warehouse
+grows by about 9 GB. The VM's disk also grows while Spark spills, and
+does not shrink, so keep about twice that free before writing the group.
 `--reference-keys` writes fewer keys for a quick run, and the tests
 derive the rows of whatever count the tables record; below the full size
 they check the advice as a floor and leave the row groups unchecked,

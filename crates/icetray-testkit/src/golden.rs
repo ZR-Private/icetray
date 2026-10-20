@@ -212,8 +212,15 @@ pub const LIGHT_ROWS: RangeInclusive<u64> = 1..=20;
 const APPEND_TAIL_DIVISOR: u64 = 5;
 
 /// The recipe's `APPEND_BATCHES`: the appends after a reference table's
-/// initial load, which split each key's tail evenly in order.
+/// initial load, which split each key's tail evenly in order, unless the
+/// table sets its own count (`OrderedRecipe::append_batches`).
 pub const APPEND_BATCHES: u64 = 4;
+
+/// The recipe's `LARGE_APPEND_BATCHES`: `ref_large_appended`'s appends,
+/// so that with its initial load's file each of its buckets holds nine
+/// files, and a load's uniqueness merges start more cursors than the reads
+/// a load of four worker threads holds in flight.
+pub const LARGE_APPEND_BATCHES: u64 = 8;
 
 /// The recipe's `TS_START`: 2026-01-01T00:00:00Z in microseconds, the
 /// earliest instant of a reference table, where the benchmark's tables of
@@ -309,11 +316,15 @@ pub enum GoldenTable {
     /// `ref_large_files`: `ref_compacted` with each bucket's file in row
     /// groups of about a quarter of it.
     RefLargeFiles,
+    /// `ref_large_appended`: the initial load in `ref_large_files`' sizes,
+    /// a file of several row groups a bucket, then `LARGE_APPEND_BATCHES`
+    /// appends, left uncompacted.
+    RefLargeAppended,
 }
 
 impl GoldenTable {
     /// Every table the recipe writes.
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 25] = [
         Self::Long2m,
         Self::Str2m,
         Self::Bin16_500k,
@@ -338,6 +349,7 @@ impl GoldenTable {
         Self::RefAppended,
         Self::RefString,
         Self::RefLargeFiles,
+        Self::RefLargeAppended,
     ];
 
     /// What the recipe writes the table as: every fact a test reads of it,
@@ -375,6 +387,9 @@ impl GoldenTable {
             Self::RefAppended => Spec::reference("ref_appended", long),
             Self::RefString => Spec::reference("ref_string", string),
             Self::RefLargeFiles => Spec::reference("ref_large_files", long),
+            Self::RefLargeAppended => {
+                Spec::reference("ref_large_appended", long).appended_in(LARGE_APPEND_BATCHES)
+            }
         }
     }
 
@@ -456,6 +471,10 @@ pub struct OrderedRecipe {
     /// Whether the recipe's `reference` group writes the table: its keys'
     /// rows are `reference_rows_of` rows at `reference_ts`.
     pub reference: bool,
+    /// The appends after a reference table's initial load, which split
+    /// each key's tail (`reference_writes`); zero outside the `reference`
+    /// group.
+    pub append_batches: u64,
 }
 
 /// The recipe's key expression of an ordered table.
@@ -495,13 +514,15 @@ impl GoldenSpec {
                 merged: false,
                 appended: false,
                 reference: false,
+                append_batches: 0,
             }),
             ..Self::kv(name, KeyType::Long, FOUR_BUCKETS, ROWS_100K)
         }
     }
 
     /// A table of the `reference` group, of long keys in
-    /// `REFERENCE_BUCKETS` buckets.
+    /// `REFERENCE_BUCKETS` buckets, written in `APPEND_BATCHES` appends
+    /// after its initial load.
     const fn reference(name: &'static str, kind: OrderKind) -> Self {
         Self {
             order: Some(OrderedRecipe {
@@ -510,6 +531,7 @@ impl GoldenSpec {
                 merged: false,
                 appended: false,
                 reference: true,
+                append_batches: APPEND_BATCHES,
             }),
             ..Self::kv(name, KeyType::Long, REFERENCE_BUCKETS, REFERENCE_ROWS)
         }
@@ -529,6 +551,15 @@ impl GoldenSpec {
     const fn appended(mut self) -> Self {
         if let Some(order) = &mut self.order {
             order.appended = true;
+        }
+        self
+    }
+
+    /// This reference table written in `batches` appends after its
+    /// initial load.
+    const fn appended_in(mut self, batches: u64) -> Self {
+        if let Some(order) = &mut self.order {
+            order.append_batches = batches;
         }
         self
     }
@@ -904,11 +935,12 @@ pub fn reference_tier_sample(keys: u64, tier: RowsTier, count: usize) -> Vec<u64
         .collect()
 }
 
-/// The key indexes below `keys` whose Scans a reference table is checked
-/// on: the first `REFERENCE_TIER_SAMPLES` keys of each tier, the heaviest,
-/// the last key, the first key with no appended rows, with rows in some
-/// appends only, and with rows in every append, and `extra`.
-pub fn reference_sample(keys: u64, extra: &BTreeSet<u64>) -> BTreeSet<u64> {
+/// The key indexes below `keys` whose Scans reference table `table` is
+/// checked on: the first `REFERENCE_TIER_SAMPLES` keys of each tier, the
+/// heaviest, the last key, the first key with no appended rows, with rows
+/// in some of its appends only, and with rows in every append, and
+/// `extra`.
+pub fn reference_sample(table: GoldenTable, keys: u64, extra: &BTreeSet<u64>) -> BTreeSet<u64> {
     let mut sample: BTreeSet<u64> = RowsTier::ALL
         .into_iter()
         .flat_map(|tier| reference_tier_sample(keys, tier, REFERENCE_TIER_SAMPLES))
@@ -916,7 +948,7 @@ pub fn reference_sample(keys: u64, extra: &BTreeSet<u64>) -> BTreeSet<u64> {
     sample.extend(REFERENCE_HEAVIEST_IDS.iter().filter(|&&id| id < keys));
     sample.insert(keys - 1);
     let appended = |id: u64| -> Vec<bool> {
-        reference_writes(id)[1..]
+        reference_writes(table, id)[1..]
             .iter()
             .map(|write| !write.is_empty())
             .collect()
@@ -995,15 +1027,18 @@ pub fn reference_rows(keys: u64) -> u64 {
 }
 
 /// The recipe's `reference_insert` ranges: the half-open row indexes of
-/// the key at key index `id` that each write holds, the initial load first
-/// and then each of the `APPEND_BATCHES` appends. An append's range is
-/// empty for a key whose tail it holds none of.
-pub fn reference_writes(id: u64) -> Vec<Range<u64>> {
+/// the key at key index `id` of reference table `table` that each write
+/// holds, the initial load first and then each of the table's appends
+/// (`OrderedRecipe::append_batches`). An append's range is empty for a key
+/// whose tail it holds none of.
+pub fn reference_writes(table: GoldenTable, id: u64) -> Vec<Range<u64>> {
+    let batches = table.recipe().append_batches;
+    assert!(batches > 0, "{table} is not a reference table");
     let rows = reference_rows_of(id);
     let tail = rows / APPEND_TAIL_DIVISOR;
     let base = rows - tail;
     let cuts: Vec<u64> = std::iter::once(0)
-        .chain((0..=APPEND_BATCHES).map(|batch| base + tail * batch / APPEND_BATCHES))
+        .chain((0..=batches).map(|batch| base + tail * batch / batches))
         .collect();
     cuts.windows(2).map(|pair| pair[0]..pair[1]).collect()
 }
@@ -1089,7 +1124,7 @@ mod tests {
         let ordered = GoldenTable::ordered();
         let reference = GoldenTable::reference();
         assert_eq!(ordered.len(), 8);
-        assert_eq!(reference.len(), 4);
+        assert_eq!(reference.len(), 5);
         assert!(
             ordered
                 .iter()
@@ -1109,7 +1144,8 @@ mod tests {
                 "ref_compacted",
                 "ref_appended",
                 "ref_string",
-                "ref_large_files"
+                "ref_large_files",
+                "ref_large_appended"
             ],
             "the names `dev/golden-tables.py --only reference` writes"
         );
@@ -1448,8 +1484,8 @@ mod tests {
     /// The keys of each tier at `REFERENCE_KEYS`, heavy, medium, and light.
     const TIER_KEYS: [u64; 3] = [1_197, 20_805, 177_998];
 
-    /// The rows each write holds at `REFERENCE_KEYS`: the initial load,
-    /// then each append.
+    /// The rows each write of a table of `APPEND_BATCHES` appends holds at
+    /// `REFERENCE_KEYS`: the initial load, then each append.
     const WRITE_ROWS: [u64; 5] = [16_031_167, 901_945, 1_001_949, 951_947, 1_051_950];
 
     fn reference_ids() -> Range<u64> {
@@ -1478,25 +1514,57 @@ mod tests {
         assert_eq!(reference_rows_of(REFERENCE_HEAVIEST_IDS[0]), 9_998);
     }
 
-    #[test]
-    fn test_reference_writes_tile_each_key_s_rows_in_order() {
-        let mut totals = [0_u64; 5];
+    /// The rows each write of reference table `table` holds at
+    /// `REFERENCE_KEYS`, after checking that its writes tile each key's
+    /// rows in order, the initial load the rows below the key's tail.
+    fn reference_write_totals(table: GoldenTable) -> Vec<u64> {
+        let writes_per_key = 1 + usize::try_from(table.recipe().append_batches).unwrap();
+        let mut totals = vec![0_u64; writes_per_key];
         for id in reference_ids() {
-            let writes = reference_writes(id);
-            assert_eq!(writes.len(), totals.len());
-            assert_eq!(writes[0].start, 0, "{id}");
+            let writes = reference_writes(table, id);
+            assert_eq!(writes.len(), writes_per_key, "{table}");
+            assert_eq!(writes[0].start, 0, "{table} {id}");
             assert!(
                 writes.windows(2).all(|pair| pair[0].end == pair[1].start),
-                "{id} {writes:?}"
+                "{table} {id} {writes:?}"
             );
             let rows = reference_rows_of(id);
-            assert_eq!(writes[writes.len() - 1].end, rows, "{id}");
-            assert_eq!(writes[0].end, rows - rows / APPEND_TAIL_DIVISOR, "{id}");
+            assert_eq!(writes[writes.len() - 1].end, rows, "{table} {id}");
+            assert_eq!(
+                writes[0].end,
+                rows - rows / APPEND_TAIL_DIVISOR,
+                "{table} {id}"
+            );
             for (total, write) in totals.iter_mut().zip(&writes) {
                 *total += write.end - write.start;
             }
         }
-        assert_eq!(totals, WRITE_ROWS);
+        totals
+    }
+
+    #[test]
+    fn test_reference_writes_tile_each_key_s_rows_in_order() {
+        assert_eq!(reference_write_totals(GoldenTable::RefAppended), WRITE_ROWS);
+    }
+
+    /// `ref_large_appended` splits the same tails among more appends: its
+    /// initial load and its appends together hold what the other tables'
+    /// do.
+    #[test]
+    fn test_reference_writes_of_more_appends_split_the_same_tails() {
+        let table = GoldenTable::RefLargeAppended;
+        let totals = reference_write_totals(table);
+        assert_eq!(
+            count(totals.len()),
+            1 + LARGE_APPEND_BATCHES,
+            "the initial load and each append"
+        );
+        assert_eq!(totals[0], WRITE_ROWS[0]);
+        assert_eq!(
+            totals[1..].iter().sum::<u64>(),
+            WRITE_ROWS[1..].iter().sum::<u64>()
+        );
+        assert!(totals[1..].iter().all(|&rows| rows > 0), "{totals:?}");
     }
 
     #[test]
@@ -1584,7 +1652,8 @@ mod tests {
 
     #[test]
     fn test_reference_sample_holds_each_tier_s_sample_and_the_heaviest() {
-        let sample = reference_sample(REFERENCE_KEYS, &BTreeSet::new());
+        let table = GoldenTable::RefAppended;
+        let sample = reference_sample(table, REFERENCE_KEYS, &BTreeSet::new());
         for tier in RowsTier::ALL {
             let tier_sample = reference_tier_sample(REFERENCE_KEYS, tier, REFERENCE_TIER_SAMPLES);
             assert!(tier_sample.iter().all(|id| sample.contains(id)), "{tier}");
@@ -1608,7 +1677,7 @@ mod tests {
             "the heaviest keys are heavy and the last key is not"
         );
         let edge = BTreeSet::from([REFERENCE_KEYS / 2]);
-        let with_edge = reference_sample(REFERENCE_KEYS, &edge);
+        let with_edge = reference_sample(table, REFERENCE_KEYS, &edge);
         assert_eq!(with_edge, &sample | &edge, "the extra keys join the sample");
     }
 

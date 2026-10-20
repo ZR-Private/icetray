@@ -9,7 +9,7 @@ vectors in version 3, and ordered tables (RFD 025): many rows per key,
 each with an order value, written by appends, skew-split writes, a MERGE,
 and a sorting compaction. The reference group, written only when --only
 names it, holds ordered tables near a production table's size: about 20
-million rows each, about 7 GB together. Run it against any object store
+million rows each, about 9 GB together. Run it against any object store
 or local directory; the tests locate the result through
 ICETRAY_GOLDEN_WAREHOUSE.
 
@@ -197,9 +197,10 @@ HEAVY_ROWS = (1_000, 10_000)
 MEDIUM_ROWS = (100, 999)
 LIGHT_ROWS = (1, 20)
 # Each key's last rows (one in `APPEND_TAIL_DIVISOR`, rounded down, so keys
-# of fewer rows have none) are written by `APPEND_BATCHES` appends after the
-# initial load, the tail split evenly in order among them, so an append
-# holds later rows of some keys only.
+# of fewer rows have none) are written by the table's appends after the
+# initial load, `APPEND_BATCHES` of them unless it sets its own count, the
+# tail split evenly in order among them, so an append holds later rows of
+# some keys only.
 APPEND_TAIL_DIVISOR = 5
 APPEND_BATCHES = 4
 # A row's order value in microseconds: `TS_START`, 2026-01-01T00:00:00Z,
@@ -225,6 +226,10 @@ ISO_INSTANT = "yyyy-MM-dd'T'HH:mm:ss.SSSSSS'Z'"
 # it, so the file holds about four.
 LARGE_FILE_BYTES = 33_554_432
 LARGE_ROW_GROUP_BYTES = 6_291_456
+# `ref_large_appended`'s appends: with its initial load's file, nine files a
+# bucket, so its 64 buckets' uniqueness merges start 576 cursors, more than
+# the 512 reads a load of four worker threads holds in flight.
+LARGE_APPEND_BATCHES = 8
 
 LONG_KEY = f"id * {KEY_STEP}"
 STRING_KEY = (
@@ -376,15 +381,16 @@ def reference_insert(spark, name, table, write):
     """An INSERT of each reference key's rows in the half-open row index
     range that `write` (0 the initial load, `b` the `b`th append) holds, at
     `MOR_FIRST_VERSION`: the initial load the rows below the key's tail,
-    and each append its share of the tail."""
+    and each of the table's `append_batches` appends its share of the
+    tail."""
     tail = f"(r DIV {APPEND_TAIL_DIVISOR})"
     base = f"(r - {tail})"
     if write == 0:
         low, high = "0", base
     else:
         batch = write - 1
-        low = f"({base} + {tail} * {batch} DIV {APPEND_BATCHES})"
-        high = f"({base} + {tail} * {batch + 1} DIV {APPEND_BATCHES})"
+        low = f"({base} + {tail} * {batch} DIV {table.append_batches})"
+        high = f"({base} + {tail} * {batch + 1} DIV {table.append_batches})"
     counts = f"(SELECT id AS k, {reference_rows()} AS r FROM (SELECT id, {keyed_hash('id')} AS h FROM range({table.keys})))"
     source = (
         f"(SELECT k, explode(sequence({low}, {high} - 1)) AS j FROM {counts} WHERE {high} > {low})"
@@ -399,9 +405,10 @@ def fill_reference(spark, name, table):
 
 
 def append_batches(spark, name, table):
-    """`APPEND_BATCHES` INSERTs of later rows of the keys with a tail: up to
-    a file per bucket each, over the bucket's earlier files' key range."""
-    for write in range(1, APPEND_BATCHES + 1):
+    """The table's `append_batches` INSERTs of later rows of the keys with
+    a tail: up to a file per bucket each, over the bucket's earlier files'
+    key range."""
+    for write in range(1, table.append_batches + 1):
         reference_insert(spark, name, table, write)
 
 
@@ -570,7 +577,7 @@ CONTRACT_GROUP = "contract"
 OFF_CONTRACT_GROUP = "off-contract"
 MOR_GROUP = "mor"
 ORDERED_GROUP = "ordered"
-# Written only when `--only` names it or one of its tables: about 7 GB.
+# Written only when `--only` names it or one of its tables: about 9 GB.
 REFERENCE_GROUP = "reference"
 
 
@@ -596,6 +603,8 @@ class Golden(NamedTuple):
     # A reference table's key count, `--reference-keys`; its `rows` is the
     # total at `REFERENCE_KEYS`, for the summary to be read against.
     keys: int = 0
+    # A reference table's appends after its initial load.
+    append_batches: int = APPEND_BATCHES
 
 
 # Every golden table, in the order a full run writes them.
@@ -822,9 +831,8 @@ TABLES = [
         order=OrderShape(string=True),
     ),
     # The reference tables: `REFERENCE_KEYS` keys in `REFERENCE_BUCKETS`
-    # buckets, an initial load and `APPEND_BATCHES` appends of later rows,
-    # then a sorting compaction to the recipe's sizes, keeping only the
-    # files it left.
+    # buckets, an initial load and appends of later rows, then a sorting
+    # compaction to the recipe's sizes, keeping only the files it left.
     Golden(
         "ref_compacted",
         REFERENCE_GROUP,
@@ -880,6 +888,26 @@ TABLES = [
         incompressible=True,
         changes=(append_batches, rewrite_sorted, expire_replaced),
         order=OrderShape(timed=True),
+    ),
+    # The initial load in `ref_large_files`' sizes, a file a bucket of
+    # several row groups, then `LARGE_APPEND_BATCHES` appends left
+    # uncompacted, each a file a bucket over the initial file's key range.
+    Golden(
+        "ref_large_appended",
+        REFERENCE_GROUP,
+        "BIGINT",
+        REFERENCE_BUCKETS,
+        REFERENCE_ROWS,
+        None,
+        REFERENCE_REPEATS,
+        extra={
+            "write.target-file-size-bytes": str(LARGE_FILE_BYTES),
+            "write.parquet.row-group-size-bytes": str(LARGE_ROW_GROUP_BYTES),
+        },
+        incompressible=True,
+        changes=(append_batches,),
+        order=OrderShape(timed=True),
+        append_batches=LARGE_APPEND_BATCHES,
     ),
 ]
 

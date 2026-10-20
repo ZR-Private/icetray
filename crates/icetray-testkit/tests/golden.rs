@@ -1508,7 +1508,7 @@ async fn assert_reference_serves(table: GoldenTable) -> Result<()> {
             .config()
             .scan_rows()
             .expect("an ordered table has a max_scan_rows");
-        let sample = golden::reference_sample(keys, &shared_edge_ids(&served));
+        let sample = golden::reference_sample(table, keys, &shared_edge_ids(&served));
         for &id in &sample {
             let rows = golden::ordered_rows(table, id);
             for scan in reference_scans(&rows, max) {
@@ -1550,6 +1550,12 @@ async fn test_golden_reference_large_files_pages_match_the_derived_rows() -> Res
     assert_reference_serves(GoldenTable::RefLargeFiles).await
 }
 
+#[tokio::test]
+#[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
+async fn test_golden_reference_large_appended_pages_match_the_derived_rows() -> Result<()> {
+    assert_reference_serves(GoldenTable::RefLargeAppended).await
+}
+
 /// What the doctor reports of a reference table as Spark wrote it.
 struct ReferenceLayout {
     table: GoldenTable,
@@ -1561,8 +1567,10 @@ struct ReferenceLayout {
     /// Whether a sorting compaction rewrote the appends into one file a
     /// bucket; otherwise a bucket holds a file per write.
     compacted: bool,
-    /// Whether each file holds more than one row group.
-    row_groups_per_file_above_one: bool,
+    /// The files of each bucket that hold more than one row group: the
+    /// compacted file, or the initial load's, written in row groups of
+    /// about a quarter of a bucket; every other file holds one.
+    several_row_group_files_per_bucket: usize,
 }
 
 /// Advice every reference table draws: runs past the default
@@ -1577,15 +1585,16 @@ const REFERENCE_ADVICE: [FindingCode; 2] = [FindingCode::LongRuns, FindingCode::
 /// one row group at the recipe's sizes and of several at
 /// `ref_large_files`'. The appends add up to a file a bucket each over the
 /// initial load's key range: `permissive` under `overlapping_files`, with
-/// more files than a bucket's bytes fill.
-const REFERENCE_LAYOUTS: [ReferenceLayout; 4] = [
+/// more files than a bucket's bytes fill, and at `ref_large_appended`'s
+/// sizes an initial file of several row groups.
+const REFERENCE_LAYOUTS: [ReferenceLayout; 5] = [
     ReferenceLayout {
         table: GoldenTable::RefCompacted,
         level: Level::Optimal,
         capping: &[],
         advice: &REFERENCE_ADVICE,
         compacted: true,
-        row_groups_per_file_above_one: false,
+        several_row_group_files_per_bucket: 0,
     },
     ReferenceLayout {
         table: GoldenTable::RefAppended,
@@ -1597,7 +1606,7 @@ const REFERENCE_LAYOUTS: [ReferenceLayout; 4] = [
             FindingCode::BloomOversized,
         ],
         compacted: false,
-        row_groups_per_file_above_one: false,
+        several_row_group_files_per_bucket: 0,
     },
     ReferenceLayout {
         table: GoldenTable::RefString,
@@ -1605,7 +1614,7 @@ const REFERENCE_LAYOUTS: [ReferenceLayout; 4] = [
         capping: &[],
         advice: &REFERENCE_ADVICE,
         compacted: true,
-        row_groups_per_file_above_one: false,
+        several_row_group_files_per_bucket: 0,
     },
     ReferenceLayout {
         table: GoldenTable::RefLargeFiles,
@@ -1613,19 +1622,31 @@ const REFERENCE_LAYOUTS: [ReferenceLayout; 4] = [
         capping: &[],
         advice: &REFERENCE_ADVICE,
         compacted: true,
-        row_groups_per_file_above_one: true,
+        several_row_group_files_per_bucket: 1,
+    },
+    ReferenceLayout {
+        table: GoldenTable::RefLargeAppended,
+        level: Level::Permissive,
+        capping: &[FindingCode::OverlappingFiles],
+        advice: &[
+            FindingCode::LongRuns,
+            FindingCode::ManyFilesPerBucket,
+            FindingCode::BloomOversized,
+        ],
+        compacted: false,
+        several_row_group_files_per_bucket: 1,
     },
 ];
 
-/// The longest run a reference table of `keys` keys holds in one file:
-/// a key's whole run once compacted, and otherwise the longest one write
-/// holds.
-fn longest_reference_run(keys: u64, compacted: bool) -> u64 {
+/// The longest run reference table `table` of `keys` keys holds in one
+/// file: a key's whole run once compacted, and otherwise the longest one
+/// write holds.
+fn longest_reference_run(table: GoldenTable, keys: u64, compacted: bool) -> u64 {
     let ids = 0..keys;
     let longest = if compacted {
         ids.map(golden::reference_rows_of).max()
     } else {
-        ids.flat_map(golden::reference_writes)
+        ids.flat_map(|id| golden::reference_writes(table, id))
             .map(|write| write.end - write.start)
             .max()
     };
@@ -1658,10 +1679,11 @@ async fn test_golden_reference_layouts_earn_their_level_and_findings() -> Result
             assert_eq!(records, table.spec().rows, "{table}");
         }
         let buckets = usize::try_from(table.spec().buckets).unwrap();
+        let recipe = table.spec().order.expect("a reference table is ordered");
         let files_per_bucket = if layout.compacted {
             1
         } else {
-            1 + usize::try_from(golden::APPEND_BATCHES).unwrap()
+            1 + usize::try_from(recipe.append_batches).unwrap()
         };
         assert_eq!(report.summary.buckets_with_files, buckets, "{table}");
         assert_eq!(
@@ -1676,19 +1698,26 @@ async fn test_golden_reference_layouts_earn_their_level_and_findings() -> Result
         // Row groups are sized in bytes, so below the full size a bucket
         // can fit in one.
         if full {
-            assert_eq!(
-                report.files.iter().all(|file| file.row_groups > 1),
-                layout.row_groups_per_file_above_one,
-                "{table}: dev/golden-tables.py writes ref_large_files in row groups of a \
-                 quarter of a bucket and the others in one; regenerate the table"
-            );
+            for bucket in 0..table.spec().buckets {
+                let several = report
+                    .files
+                    .iter()
+                    .filter(|file| file.bucket == bucket && file.row_groups > 1)
+                    .count();
+                assert_eq!(
+                    several, layout.several_row_group_files_per_bucket,
+                    "{table} bucket {bucket}: dev/golden-tables.py writes ref_large_files' \
+                     file and ref_large_appended's initial load in row groups of a quarter \
+                     of a bucket and every other file in one; regenerate the table"
+                );
+            }
         }
         let order = report.summary.order.as_ref().expect("an ordered table");
         assert_eq!(order.order_type, recipe_order_type(table), "{table}");
         assert_eq!(order.files_probed, files_per_bucket, "{table}");
         assert_eq!(
             order.longest_run,
-            longest_reference_run(keys, layout.compacted),
+            longest_reference_run(table, keys, layout.compacted),
             "{table}"
         );
         assert_eq!(order.gets_per_scan, FULL_SCAN_GETS, "{table}");
