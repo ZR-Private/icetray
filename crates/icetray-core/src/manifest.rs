@@ -174,6 +174,21 @@ impl<'a> ColumnRead<'a> {
     }
 }
 
+/// Column reads that hold none of the faults `check_column_reads` names:
+/// no name given twice, and every field list in range with no number given
+/// twice. Only `check_column_reads` makes one, and `select_columns` and
+/// `TableLayout::select` take only this, so no read reaches selection
+/// unchecked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CheckedReads<'r>(&'r [ColumnRead<'r>]);
+
+impl<'r> CheckedReads<'r> {
+    /// The reads, in the order the lookup named them.
+    pub fn reads(self) -> &'r [ColumnRead<'r>] {
+        self.0
+    }
+}
+
 /// The column reads of one lookup checked against its table
 /// (`select_columns`): per read, in the order the lookup named them, the
 /// column's position in the layout and the fields its value is trimmed to,
@@ -384,19 +399,14 @@ impl TableLayout {
             .position(|column| column.name == name)
     }
 
-    /// The column reads `reads` names, which `check_column_reads` has
-    /// passed, checked for a lookup under `entry`, the table's entry as it
-    /// stands (`select_columns`): each column's
+    /// The column reads `reads` names, checked for a lookup under `entry`,
+    /// the table's entry as it stands (`select_columns`): each column's
     /// position here, and its format from `entry`, so a retune of formats
     /// applies to the next lookup. A column `entry` declares protobuf whose
     /// type here is not `binary` is taken as opaque: an entry retuned to
     /// protobuf after this layout was checked takes no field list for a
     /// column it cannot trim.
-    pub(crate) fn select(
-        &self,
-        entry: &TableConfig,
-        reads: &[ColumnRead<'_>],
-    ) -> Result<Selection> {
+    pub(crate) fn select(&self, entry: &TableConfig, reads: CheckedReads<'_>) -> Result<Selection> {
         select_columns(&entry.name, reads, |name| {
             let at = self.value_column(name)?;
             let declared = entry.format_of(name)?;
@@ -456,8 +466,11 @@ fn check_format(
 /// `ColumnRequestFault::RepeatedField` (`FieldSet::new`), whatever format
 /// the column is in. The first fault in `reads` is reported. A table's
 /// value columns have distinct names, so reads that pass name distinct
-/// columns.
-pub fn check_column_reads(table: &str, reads: &[ColumnRead<'_>]) -> Result<()> {
+/// columns; they are returned as `CheckedReads`, what selection takes.
+pub fn check_column_reads<'r>(
+    table: &str,
+    reads: &'r [ColumnRead<'r>],
+) -> Result<CheckedReads<'r>> {
     let mut seen = HashSet::with_capacity(reads.len());
     for read in reads {
         let fault = |fault| Error::ColumnRequest {
@@ -470,21 +483,22 @@ pub fn check_column_reads(table: &str, reads: &[ColumnRead<'_>]) -> Result<()> {
         }
         FieldSet::new(read.fields).map_err(fault)?;
     }
-    Ok(())
+    Ok(CheckedReads(reads))
 }
 
-/// The column reads `reads` names, which `check_column_reads` has passed,
-/// checked in its order for a lookup of `table`, where `served` gives a
-/// served column's position and format: a name `served` places nowhere,
-/// one the table does not serve, is `Error::ColumnRequest` with
+/// The column reads `reads` names, checked in its order for a lookup of
+/// `table`, where `served` gives a served column's position and format: a
+/// name `served` places nowhere, one the table does not serve, is
+/// `Error::ColumnRequest` with
 /// `ColumnRequestFault::NotServed`, and a field list on a column not
 /// declared protobuf is `ColumnRequestFault::NotProtobuf`. The first fault
 /// in `reads` is reported.
 pub(crate) fn select_columns(
     table: &str,
-    reads: &[ColumnRead<'_>],
+    reads: CheckedReads<'_>,
     served: impl Fn(&str) -> Option<(usize, ValueFormat)>,
 ) -> Result<Selection> {
+    let reads = reads.reads();
     let mut selection = Selection {
         positions: Vec::with_capacity(reads.len()),
         fields: Vec::with_capacity(reads.len()),
@@ -1630,6 +1644,11 @@ mod tests {
         self, DATA_DIR, DeleteSpec, KEY_COLUMN, KEY_FIELD_ID, VALUE_COLUMN, VALUE_FIELD_ID, Written,
     };
     use super::*;
+
+    /// `reads` through `check_column_reads`, which these reads pass.
+    fn checked<'r>(reads: &'r [ColumnRead<'r>]) -> CheckedReads<'r> {
+        check_column_reads(TABLE, reads).unwrap()
+    }
     use crate::bucket;
     use crate::config::{StorageConfig, ValueColumnConfig};
     use crate::generation::testing::{TABLE, refusal_of, table_fault_of};
@@ -2065,13 +2084,13 @@ mod tests {
         let selection = layout
             .select(
                 &config,
-                &[
+                checked(&[
                     ColumnRead::whole(VALUE_COLUMN),
                     ColumnRead {
                         name: RENAMED_VALUE_COLUMN,
                         fields: &fields,
                     },
-                ],
+                ]),
             )
             .unwrap();
         assert_eq!(selection.positions, [1, 0]);
@@ -2082,12 +2101,12 @@ mod tests {
         );
         assert!(selection.projects());
         let whole = layout
-            .select(&config, &[ColumnRead::whole(RENAMED_VALUE_COLUMN)])
+            .select(&config, checked(&[ColumnRead::whole(RENAMED_VALUE_COLUMN)]))
             .unwrap();
         assert_eq!(whole.fields, [None]);
         assert!(!whole.projects());
         assert_eq!(
-            layout.select(&config, &[]).unwrap().positions,
+            layout.select(&config, checked(&[])).unwrap().positions,
             Vec::<usize>::new()
         );
     }
@@ -2164,11 +2183,11 @@ mod tests {
         for (reads, named, expected, request_only) in cases {
             let checked = check_column_reads(TABLE, &reads);
             let refusals = if request_only {
-                vec![checked, config.check_column_request(&reads)]
+                vec![checked.map(drop), config.check_column_request(&reads)]
             } else {
                 assert!(checked.is_ok(), "{reads:?} holds no fault of its own");
                 vec![
-                    layout.select(&config, &reads).map(drop),
+                    layout.select(&config, checked.unwrap()).map(drop),
                     config.check_column_request(&reads),
                 ]
             };
@@ -2206,10 +2225,10 @@ mod tests {
         let fields = [1];
         let Err(Error::ColumnRequest { column, fault, .. }) = layout.select(
             &config,
-            &[ColumnRead {
+            checked(&[ColumnRead {
                 name: RENAMED_VALUE_COLUMN,
                 fields: &fields,
-            }],
+            }]),
         ) else {
             panic!("a field list on a string column is refused");
         };
@@ -2218,7 +2237,7 @@ mod tests {
             (RENAMED_VALUE_COLUMN, ColumnRequestFault::NotProtobuf)
         );
         let whole = layout
-            .select(&config, &[ColumnRead::whole(RENAMED_VALUE_COLUMN)])
+            .select(&config, checked(&[ColumnRead::whole(RENAMED_VALUE_COLUMN)]))
             .unwrap();
         assert_eq!(whole.fields, [None], "and read whole as opaque");
     }

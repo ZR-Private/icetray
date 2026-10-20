@@ -3591,6 +3591,7 @@ enum Fault {
     None,
     MissingKey,
     UnsetDirection,
+    UnknownDirection,
     BoundWithNoVariant,
     EmptyWindow,
     RepeatedColumn,
@@ -3601,16 +3602,18 @@ enum Fault {
     LimitAboveMax,
     TooManyValues,
     KeyVariant,
+    UuidLength,
     BoundVariant,
     UnservedColumn,
     FieldsOfAnOpaqueColumn,
 }
 
 impl Fault {
-    const ALL: [Self; 16] = [
+    const ALL: [Self; 18] = [
         Self::None,
         Self::MissingKey,
         Self::UnsetDirection,
+        Self::UnknownDirection,
         Self::BoundWithNoVariant,
         Self::EmptyWindow,
         Self::RepeatedColumn,
@@ -3621,6 +3624,7 @@ impl Fault {
         Self::LimitAboveMax,
         Self::TooManyValues,
         Self::KeyVariant,
+        Self::UuidLength,
         Self::BoundVariant,
         Self::UnservedColumn,
         Self::FieldsOfAnOpaqueColumn,
@@ -3632,22 +3636,27 @@ impl Fault {
             Self::None => None,
             Self::MissingKey
             | Self::UnsetDirection
+            | Self::UnknownDirection
             | Self::BoundWithNoVariant
+            | Self::LimitZero
             | Self::EmptyWindow
             | Self::RepeatedColumn
             | Self::FieldOutOfRange
             | Self::RepeatedField => Some(Step::Request),
-            Self::WrongKind | Self::LimitZero | Self::LimitAboveMax | Self::TooManyValues => {
+            Self::WrongKind | Self::LimitAboveMax | Self::TooManyValues => {
                 Some(Step::Configuration)
             }
             Self::KeyVariant
+            | Self::UuidLength
             | Self::BoundVariant
             | Self::UnservedColumn
             | Self::FieldsOfAnOpaqueColumn => Some(Step::Generation),
         }
     }
 
-    /// Whether a request of `kind` can hold the fault.
+    /// Whether a request of `kind` can hold the fault. A uuid key's length
+    /// is a fault on a uuid-keyed table alone, which the test serves as a
+    /// key-value table, so only a `Get` and a `MultiGet` hold it.
     fn applies_to(self, kind: Lookup) -> bool {
         match self {
             Self::None
@@ -3660,12 +3669,14 @@ impl Fault {
             | Self::UnservedColumn
             | Self::FieldsOfAnOpaqueColumn => true,
             Self::UnsetDirection
+            | Self::UnknownDirection
             | Self::BoundWithNoVariant
             | Self::EmptyWindow
             | Self::LimitZero
             | Self::LimitAboveMax
             | Self::BoundVariant => kind.scans(),
             Self::TooManyValues => kind.batch(),
+            Self::UuidLength => !kind.scans(),
         }
     }
 
@@ -3691,7 +3702,10 @@ impl Fault {
     }
 
     /// `good`, a request of `kind` that a served table answers, with the
-    /// fault put in; `other` is the table of the other kind.
+    /// fault put in; `other` is the table of the other kind. A uuid key's
+    /// length moves a request on a served table to `UUID_TABLE`, its one
+    /// key a `bin` too short for a uuid, so the request holds no other
+    /// fault; on an unknown table it keeps the name.
     fn put_in(self, good: &Parts, kind: Lookup, other: &str) -> Parts {
         let mut parts = good.clone();
         let mut bad_key = |key: v1::Key| {
@@ -3707,7 +3721,16 @@ impl Fault {
             Self::KeyVariant => bad_key(v1::Key {
                 key: Some(v1::key::Key::Str("not a long".to_string())),
             }),
+            Self::UuidLength => {
+                if parts.table != NOBODY {
+                    parts.table = UUID_TABLE.to_string();
+                }
+                parts.keys = vec![v1::Key {
+                    key: Some(v1::key::Key::Bin(vec![0; SHORT_UUID_BYTES])),
+                }];
+            }
             Self::UnsetDirection => parts.direction = i32::from(v1::Direction::Unspecified),
+            Self::UnknownDirection => parts.direction = UNKNOWN_DIRECTION,
             Self::BoundWithNoVariant => parts.start = Some(v1::OrderValue { value: None }),
             Self::EmptyWindow => {
                 parts.start = Some(wire_order(ORDER_START));
@@ -3737,6 +3760,10 @@ impl Fault {
         parts
     }
 }
+
+/// The length of a `bin` key the validation-order test sends a uuid-keyed
+/// table: fewer bytes than a uuid's.
+const SHORT_UUID_BYTES: usize = 3;
 
 /// The keys a `MultiScan` of the validation-order test asks for to pass
 /// `MULTI_SCAN_VALUES` at `PAGE_ROWS` rows of one column and the order
@@ -3841,6 +3868,7 @@ async fn test_each_call_checks_its_request_in_the_one_order() -> TestResult {
             vec![
                 FixtureSpec::small(TABLE, KeyType::Long),
                 ordered_spec(ORDERED_TABLE),
+                FixtureSpec::small(UUID_TABLE, KeyType::Uuid),
             ],
             async |setup| {
                 setup.config.tables[1].max_scan_rows = Some(SCAN_CAP);
@@ -3894,10 +3922,10 @@ async fn test_each_call_checks_its_request_in_the_one_order() -> TestResult {
             stack.s3.release();
         }
     }
-    // Counting no fault: 9 for a `Get`, 10 for a `MultiGet`, which can ask
-    // for too many values, 15 for a Scan, which has a direction, a limit,
-    // and bounds, and 16 for a `MultiScan`.
-    let cases_per_target = 9 + 10 + 15 + 16;
+    // Counting no fault: 10 for a `Get`, 11 for a `MultiGet`, which can ask
+    // for too many values, 16 for a Scan, which has a direction, a limit,
+    // and bounds but reads no uuid-keyed table, and 17 for a `MultiScan`.
+    let cases_per_target = 10 + 11 + 16 + 17;
     let servers = 4;
     let targets_per_server = 2;
     assert_eq!(

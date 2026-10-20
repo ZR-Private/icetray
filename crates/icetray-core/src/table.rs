@@ -37,7 +37,7 @@ use crate::index::RunSource;
 use crate::key::{Key, KeyType};
 use crate::level::{Level, PageCacheCondition};
 use crate::local::{LocalDir, ResidentPages, Unobserved};
-use crate::manifest::{ColumnRead, Selection, TableLayout, check_column_reads};
+use crate::manifest::{CheckedReads, ColumnRead, Selection, TableLayout, check_column_reads};
 use crate::metric::{self, LookupResult, ScanResult, Temperature};
 use crate::order::{OrderValue, ScanBounds};
 use crate::projection;
@@ -1534,7 +1534,7 @@ impl Table {
     /// not the protobuf its column declares, when its read names fields.
     pub async fn get(&self, key: &Key, columns: &[ColumnRead<'_>]) -> Result<Lookup> {
         let _in_flight = self.lookups.enter();
-        check_column_reads(&self.name, columns)?;
+        let columns = check_column_reads(&self.name, columns)?;
         self.check_kind(TableKind::KeyValue)?;
         // A guard held across the lookup's awaits stays correct wherever
         // the task resumes. While held it occupies one of the loading
@@ -1594,7 +1594,7 @@ impl Table {
     /// canceled under a runtime shutdown is `Error::LookupCanceled`.
     pub async fn multi_get(&self, keys: &[Key], columns: &[ColumnRead<'_>]) -> Result<MultiLookup> {
         let _in_flight = self.lookups.enter();
-        check_column_reads(&self.name, columns)?;
+        let columns = check_column_reads(&self.name, columns)?;
         self.check_kind(TableKind::KeyValue)?;
         let generation = self.serving()?;
         for key in keys {
@@ -1797,9 +1797,9 @@ impl Table {
         bounds: &ScanBounds,
         multi: bool,
     ) -> Result<ScanCall> {
-        scan::check_scan_request(&self.name, columns, bounds)?;
+        let columns = scan::check_scan_request(&self.name, columns, bounds)?;
         if multi {
-            self.check_multi_scan(keys.len(), columns.len(), bounds)?;
+            self.check_multi_scan(keys.len(), columns.reads().len(), bounds)?;
         } else {
             self.check_scan(bounds)?;
         }
@@ -2645,11 +2645,13 @@ impl Table {
     }
 
     /// `Error::WrongTableKind` on a key-value table, and `Error::ScanRequest`
-    /// for a limit of 0 or above the entry's `max_scan_rows`
-    /// (`scan::check_limit`): what a Scan is held to by the table's
-    /// configuration alone, so the gRPC service checks it before it admits
-    /// the call or reads the table's readiness, and `scan` checks it again
-    /// with the same result.
+    /// for a limit above the entry's `max_scan_rows` (`scan::check_limit`):
+    /// what a Scan is held to by the table's configuration alone, so the
+    /// gRPC service checks it before it admits the call or reads the
+    /// table's readiness, and `scan` checks it again. Each check reads the
+    /// entry as it stands, so a retune that lowers `max_scan_rows` between
+    /// the two can refuse at `scan` a limit the first check admitted; one
+    /// that raises it leaves the first check's refusal standing.
     pub fn check_scan(&self, bounds: &ScanBounds) -> Result<()> {
         self.check_kind(TableKind::Ordered)?;
         // An ordered table's entry names its order column; one that does
@@ -2696,7 +2698,7 @@ impl Table {
         &self,
         generation: &Generation,
         keys: &[Key],
-        columns: &[ColumnRead<'_>],
+        columns: CheckedReads<'_>,
         bounds: &ScanBounds,
     ) -> Result<Selection> {
         // An ordered table's generation names its order column; one that
@@ -2855,7 +2857,7 @@ mod tests {
     use crate::metric::LookupResult;
     use crate::order::{Direction, OrderValue, OrderVariant};
     use crate::projection::MAX_FIELD_NUMBER;
-    use crate::scan::{BoundSide, Fits, ScanRequestFault, ScanRow};
+    use crate::scan::{BoundSide, Fits, ScanRequestFault, ScanRow, check_scan_request};
     use crate::storage::testing::{DEADLINE_GUARD, Gauged, STALL};
     use crate::storage::{FILE_PREFIX, LocationError, LocationFault};
 
@@ -3572,9 +3574,13 @@ mod tests {
     /// fan-out of `permits`, the bound `multi_get` gives a batch.
     async fn run_under(table: &Table, keys: &[Key], columns: &[&str], permits: usize) -> Vec<Row> {
         let generation = table.current().unwrap();
+        let reads = whole(columns);
         let columns = generation
             .layout
-            .select(&table.config(), &whole(columns))
+            .select(
+                &table.config(),
+                check_column_reads(table.name(), &reads).unwrap(),
+            )
             .unwrap();
         let fan_out = Arc::new(Semaphore::new(permits));
         table
@@ -7552,6 +7558,35 @@ mod tests {
             plain.multi_get(std::slice::from_ref(&key), &reads).await,
             Err(Error::NotReady { .. })
         ));
+        let repeated = [reads[0], reads[0]];
+        let is_repeated = |outcome: Result<()>| {
+            assert!(
+                matches!(
+                    outcome,
+                    Err(Error::ColumnRequest {
+                        fault: ColumnRequestFault::Repeated,
+                        ..
+                    })
+                ),
+                "a column named twice, ahead of the kind and the readiness: {:?}",
+                outcome.map(drop)
+            );
+        };
+        is_repeated(plain.get(&key, &repeated).await.map(drop));
+        is_repeated(
+            plain
+                .multi_get(std::slice::from_ref(&key), &repeated)
+                .await
+                .map(drop),
+        );
+        let key = Key::Long(KEY_STEP);
+        is_repeated(ordered.get(&key, &repeated).await.map(drop));
+        is_repeated(
+            ordered
+                .multi_get(std::slice::from_ref(&key), &repeated)
+                .await
+                .map(drop),
+        );
     }
 
     /// A Scan or `MultiScan` request holds the faults of its own and of the
@@ -7583,7 +7618,7 @@ mod tests {
             ColumnRead::whole(VALUE_COLUMN),
         ];
         let refused = [
-            (at(0), &BOTH_READS[..], ScanRequestFault::LimitZero { max }),
+            (at(0), &BOTH_READS[..], ScanRequestFault::LimitZero),
             (
                 at(max + 1),
                 &BOTH_READS[..],
@@ -7602,11 +7637,6 @@ mod tests {
                 assert_eq!(scan_request_fault(error), expected);
             }
         }
-        assert_eq!(
-            scan_request_fault(ordered.check_scan(&at(0)).unwrap_err()),
-            ScanRequestFault::LimitZero { max },
-            "the gRPC service's check before admission is the one a Scan runs"
-        );
         for error in [
             ordered
                 .scan(&key, &repeated, &oldest_first())
@@ -7660,6 +7690,37 @@ mod tests {
         }
     }
 
+    /// The checks the gRPC service runs before it admits a Scan are the
+    /// ones a Scan runs: a limit of 0 is the request's own fault, and one
+    /// above `max_scan_rows` the entry's, on a table with no generation.
+    #[tokio::test]
+    async fn test_the_service_s_scan_checks_give_the_faults_a_scan_gives() {
+        let rows = ordered_rows(&[KEY_STEP], SCAN_ROWS_PER_KEY);
+        let (ordered, _fixture, _gauged) =
+            unloaded_ordered_table_over(&[&rows], WriterLayout::contract(), DEFAULT_BATCH_FAN_OUT)
+                .await;
+        let max = DEFAULT_MAX_SCAN_ROWS;
+        let at = |limit| ScanBounds {
+            limit,
+            ..oldest_first()
+        };
+        assert_eq!(
+            scan_request_fault(check_scan_request(TABLE, &BOTH_READS, &at(0)).unwrap_err()),
+            ScanRequestFault::LimitZero
+        );
+        assert!(
+            ordered.check_scan(&at(0)).is_ok(),
+            "no limit of the entry's"
+        );
+        assert_eq!(
+            scan_request_fault(ordered.check_scan(&at(max + 1)).unwrap_err()),
+            ScanRequestFault::LimitAboveMax {
+                limit: max + 1,
+                max
+            }
+        );
+    }
+
     /// The fault of `error`, a refused Scan request of the test table.
     fn scan_request_fault(error: Error) -> ScanRequestFault {
         let Error::ScanRequest { table, fault } = error else {
@@ -7681,7 +7742,7 @@ mod tests {
         let max = DEFAULT_MAX_SCAN_ROWS;
         let before = fixture.gets();
         for (limit, expected) in [
-            (0, ScanRequestFault::LimitZero { max }),
+            (0, ScanRequestFault::LimitZero),
             (
                 max + 1,
                 ScanRequestFault::LimitAboveMax {

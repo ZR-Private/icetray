@@ -474,12 +474,13 @@ worth a retry, and the client raises its limit, or the caller lowers its
 The server checks a `Get`, `MultiGet`, `Scan`, or `MultiScan` request in
 one order and answers the first fault it finds:
 
-1. Faults in the request itself: a missing key, an unset direction, a
-   bound with no variant, a `start` at or above a `before` of the same
-   variant, a column listed twice, and a field number outside 1 to
-   536,870,911 or listed twice. `INVALID_ARGUMENT`.
-2. Faults against the table's configuration: a table the server does
-   not serve (`NOT_FOUND`), a call of the wrong kind, a limit of 0 or
+1. Faults in the request itself: a missing key, no direction or one the
+   contract does not name, a bound with no variant, a limit of 0, a
+   `start` at or above a `before` of the same variant, a column listed
+   twice, and a field number outside 1 to 536,870,911 or listed twice.
+   `INVALID_ARGUMENT`.
+2. Faults against the table's configuration: first a table the server
+   does not serve (`NOT_FOUND`), then a call of the wrong kind, a limit
    above `max_scan_rows`, and a `MultiGet` or `MultiScan` over its
    values limit (`INVALID_ARGUMENT`).
 3. The server's in-flight limit: `RESOURCE_EXHAUSTED` when all
@@ -492,7 +493,11 @@ one order and answers the first fault it finds:
    `INVALID_ARGUMENT`.
 
 So the faults of steps 1 and 2 come back whatever the table's state,
-while it loads included, and never cost an in-flight slot. A request
+while it loads included, and cost no in-flight slot. The one exception
+is a reload that lowers `max_scan_rows` while a call is checked: a limit
+the server admitted under the old value can then be refused, still
+`INVALID_ARGUMENT` and naming the new value, after the call took its
+slot. A request
 with a fault of step 5 is `UNAVAILABLE` while the table loads and
 `INVALID_ARGUMENT` once it serves, so a caller that retries
 `UNAVAILABLE` sees the fault after the load.

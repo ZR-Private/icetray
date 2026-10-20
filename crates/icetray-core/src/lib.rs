@@ -66,8 +66,8 @@ pub use key::{Key, KeyBytes, KeyType};
 pub use level::{FALL_PER_MILLE, Level, PAGE_CACHE_SAMPLE_INTERVAL, PER_MILLE, RECOVER_PER_MILLE};
 pub use local::{DataFileIdentity, DiskChunks, DiskLevel, LocalDir, LocalFault};
 pub use manifest::{
-    Bucketing, ColumnRead, ColumnRequestFault, DataFileEntry, TableLayout, ValueColumnLayout,
-    ValueType, check_column_reads,
+    Bucketing, CheckedReads, ColumnRead, ColumnRequestFault, DataFileEntry, TableLayout,
+    ValueColumnLayout, ValueType, check_column_reads,
 };
 pub use open::{Applied, Opened, Refused, Tables, open};
 pub use order::{

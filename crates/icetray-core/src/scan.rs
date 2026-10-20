@@ -11,7 +11,7 @@ use bytes::Bytes;
 
 use crate::error::Error;
 use crate::key::Key;
-use crate::manifest::{ColumnRead, check_column_reads};
+use crate::manifest::{CheckedReads, ColumnRead, check_column_reads};
 use crate::order::{Direction, OrderValue, OrderVariant, ScanBounds};
 use crate::snapshot::SnapshotId;
 
@@ -126,12 +126,9 @@ impl fmt::Display for BoundSide {
 /// `Error::ScanRequest`'s message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScanRequestFault {
-    /// The limit is 0: a Scan and each key of a `MultiScan` sets the most
-    /// rows it reads, from 1 to the table's `max_scan_rows`.
-    LimitZero {
-        /// The table's `max_scan_rows`.
-        max: u32,
-    },
+    /// The limit is 0: a Scan and each key of a `MultiScan` reads at least
+    /// one row, a fault of the request alone, whatever its table.
+    LimitZero,
     /// The limit is above the table's `max_scan_rows`.
     LimitAboveMax {
         /// The limit asked.
@@ -172,10 +169,9 @@ pub enum ScanRequestFault {
 impl fmt::Display for ScanRequestFault {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::LimitZero { max } => write!(
-                f,
-                "limit is 0: a Scan or MultiScan sets the most rows it reads per key, at most max_scan_rows {max}"
-            ),
+            Self::LimitZero => {
+                f.write_str("limit is 0: a Scan or MultiScan reads at least one row per key")
+            }
             Self::LimitAboveMax { limit, max } => {
                 write!(f, "limit {limit} is above max_scan_rows {max}")
             }
@@ -211,36 +207,39 @@ fn plural(count: usize, one: &'static str, many: &'static str) -> &'static str {
     if count == 1 { one } else { many }
 }
 
-/// The limit `bounds` asks for, checked against `max_scan_rows`: a limit of
-/// 0 is `ScanRequestFault::LimitZero`, since a Scan and each key of a
-/// `MultiScan` sets the rows it reads, and a limit above `max_scan_rows` is
-/// `ScanRequestFault::LimitAboveMax`.
+/// `ScanRequestFault::LimitAboveMax` for a limit `bounds` asks for above
+/// `max_scan_rows`. A limit of 0 is the request's own fault
+/// (`check_scan_request`), refused before the table is looked up.
 pub(crate) fn check_limit(bounds: &ScanBounds, max_scan_rows: u32) -> Result<(), ScanRequestFault> {
-    match bounds.limit {
-        0 => Err(ScanRequestFault::LimitZero { max: max_scan_rows }),
-        limit if limit > max_scan_rows => Err(ScanRequestFault::LimitAboveMax {
-            limit,
+    if bounds.limit > max_scan_rows {
+        return Err(ScanRequestFault::LimitAboveMax {
+            limit: bounds.limit,
             max: max_scan_rows,
-        }),
-        _ => Ok(()),
+        });
     }
+    Ok(())
 }
 
 /// The faults a Scan or `MultiScan` request of `table` reading `columns`
 /// under `bounds` holds whatever the table is, checked before the table is
-/// looked up: `Error::ScanRequest` with `ScanRequestFault::EmptyWindow` for
-/// a `start` at or above a `before` of its variant (`check_window`), then
-/// the faults `check_column_reads` names. A key-value table takes no Scan,
-/// so these come before `Error::WrongTableKind` too.
-pub fn check_scan_request(
+/// looked up: `Error::ScanRequest` with `ScanRequestFault::LimitZero` for a
+/// limit of 0, then with `ScanRequestFault::EmptyWindow` for a `start` at
+/// or above a `before` of its variant (`check_window`), then the faults
+/// `check_column_reads` names, whose checked reads it returns. A key-value
+/// table takes no Scan, so these come before `Error::WrongTableKind` too.
+pub fn check_scan_request<'r>(
     table: &str,
-    columns: &[ColumnRead<'_>],
+    columns: &'r [ColumnRead<'r>],
     bounds: &ScanBounds,
-) -> crate::error::Result<()> {
-    check_window(bounds).map_err(|fault| Error::ScanRequest {
+) -> crate::error::Result<CheckedReads<'r>> {
+    let refused = |fault| Error::ScanRequest {
         table: table.to_string(),
         fault,
-    })?;
+    };
+    if bounds.limit == 0 {
+        return Err(refused(ScanRequestFault::LimitZero));
+    }
+    check_window(bounds).map_err(refused)?;
     check_column_reads(table, columns)
 }
 
@@ -430,12 +429,8 @@ mod tests {
     }
 
     #[test]
-    fn test_check_limit_refuses_zero_and_above_max() {
-        assert_eq!(
-            check_limit(&bounds(0, None, None), MAX),
-            Err(ScanRequestFault::LimitZero { max: MAX })
-        );
-        for limit in [1, UNDER, MAX] {
+    fn test_check_limit_refuses_only_above_max() {
+        for limit in [0, 1, UNDER, MAX] {
             assert_eq!(check_limit(&bounds(limit, None, None), MAX), Ok(()));
         }
         assert_eq!(
@@ -519,20 +514,28 @@ mod tests {
     }
 
     #[test]
-    fn test_check_scan_request_refuses_an_empty_window_before_a_repeated_column() {
+    fn test_check_scan_request_refuses_a_zero_limit_then_an_empty_window_then_a_repeated_column() {
         let long = |value| Some(OrderValue::Long(value));
         let repeated = [ColumnRead::whole("a"), ColumnRead::whole("a")];
-        let Err(Error::ScanRequest { table, fault }) =
-            check_scan_request(TABLE, &repeated, &bounds(0, long(2), long(2)))
-        else {
-            panic!("an empty window is refused");
+        let fault_of = |bounds: &ScanBounds| match check_scan_request(TABLE, &repeated, bounds) {
+            Err(Error::ScanRequest { table, fault }) => {
+                assert_eq!(table, TABLE);
+                Some(fault)
+            }
+            Err(error) => panic!("a scan request fault, got {error:?}"),
+            Ok(_) => None,
         };
         assert_eq!(
-            (table.as_str(), fault),
-            (TABLE, ScanRequestFault::EmptyWindow)
+            fault_of(&bounds(0, long(2), long(2))),
+            Some(ScanRequestFault::LimitZero),
+            "a limit of 0 whatever else the request holds"
+        );
+        assert_eq!(
+            fault_of(&bounds(UNDER, long(2), long(2))),
+            Some(ScanRequestFault::EmptyWindow)
         );
         let Err(Error::ColumnRequest { column, fault, .. }) =
-            check_scan_request(TABLE, &repeated, &bounds(0, long(1), long(2)))
+            check_scan_request(TABLE, &repeated, &bounds(UNDER, long(1), long(2)))
         else {
             panic!("a repeated column is refused");
         };
@@ -540,7 +543,9 @@ mod tests {
             (column.as_str(), fault),
             ("a", crate::manifest::ColumnRequestFault::Repeated)
         );
-        assert!(check_scan_request(TABLE, &repeated[..1], &bounds(0, long(1), long(2))).is_ok());
+        assert!(
+            check_scan_request(TABLE, &repeated[..1], &bounds(UNDER, long(1), long(2))).is_ok()
+        );
     }
 
     #[test]

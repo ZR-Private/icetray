@@ -9,6 +9,11 @@
 > failing key in request order, whether its keys are spread over worker
 > threads or read on one task.
 
+> Updated 2026-10-20: a limit of 0 is a fault of the request alone,
+> answered whatever its table, unknown or loading included, so its
+> message names no `max_scan_rows`; a limit above `max_scan_rows` stays
+> a fault the table's configuration finds.
+
 ## Problem
 
 icetray serves tables with at most one row per key, and that remains its
@@ -100,9 +105,10 @@ direction under a limit and optional bounds on the order value.
   is an empty window, a MultiScan above `max_multi_scan_values`, or a
   call of the wrong kind for the table. The server checks a request in
   the order RFD 010 gives: the request's own faults, such as an
-  unspecified direction or a `start` at or above a `before` of its
-  variant; then the table's configuration, the call's kind, the limit
-  against `max_scan_rows`, and a MultiScan's values against
+  unspecified direction, a limit of 0, which no table answers, or a
+  `start` at or above a `before` of its variant; then the table's
+  configuration, a table not served first, then the call's kind, a limit
+  above `max_scan_rows`, and a MultiScan's values against
   `server.max_multi_scan_values`; then the in-flight bound; then the
   table's readiness; then a key or bound of the wrong variant and a
   column the table does not serve, which need the loaded snapshot. So a

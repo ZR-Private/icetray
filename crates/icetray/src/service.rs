@@ -19,27 +19,32 @@
 //! each step as far as it applies to the call, and answer the first fault
 //! found:
 //!
-//! 1. The request on its own, whatever its table: a missing key, an unset
-//!    direction, a bound with no variant, a `start` at or above a `before`
-//!    of its variant, a column named twice, and a field list with a number
-//!    out of range or named twice (`INVALID_ARGUMENT`).
-//! 2. The table's configuration, which needs no generation: a table not
-//!    served (`NOT_FOUND`), a call of the wrong kind, a limit of 0 or above
-//!    `max_scan_rows`, whose fault names that bound, and a `MultiGet`'s or
-//!    `MultiScan`'s values (`INVALID_ARGUMENT`).
+//! 1. The request on its own, whatever its table: a missing key, no
+//!    direction or one the contract does not name, a bound with no
+//!    variant, a limit of 0, a `start` at or above a `before` of its
+//!    variant, a column named twice, and a field list with a number out of
+//!    range or named twice (`INVALID_ARGUMENT`).
+//! 2. The table's configuration, which needs no generation: first a table
+//!    not served (`NOT_FOUND`), then a call of the wrong kind, a limit
+//!    above `max_scan_rows`, whose fault names that bound, and a
+//!    `MultiGet`'s or `MultiScan`'s values (`INVALID_ARGUMENT`).
 //! 3. An in-flight slot (`RESOURCE_EXHAUSTED`).
 //! 4. The table's readiness (`UNAVAILABLE`).
-//! 5. The serving generation: a key of another variant than the key type,
-//!    a bound of another than the order type's, and a column the table
-//!    does not serve or a field list on one not protobuf
-//!    (`INVALID_ARGUMENT`).
+//! 5. The serving generation: a key of another variant than the key type
+//!    or a uuid key that is not sixteen bytes, a bound of another than the
+//!    order type's, and a column the table does not serve or a field list
+//!    on one not protobuf (`INVALID_ARGUMENT`).
 //!
 //! So a request whose fault needs no generation is refused for it while
-//! the table loads, never `UNAVAILABLE`, which a caller retries, and holds
-//! no slot. Steps 1 and 2 run core's checks (`check_column_reads`,
-//! `check_scan_request`, `Table::check_kind`, `Table::check_scan`,
-//! `Table::check_multi_scan`), the ones its lookups run first, so a request
-//! that passes them here passes them there.
+//! the table loads, never `UNAVAILABLE`, which a caller retries. Steps 1
+//! and 2 run core's checks (`check_column_reads`, `check_scan_request`,
+//! `Table::check_kind`, `Table::check_scan`, `Table::check_multi_scan`),
+//! the ones its lookups run first, each against the table's entry as it
+//! stands when it runs. So a request that fails them fails here, before it
+//! takes a slot, except under a reload that lowers a table's
+//! `max_scan_rows` between the two checks: core then refuses a limit this
+//! module admitted, with the same code and still ahead of readiness, after
+//! the call took its slot.
 
 use std::fmt;
 use std::sync::Arc;
@@ -1277,7 +1282,7 @@ mod tests {
     fn scan_cases() -> Vec<(Error, Code)> {
         let (limit, max) = (SAMPLE_LIMIT_U32 + 1, SAMPLE_LIMIT_U32);
         [
-            ScanRequestFault::LimitZero { max },
+            ScanRequestFault::LimitZero,
             ScanRequestFault::LimitAboveMax { limit, max },
             ScanRequestFault::BoundVariant {
                 bound: BoundSide::Start,

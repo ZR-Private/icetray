@@ -33,6 +33,11 @@
 > of its first failing key in request order, however the server
 > schedules its reads.
 
+> Updated 2026-10-20: among the faults of a table's configuration, a
+> table the server does not serve is checked first, and a Scan's or
+> MultiScan's limit of 0 is a fault of the request alone, answered
+> whatever its table. See RFD 025.
+
 ## Problem
 
 icetray answers get-by-key lookups for programs written in more than one
@@ -81,9 +86,10 @@ invalid-argument error.
 
 Get, MultiGet, Scan, and MultiScan check a request in one order and
 answer the first fault found: what the request holds on its own, such as
-a missing key or a name given twice; then what the table's configuration
-holds it to, a table not served, a call of the wrong kind, and a batch
-over its values limit among them; then the in-flight bound (RFD 013
+a missing key, a name given twice, or a Scan's limit of 0; then what the
+table's configuration holds it to, a table not served first, then a call
+of the wrong kind and a batch over its values limit among them; then the
+in-flight bound (RFD 013
 (Tail latency)); then the table's readiness; then what needs the loaded
 snapshot, such as a key in the wrong variant or a column the table does
 not serve. A fault that needs no snapshot is answered as itself while
