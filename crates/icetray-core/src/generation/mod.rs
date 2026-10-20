@@ -77,8 +77,10 @@ const LOAD_FILES_MAX: usize = 1024;
 /// verification, then in the Disk tier its chunk file's write).
 /// `LOAD_FILES_PER_WORKER` for each of the runtime's worker threads
 /// (`shard::workers`), at most `LOAD_FILES_MAX`. It is per load: tables
-/// loading at once each run their own.
-pub(crate) fn load_concurrency() -> usize {
+/// loading at once each run their own. Public so a measurement of loads
+/// records the bound it ran under rather than restating it.
+#[must_use]
+pub fn load_concurrency() -> usize {
     (shard::workers() * LOAD_FILES_PER_WORKER).min(LOAD_FILES_MAX)
 }
 

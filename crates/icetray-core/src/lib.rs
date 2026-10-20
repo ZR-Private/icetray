@@ -57,7 +57,7 @@ pub use deletes::{BlobFraming, DeleteFault, DeleteSummary};
 pub use error::{
     Budget, Error, ErrorKind, RefusalReason, Result, UnsupportedDelete, UnsupportedFormat,
 };
-pub use generation::{Generation, LoadedFile, Lookup, MultiLookup, Row};
+pub use generation::{Generation, LoadedFile, Lookup, MultiLookup, Row, load_concurrency};
 pub use index::{
     ChunkPage, DecodedPart, FileFault, FileIndex, HeaderField, OrderFences, PageHeaderFault,
     PageRef, Pair, PairPart, ResidentBytes, ResidentParts, WireType,
