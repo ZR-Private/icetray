@@ -3090,7 +3090,7 @@ mod tests {
     /// handed to it, as `drive` counted them at the spawn, and fails as
     /// canceled.
     #[tokio::test]
-    async fn test_a_lost_step_hands_back_what_its_state_owned() {
+    async fn test_stepped_losing_a_step_hands_back_what_its_state_owned() {
         let built = sharing_a_pair("l", 0).await;
         let reused = vec![false; built.len()];
         let none = vec![Vec::new(); built.len()];
