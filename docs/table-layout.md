@@ -98,7 +98,7 @@ doctor's output and the metrics spell it.
 | Key pages of 1,000 rows | Caps at `balanced` above 2,000 rows: `large_key_pages`, keys decoded per lookup | `'write.parquet.page-row-limit' = '1000'` |
 | Value pages bounded by bytes for large values | Advice, per column, when a file's mean value page for that column is over 1 MiB: `large_value_pages`. Over 64 MiB: `value_pages_over_ceiling`, and icetray fails a lookup into a page that large with an error | `'write.parquet.page-size-bytes' = '65536'` with a short page-size check interval, as the recipe above describes |
 | Full-length manifest metrics on the key | Advice: `bounds_missing` | `'write.metadata.metrics.column.key' = 'full'` |
-| A full-length column index on the key | Advice: `column_index_truncated` | `'parquet.columnindex.truncate.length'` at least the key length, such as `'256'` |
+| A full-length column index on the key | Advice: `column_index_truncated`, when under half of a file's key pages have a distinct column-index minimum, which a writer's cut to a shared prefix causes; an [ordered table](#requirements-of-an-ordered-table) is judged by its first keys instead | `'parquet.columnindex.truncate.length'` at least the key length, such as `'256'` |
 | A bloom filter on the key | Advice: `no_bloom_filter`. Under `bloom` residency, icetray refuses the table with the same reason | `'write.parquet.bloom-filter-enabled.column.key' = 'true'` |
 | A bloom filter sized for its keys | Advice: `bloom_oversized` above 4 bytes per key, `bloom_undersized` below 8 bits per key | `write.parquet.bloom-filter-max-bytes` and `write.parquet.bloom-filter-ndv.column.key`, which Iceberg honors from 1.11 |
 | Deletes compacted into the data files | Advice while deletes remove rows: `deletes_pending`, with the rows, delete files, and delete state a compaction would remove and, where files overlap, the level the table reaches once none do | A compaction that rewrites the data files the deletes apply to |
@@ -366,6 +366,16 @@ replace.
 The bloom findings `bloom_oversized` and `bloom_undersized` divide a row
 group's filter bits by the distinct keys it holds, which the load counts,
 so a repeated key counts once.
+
+The `column_index_truncated` advice counts a key's repeated pages once. A
+key's run spans many key pages that share one minimum, so a count of
+distinct page minimums over pages would read a long run as a truncated
+index. The doctor compares the distinct page minimums with the distinct
+first keys of the pages, which the load decodes, and draws the advice when
+fewer than half of those first keys still differ in the column index. An
+untruncated column index holds each page's first key as its minimum, so
+an ordered table whose runs span pages draws nothing, and one whose writer
+cut a long string key's minimums to a shared prefix draws the advice.
 
 ### Levels of an ordered table
 

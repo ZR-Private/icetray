@@ -103,8 +103,9 @@ pub mod thresholds {
     /// 100 (bloom residency tier, observations).
     pub const BLOOM_BITS_PER_KEY_MIN: f64 = 8.0;
 
-    /// The share of key pages with a distinct column-index minimum below
-    /// which `column_index_truncated` is advice. parquet-mr cuts page
+    /// The share of the key pages' distinct first keys that keep a distinct
+    /// column-index minimum, below which `column_index_truncated` is
+    /// advice (`distinct_mins_ratio`). parquet-mr cuts page
     /// minimums to 64 bytes by default, so on a table of 91-byte keys every
     /// page of a file reported one minimum; icetray routes by resident keys
     /// and served it at one GET (prototype findings, method and finding 1),
@@ -772,9 +773,10 @@ pub struct FileReport {
     /// Disk tier writes, whose whole size, header included, is the
     /// prediction's `disk_bytes`.
     pub key_chunk_bytes: u64,
-    /// The share of key pages whose column-index minimum is distinct; 1.0
-    /// when every page is addressable by it, and 1.0 for a file whose
-    /// column index cannot show truncation.
+    /// The share of the distinct first keys of the key pages that the
+    /// column index still tells apart (`distinct_mins_ratio`); 1.0 when
+    /// every page is addressable by it, and 1.0 for a file whose column
+    /// index cannot show truncation.
     pub distinct_page_mins_ratio: f64,
     /// Whether the manifest carries both key bounds and neither is shorter
     /// than the exact key it bounds, which a truncated bound is.
@@ -1689,7 +1691,11 @@ fn measure(file: &LoadedFile, layout: &TableLayout) -> FileFacts {
             bloom_bytes: predicted.filter_bytes,
             bloom_bits_per_key: predicted.bloom_bits_per_key,
             key_chunk_bytes: predicted.key_chunk_bytes,
-            distinct_page_mins_ratio: distinct_mins_ratio(metadata, index.key_leaf()),
+            distinct_page_mins_ratio: distinct_mins_ratio(
+                metadata,
+                index.key_leaf(),
+                index.fences(),
+            ),
             bounds_present: bounds_intact(&file.entry, index.key_range()),
             resident_bytes: index.resident_bytes(),
             order: order_facts.map(FileOrderReport::of),
@@ -1799,34 +1805,35 @@ fn dictionary_encoded(chunk: &ColumnChunkMetaData) -> bool {
         || encodings.is_set(Encoding::PLAIN_DICTIONARY)
 }
 
-/// The share of the key column's pages whose column-index minimum is
-/// distinct: 1.0 when every page is addressable by it, lower when a writer
-/// cut the minimums to a shared prefix. The key column is `INT64`,
-/// `BYTE_ARRAY`, or `FIXED_LEN_BYTE_ARRAY` (`FileIndex::build` refused any
-/// other), and a page without a minimum (a null page, which a key column
-/// never has) is not counted. A file without a column index, or whose
-/// index lists no page, is `DISTINCT_MINS_UNOBSERVABLE`: truncation is not
-/// observable there, so it draws no finding.
-fn distinct_mins_ratio(metadata: &ParquetMetaData, key_leaf: usize) -> f64 {
+/// The share of the distinct first keys of the key column's pages that its
+/// column index still tells apart: the distinct page minimums over the
+/// distinct first keys the load decoded (`fences`, the first key of every
+/// key page), 1.0 when every page is addressable by its minimum, lower when
+/// a writer cut the minimums to a shared prefix. An untruncated minimum is
+/// its page's first key, since the keys ascend, so the ratio is below 1.0
+/// only where a minimum is shorter than the key it bounds. On a key-value
+/// table every page starts a new key, so the distinct first keys are the
+/// pages and this is the share of pages with a distinct minimum; on an
+/// ordered table a key's run spans pages that legitimately share one
+/// minimum, and counting pages would read a long run as truncation. The key
+/// column is `INT64`, `BYTE_ARRAY`, or `FIXED_LEN_BYTE_ARRAY`
+/// (`FileIndex::build` refused any other), and a page without a minimum (a
+/// null page, which a key column never has) is not counted. A file without
+/// a column index, or whose index lists no page, is
+/// `DISTINCT_MINS_UNOBSERVABLE`: truncation is not observable there, so it
+/// draws no finding.
+fn distinct_mins_ratio(metadata: &ParquetMetaData, key_leaf: usize, fences: &[Vec<Key>]) -> f64 {
     let Some(index) = metadata.column_index() else {
         return DISTINCT_MINS_UNOBSERVABLE;
     };
-    let (mut pages, mut distinct) = (0, 0);
-    for columns in index {
-        match columns.get(key_leaf) {
-            Some(ColumnIndexMetaData::INT64(native)) => {
-                let mins: Vec<i64> = native.min_values_iter().flatten().copied().collect();
-                pages += approx::count(mins.len());
-                distinct += approx::count(mins.iter().collect::<BTreeSet<_>>().len());
-            }
+    let (mut pages, mut distinct, mut first_keys) = (0, 0, 0);
+    for (columns, group_fences) in index.iter().zip(fences) {
+        let (listed, different) = match columns.get(key_leaf) {
+            Some(ColumnIndexMetaData::INT64(native)) => tally(native.min_values_iter().flatten()),
             Some(
                 ColumnIndexMetaData::BYTE_ARRAY(bytes)
                 | ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(bytes),
-            ) => {
-                let mins: Vec<&[u8]> = bytes.min_values_iter().flatten().collect();
-                pages += approx::count(mins.len());
-                distinct += approx::count(mins.iter().collect::<BTreeSet<_>>().len());
-            }
+            ) => tally(bytes.min_values_iter().flatten()),
             Some(
                 ColumnIndexMetaData::NONE
                 | ColumnIndexMetaData::BOOLEAN(_)
@@ -1835,14 +1842,24 @@ fn distinct_mins_ratio(metadata: &ParquetMetaData, key_leaf: usize) -> f64 {
                 | ColumnIndexMetaData::FLOAT(_)
                 | ColumnIndexMetaData::DOUBLE(_),
             )
-            | None => {}
-        }
+            | None => continue,
+        };
+        pages += listed;
+        distinct += different;
+        first_keys += group_fences.iter().collect::<BTreeSet<_>>().len();
     }
     if pages == 0 {
         DISTINCT_MINS_UNOBSERVABLE
     } else {
-        approx::ratio(distinct, pages)
+        approx::ratio(approx::count(distinct), approx::count(first_keys))
     }
+}
+
+/// How many of `mins` there are, and how many of them differ.
+fn tally<T: Ord>(mins: impl Iterator<Item = T>) -> (usize, usize) {
+    let mins: Vec<T> = mins.collect();
+    let distinct = mins.iter().collect::<BTreeSet<_>>().len();
+    (mins.len(), distinct)
 }
 
 /// Whether the manifest's key bounds are present and not truncated: both
@@ -2012,7 +2029,7 @@ fn file_layout_advice(
             FindingCode::ColumnIndexTruncated,
             Some(&report.path),
             format!(
-                "{ratio:.2} of key pages have a distinct minimum in the column index, below {limit}; readers that route by it cannot tell the pages apart ({property}, at least the longest key)",
+                "{ratio:.2} of the distinct first keys of key pages keep a distinct minimum in the column index, below {limit}; readers that route by it cannot tell the pages apart ({property}, at least the longest key)",
                 ratio = report.distinct_page_mins_ratio,
                 limit = thresholds::DISTINCT_MINS_RATIO_ADVICE,
                 property = WriterProperty::ColumnIndexTruncateLength,
@@ -3391,7 +3408,7 @@ mod tests {
             .build();
         assert!(stripped.column_index().is_none());
         assert_eq!(
-            distinct_mins_ratio(&stripped, index.key_leaf()).to_bits(),
+            distinct_mins_ratio(&stripped, index.key_leaf(), index.fences()).to_bits(),
             DISTINCT_MINS_UNOBSERVABLE.to_bits()
         );
     }

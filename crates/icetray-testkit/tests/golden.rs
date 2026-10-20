@@ -1633,9 +1633,8 @@ struct ReferenceLayout {
 /// group, sized for more keys than a file of a few thousand holds.
 const REFERENCE_ADVICE: [FindingCode; 2] = [FindingCode::LongRuns, FindingCode::BloomOversized];
 
-/// The reference tables as Spark writes them; the advice and the row groups
-/// hold at the full size, `golden::REFERENCE_KEYS`, and below it the advice
-/// is a floor and the row groups go unchecked. A sorting
+/// The reference tables as Spark writes them; the row groups hold at the
+/// full size, `golden::REFERENCE_KEYS`, and below it go unchecked. A sorting
 /// compaction leaves one file in each bucket, as Spark sizes it for the
 /// target file size, so a Scan reads one file: `optimal`, with a file of
 /// one row group at the recipe's sizes and of several at
@@ -1710,22 +1709,12 @@ async fn test_golden_reference_layouts_earn_their_level_and_findings() -> Result
         assert_eq!(report.summary.level, layout.level, "{table}");
         assert_eq!(codes_of(&report), layout.capping, "{table}");
         let advice: BTreeSet<FindingCode> = advice_codes(&golden).into_iter().collect();
+        assert_eq!(
+            advice.into_iter().collect::<Vec<_>>(),
+            layout.advice,
+            "{table}"
+        );
         let full = keys == golden::REFERENCE_KEYS;
-        if full {
-            assert_eq!(
-                advice.into_iter().collect::<Vec<_>>(),
-                layout.advice,
-                "{table}"
-            );
-        } else {
-            // Fewer keys put the heavy keys' runs over more of each file's
-            // key pages, which can draw more advice, such as
-            // column_index_truncated.
-            assert!(
-                layout.advice.iter().all(|code| advice.contains(code)),
-                "{table} {advice:?}"
-            );
-        }
         let records = golden::reference_rows(keys);
         assert_eq!(report.summary.records, records, "{table}");
         if full {

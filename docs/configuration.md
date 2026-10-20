@@ -773,7 +773,7 @@ One per data file, from `doctor --files`:
 | `dictionary_columns` | The columns, key or value, that are dictionary-encoded in a row group. |
 | `bloom_bytes`, `bloom_bits_per_key` | The key's bloom filter size and bits per row; `null` when a row group has none. |
 | `key_chunk_bytes` | The key column's compressed bytes. |
-| `distinct_page_mins_ratio` | The share of key pages whose column-index minimum is distinct; low when the column index is truncated. |
+| `distinct_page_mins_ratio` | The share of the distinct first keys of the key pages that the key column's index still tells apart; low when the column index is truncated. On a key-value table every page starts a new key, so this is the share of key pages with a distinct column-index minimum; on an ordered table a key's pages share one minimum without truncation, so it is 1.0 unless a minimum is cut. |
 | `bounds_present` | Whether the manifest carries full-length key bounds. |
 | `resident_bytes` | The bytes this file's index holds in the loaded residency. |
 | `order` | Present only on an ordered table: an object of the keys below, which the load recorded from every order value in the file. |

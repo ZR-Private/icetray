@@ -419,6 +419,102 @@ async fn test_column_index_truncated_is_advice() -> Result<()> {
     Ok(())
 }
 
+/// Keys of the long-run string fixtures: few enough that each key's run
+/// fills several pages.
+const RUN_PAGES_IDS: Range<u64> = 0..20;
+
+/// Rows of each key of the long-run string fixtures: two and a half pages
+/// at `RUN_PAGES_PAGE_ROWS`, so a key's run spans several pages and fewer
+/// than half of a file's pages start a new key.
+const RUN_PAGES_ROWS_PER_KEY: u64 = 250;
+
+/// Rows per page of the long-run string fixtures.
+const RUN_PAGES_PAGE_ROWS: usize = 100;
+
+/// An ordered table of string keys, `RUN_PAGES_ROWS_PER_KEY` rows each over
+/// pages of `RUN_PAGES_PAGE_ROWS`, every key sharing a `SHARED_PREFIX_PAD`
+/// prefix, whose writer cuts the key column's index to `truncate` bytes.
+fn run_pages_spec(name: &str, truncate: Option<usize>) -> FixtureSpec {
+    FixtureSpec {
+        ids: RUN_PAGES_IDS,
+        buckets: ONE_BUCKET,
+        key_pad: SHARED_PREFIX_PAD,
+        layout: Layout {
+            page_rows: RUN_PAGES_PAGE_ROWS,
+            column_index_truncate: truncate,
+            statistics: Statistics::Full,
+            ..Layout::contract()
+        },
+        ..FixtureSpec::ordered(
+            name,
+            KeyType::String,
+            Ordered {
+                kind: OrderKind::Long,
+                rows_per_key: RowsPerKey::Each(RUN_PAGES_ROWS_PER_KEY),
+                start: ORDER_START,
+                step: ORDER_STEP,
+            },
+        )
+    }
+}
+
+/// An ordered table whose key runs span many pages draws no
+/// `column_index_truncated` while its column index holds every key whole:
+/// the pages of one key share a minimum, and that is not truncation.
+#[tokio::test]
+async fn test_column_index_truncated_is_not_advice_for_long_runs_of_whole_keys() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let (_fixture, served) =
+        write_and_serve(&catalog, run_pages_spec("ord_wholeindex", None)).await?;
+    let report = diagnose(
+        &served.current(),
+        Level::Optimal,
+        &ValueFormat::opaque,
+        None,
+    );
+    assert_codes(&report, &[], &[]);
+    let keys = usize::try_from(RUN_PAGES_IDS.end - RUN_PAGES_IDS.start).unwrap();
+    for file in &report.files {
+        assert!(
+            file.key_pages > keys,
+            "{}: a key's run spans pages, so pages repeat a minimum",
+            file.path
+        );
+        assert_eq!(
+            file.distinct_page_mins_ratio.to_bits(),
+            1.0_f64.to_bits(),
+            "{}",
+            file.path
+        );
+    }
+    Ok(())
+}
+
+/// An ordered table whose writer cut a long string key's column index to a
+/// shared prefix draws `column_index_truncated`, however long its runs.
+#[tokio::test]
+async fn test_column_index_truncated_is_advice_for_an_ordered_table() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let spec = run_pages_spec("ord_cutindex", Some(COLUMN_INDEX_TRUNCATE));
+    let (_fixture, served) = write_and_serve(&catalog, spec).await?;
+    let report = diagnose(
+        &served.current(),
+        Level::Optimal,
+        &ValueFormat::opaque,
+        None,
+    );
+    assert_codes(&report, &[], &[FindingCode::ColumnIndexTruncated]);
+    for file in &report.files {
+        assert!(
+            file.distinct_page_mins_ratio < DISTINCT_MINS_RATIO_ADVICE,
+            "{}: {}",
+            file.path,
+            file.distinct_page_mins_ratio
+        );
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_large_value_pages_is_advice() -> Result<()> {
     let (_dir, catalog) = local_catalog().await?;
