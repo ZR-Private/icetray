@@ -394,7 +394,10 @@ impl GoldenTable {
     }
 
     /// The rows the recipe filled the table with, before any change; for a
-    /// reference table, every row its writes hold at `REFERENCE_KEYS`.
+    /// reference table, every row its writes hold at the full size,
+    /// `REFERENCE_KEYS`. A reference table written with `--reference-keys`
+    /// holds `reference_rows` of the count it records under
+    /// `REFERENCE_KEYS_PROPERTY`, which a test reads from the table.
     pub fn rows(self) -> u64 {
         match self {
             Self::Long2m | Self::Str2m => ROWS_2M,
@@ -737,6 +740,12 @@ pub fn reference_rows_of(id: u64) -> u64 {
     rows.start() + spread % (rows.end() - rows.start() + 1)
 }
 
+/// The rows of a reference table of `keys` keys, every key's
+/// `reference_rows_of` summed: `REFERENCE_ROWS` at `REFERENCE_KEYS`.
+pub fn reference_rows(keys: u64) -> u64 {
+    (0..keys).map(reference_rows_of).sum()
+}
+
 /// The recipe's `reference_insert` ranges: the half-open row indexes of
 /// the key at key index `id` that each write holds, the initial load first
 /// and then each of the `APPEND_BATCHES` appends. An append's range is
@@ -1063,7 +1072,7 @@ mod tests {
             "the hash of 0 is 0, a heavy tier"
         );
         let counts: Vec<u64> = reference_ids().map(reference_rows_of).collect();
-        assert_eq!(counts.iter().sum::<u64>(), REFERENCE_ROWS);
+        assert_eq!(reference_rows(REFERENCE_KEYS), REFERENCE_ROWS);
         let tiers = [&HEAVY_ROWS, &MEDIUM_ROWS, &LIGHT_ROWS]
             .map(|rows| count(counts.iter().filter(|n| rows.contains(n)).count()));
         assert_eq!(tiers, TIER_KEYS);

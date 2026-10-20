@@ -1368,23 +1368,25 @@ async fn reference_keys(golden: &Golden) -> Result<u64> {
         .expect("the recipe records the key count in decimal digits"))
 }
 
-/// Keys sampled evenly through a reference table, beside the keys
-/// `reference_sample` names.
-const REFERENCE_STRIDE_SAMPLES: u64 = 16;
+/// The keys `reference_sample` takes from each tier of rows per key, so
+/// the sample spans the skew whatever share of the keys each tier holds.
+const REFERENCE_TIER_SAMPLES: usize = 5;
 
 /// The key indexes below `keys` whose Scans a reference table is checked
-/// on: a stride through the table, its first and last key, its heaviest,
-/// the first key of each tier, the first key with no appended rows, with
-/// rows in some appends only, and with rows in every append, and `extra`.
+/// on: the first `REFERENCE_TIER_SAMPLES` keys of each tier, the heaviest,
+/// the last key, the first key with no appended rows, with rows in some
+/// appends only, and with rows in every append, and `extra`.
 fn reference_sample(keys: u64, extra: &BTreeSet<u64>) -> BTreeSet<u64> {
-    let stride = usize::try_from((keys / REFERENCE_STRIDE_SAMPLES).max(1))
-        .expect("a stride below the key count fits usize");
-    let mut sample: BTreeSet<u64> = (0..keys).step_by(stride).collect();
-    sample.insert(keys - 1);
-    sample.extend(REFERENCE_HEAVIEST_IDS.iter().filter(|&&id| id < keys));
+    let mut sample = BTreeSet::new();
     for tier in [golden::HEAVY_ROWS, golden::MEDIUM_ROWS, golden::LIGHT_ROWS] {
-        sample.extend((0..keys).find(|&id| tier.contains(&golden::reference_rows_of(id))));
+        sample.extend(
+            (0..keys)
+                .filter(|&id| tier.contains(&golden::reference_rows_of(id)))
+                .take(REFERENCE_TIER_SAMPLES),
+        );
     }
+    sample.extend(REFERENCE_HEAVIEST_IDS.iter().filter(|&&id| id < keys));
+    sample.insert(keys - 1);
     let appended = |id: u64| -> Vec<bool> {
         golden::reference_writes(id)[1..]
             .iter()
@@ -1631,7 +1633,9 @@ struct ReferenceLayout {
 /// group, sized for more keys than a file of a few thousand holds.
 const REFERENCE_ADVICE: [FindingCode; 2] = [FindingCode::LongRuns, FindingCode::BloomOversized];
 
-/// The reference tables as Spark writes them at the full size. A sorting
+/// The reference tables as Spark writes them; the advice and the row groups
+/// hold at the full size, `golden::REFERENCE_KEYS`, and below it the advice
+/// is a floor and the row groups go unchecked. A sorting
 /// compaction leaves one file in each bucket, as Spark sizes it for the
 /// target file size, so a Scan reads one file: `optimal`, with a file of
 /// one row group at the recipe's sizes and of several at
@@ -1706,14 +1710,25 @@ async fn test_golden_reference_layouts_earn_their_level_and_findings() -> Result
         assert_eq!(report.summary.level, layout.level, "{table}");
         assert_eq!(codes_of(&report), layout.capping, "{table}");
         let advice: BTreeSet<FindingCode> = advice_codes(&golden).into_iter().collect();
-        assert_eq!(
-            advice.into_iter().collect::<Vec<_>>(),
-            layout.advice,
-            "{table}"
-        );
-        let records: u64 = (0..keys).map(golden::reference_rows_of).sum();
+        let full = keys == golden::REFERENCE_KEYS;
+        if full {
+            assert_eq!(
+                advice.into_iter().collect::<Vec<_>>(),
+                layout.advice,
+                "{table}"
+            );
+        } else {
+            // Fewer keys put the heavy keys' runs over more of each file's
+            // key pages, which can draw more advice, such as
+            // column_index_truncated.
+            assert!(
+                layout.advice.iter().all(|code| advice.contains(code)),
+                "{table} {advice:?}"
+            );
+        }
+        let records = golden::reference_rows(keys);
         assert_eq!(report.summary.records, records, "{table}");
-        if keys == golden::REFERENCE_KEYS {
+        if full {
             assert_eq!(records, table.rows(), "{table}");
         }
         let buckets = usize::try_from(table.buckets()).unwrap();
@@ -1732,12 +1747,16 @@ async fn test_golden_reference_layouts_earn_their_level_and_findings() -> Result
             buckets * files_per_bucket,
             "{table}"
         );
-        assert_eq!(
-            report.files.iter().all(|file| file.row_groups > 1),
-            layout.row_groups_per_file_above_one,
-            "{table}: dev/golden-tables.py writes ref_large_files in row groups of a quarter \
-             of a bucket and the others in one; regenerate the table"
-        );
+        // Row groups are sized in bytes, so below the full size a bucket
+        // can fit in one.
+        if full {
+            assert_eq!(
+                report.files.iter().all(|file| file.row_groups > 1),
+                layout.row_groups_per_file_above_one,
+                "{table}: dev/golden-tables.py writes ref_large_files in row groups of a \
+                 quarter of a bucket and the others in one; regenerate the table"
+            );
+        }
         let order = report.summary.order.as_ref().expect("an ordered table");
         let expected_type = if table == GoldenTable::RefString {
             OrderType::String

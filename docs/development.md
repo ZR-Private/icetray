@@ -55,7 +55,8 @@ Two suites need fixtures and show as ignored under a plain `cargo test`.
   writer's default), the other layouts whose capping and advice
   findings the doctor reports, the contract tables Spark then changes with
   merge-on-read, and the ordered tables (many rows per key, each with an
-  order value) that Spark appends to, MERGEs into, and compacts.
+  order value) that Spark appends to, MERGEs into, and compacts. With
+  `--reference` it runs the reference group's tests instead (below).
 
 ```sh
 dev/golden-tables.sh
@@ -109,18 +110,23 @@ compact it with a sort by key and order value:
 - `ref_string`: `ref_compacted` with each instant as ISO-8601 UTC text.
 - `ref_large_files`: row groups of 6 MiB, about four in each bucket's file.
 
-On the 4-CPU, 8 GiB colima VM `dev/runtime.sh` starts, the group takes
-about four minutes, about a minute a table, and the warehouse grows by
-about 12 GB, the files each compaction replaced included. The VM's disk
-also grows while Spark spills, and does not shrink, so keep about twice
-that free before writing the group. `--reference-keys` writes fewer keys
-for a quick run, and the tests derive the rows of whatever count the
-tables record. The group's tests run with the others under
-`dev/test-golden.sh`, which fails them until the group is written:
+After each compaction the recipe expires the older snapshots and
+removes the files no snapshot lists, so a table root holds only its live
+files. On the 4-CPU, 8 GiB colima VM `dev/runtime.sh` starts, the group
+takes about four minutes, about a minute a table, and the warehouse grows
+by about 7 GB. The VM's disk also grows while Spark spills, and does not
+shrink, so keep about twice that free before writing the group.
+`--reference-keys` writes fewer keys for a quick run, and the tests
+derive the rows of whatever count the tables record; below the full size
+they check the advice as a floor and leave the row groups unchecked,
+since both follow the bytes per bucket. `dev/test-golden.sh` skips the
+group's tests, `test_golden_reference_*`, and `dev/test-golden.sh
+--reference` runs them alone:
 
 ```sh
 dev/golden-tables.sh --only reference
 dev/golden-tables.sh --only reference --reference-keys 20000
+ICETRAY_GOLDEN_WAREHOUSE=file://$PWD/target/golden-warehouse dev/test-golden.sh --reference
 ```
 
 The tables are also the quickest way to try the binary: `icetray get

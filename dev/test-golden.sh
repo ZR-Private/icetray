@@ -5,7 +5,21 @@
 #
 #   python3 dev/golden-tables.py --warehouse file:///tmp/icetray-golden
 #   ICETRAY_GOLDEN_WAREHOUSE=file:///tmp/icetray-golden dev/test-golden.sh
+#   ICETRAY_GOLDEN_WAREHOUSE=file:///tmp/icetray-golden dev/test-golden.sh --reference
+#
+# The reference group's tests, named test_golden_reference_*, read tables a
+# default recipe run does not write (dev/golden-tables.py --only reference),
+# so they run only under --reference, and then alone.
 set -euo pipefail
+
+# The name every reference group test carries, which cargo's filter matches.
+REFERENCE_TESTS=test_golden_reference_
+
+case "${1:-}" in
+--reference) filter=("$REFERENCE_TESTS") ;;
+"") filter=(--skip "$REFERENCE_TESTS") ;;
+*) echo "usage: dev/test-golden.sh [--reference]" >&2; exit 64 ;;
+esac
 
 if [ -z "${ICETRAY_GOLDEN_WAREHOUSE:-}" ]; then
   echo "ICETRAY_GOLDEN_WAREHOUSE is not set: run dev/golden-tables.py and export the warehouse it wrote" >&2
@@ -23,4 +37,4 @@ file://*)
 esac
 export ICETRAY_GOLDEN_WAREHOUSE
 
-cargo test --workspace --locked --test golden -- --ignored
+cargo test --workspace --locked --test golden -- --ignored "${filter[@]}"

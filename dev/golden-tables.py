@@ -9,7 +9,7 @@ vectors in version 3, and ordered tables (RFD 025): many rows per key,
 each with an order value, written by appends, skew-split writes, a MERGE,
 and a sorting compaction. The reference group, written only when --only
 names it, holds ordered tables near a production table's size: about 20
-million rows each, about 10 GB together. Run it against any object store
+million rows each, about 7 GB together. Run it against any object store
 or local directory; the tests locate the result through
 ICETRAY_GOLDEN_WAREHOUSE.
 
@@ -45,6 +45,7 @@ write.
 
 import argparse
 import time
+from datetime import datetime, timezone
 from typing import NamedTuple, Optional
 
 ICEBERG_PACKAGE = "org.apache.iceberg:iceberg-spark-runtime-4.1_2.13:1.11.0"
@@ -527,6 +528,24 @@ def rewrite_rolled(spark, name, table):
     )
 
 
+def expire_replaced(spark, name, table):
+    """Expires every snapshot but the current one, which deletes the files
+    only they listed, then removes any file no snapshot lists, so the table
+    root holds only the live files a compaction left. The cutoff is now:
+    the recipe is the table's only writer while it runs. The
+    `remove_orphan_files` procedure refuses a cutoff under a day, so the
+    orphan pass goes through Iceberg's action API, which takes any."""
+    now = datetime.now(timezone.utc)
+    spark.sql(
+        f"CALL {CATALOG}.system.expire_snapshots(table => '{qualified(name)}', "
+        f"older_than => TIMESTAMP '{now.strftime('%Y-%m-%d %H:%M:%S.%f')}', retain_last => 1)"
+    )
+    jvm = spark._jvm
+    iceberg_table = jvm.org.apache.iceberg.spark.Spark3Util.loadIcebergTable(spark._jsparkSession, name)
+    actions = jvm.org.apache.iceberg.spark.actions.SparkActions.get(spark._jsparkSession)
+    actions.deleteOrphanFiles(iceberg_table).olderThan(int(now.timestamp() * 1000)).execute()
+
+
 def qualified(name):
     """The table's name within the catalog, as a procedure takes it."""
     return name.removeprefix(f"{CATALOG}.")
@@ -551,7 +570,7 @@ CONTRACT_GROUP = "contract"
 OFF_CONTRACT_GROUP = "off-contract"
 MOR_GROUP = "mor"
 ORDERED_GROUP = "ordered"
-# Written only when `--only` names it or one of its tables: about 10 GB.
+# Written only when `--only` names it or one of its tables: about 7 GB.
 REFERENCE_GROUP = "reference"
 
 
@@ -804,7 +823,8 @@ TABLES = [
     ),
     # The reference tables: `REFERENCE_KEYS` keys in `REFERENCE_BUCKETS`
     # buckets, an initial load and `APPEND_BATCHES` appends of later rows,
-    # then a sorting compaction to the recipe's sizes.
+    # then a sorting compaction to the recipe's sizes, keeping only the
+    # files it left.
     Golden(
         "ref_compacted",
         REFERENCE_GROUP,
@@ -814,7 +834,7 @@ TABLES = [
         None,
         REFERENCE_REPEATS,
         incompressible=True,
-        changes=(append_batches, rewrite_sorted),
+        changes=(append_batches, rewrite_sorted, expire_replaced),
         order=OrderShape(timed=True),
     ),
     # The same writes left uncompacted: up to one file a bucket per write.
@@ -840,7 +860,7 @@ TABLES = [
         None,
         REFERENCE_REPEATS,
         incompressible=True,
-        changes=(append_batches, rewrite_sorted),
+        changes=(append_batches, rewrite_sorted, expire_replaced),
         order=OrderShape(timed=True, string=True),
     ),
     # `ref_compacted` with each bucket's file in row groups of about a
@@ -858,7 +878,7 @@ TABLES = [
             "write.parquet.row-group-size-bytes": str(LARGE_ROW_GROUP_BYTES),
         },
         incompressible=True,
-        changes=(append_batches, rewrite_sorted),
+        changes=(append_batches, rewrite_sorted, expire_replaced),
         order=OrderShape(timed=True),
     ),
 ]
