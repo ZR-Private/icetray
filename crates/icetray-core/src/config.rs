@@ -1609,6 +1609,56 @@ impl RewriteRule {
     }
 }
 
+/// What separates the two halves of a rule's `FROM=TO` text; the first
+/// occurrence, since a location may itself carry one.
+pub const REWRITE_SEPARATOR: char = '=';
+
+/// A rule from `FROM=TO`, split at the first `REWRITE_SEPARATOR` and checked
+/// by `RewriteRule::fault`, the check a file's rules go through, so text
+/// the file would refuse is refused here: the one parser of a rule given
+/// as text, on the command line or in an environment variable.
+impl std::str::FromStr for RewriteRule {
+    type Err = RewriteTextFault;
+
+    fn from_str(text: &str) -> std::result::Result<Self, RewriteTextFault> {
+        let (from, to) = text
+            .split_once(REWRITE_SEPARATOR)
+            .ok_or(RewriteTextFault::NoSeparator)?;
+        let rule = Self {
+            from: from.to_string(),
+            to: to.to_string(),
+        };
+        match rule.fault() {
+            None => Ok(rule),
+            Some(RewriteFault::EmptyFrom) => Err(RewriteTextFault::EmptyFrom),
+            Some(RewriteFault::EmptyTo) => Err(RewriteTextFault::EmptyTo),
+        }
+    }
+}
+
+/// The rule as `FROM=TO`, the text `FromStr` reads back.
+impl fmt::Display for RewriteRule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}{REWRITE_SEPARATOR}{}", self.from, self.to)
+    }
+}
+
+/// Why `FROM=TO` text is not a rewrite rule (`RewriteRule::from_str`): the
+/// faults `RewriteRule::fault` finds in a file's rule, named by the halves
+/// of the text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum RewriteTextFault {
+    /// No `=` separates `FROM` from `TO`.
+    #[error("no = separates FROM from TO")]
+    NoSeparator,
+    /// `FROM` is empty, so the rule would rewrite every location.
+    #[error("FROM is empty")]
+    EmptyFrom,
+    /// `TO` is empty, so every location it matches would become relative.
+    #[error("TO is empty")]
+    EmptyTo,
+}
+
 /// Why a rewrite rule is unusable (`RewriteRule::fault`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RewriteFault {
@@ -4201,6 +4251,33 @@ locaton = "typo"
             );
         }
         assert!(Config::parse(&format!("{TOML_MINIMAL}{usable}")).is_ok());
+    }
+
+    #[test]
+    fn test_from_str_rewrite_rule_splits_at_the_first_separator_and_displays_back() {
+        let text = "s3://a/=s3://b/?x=1";
+        let rule: RewriteRule = text.parse().unwrap();
+        assert_eq!(
+            rule,
+            RewriteRule {
+                from: "s3://a/".to_string(),
+                to: "s3://b/?x=1".to_string(),
+            }
+        );
+        assert_eq!(rule.to_string(), text);
+    }
+
+    #[test]
+    fn test_from_str_rewrite_rule_refuses_a_rule_the_file_would_refuse() {
+        let cases = [
+            ("no-separator", RewriteTextFault::NoSeparator),
+            ("=s3://b/", RewriteTextFault::EmptyFrom),
+            ("s3://a/=", RewriteTextFault::EmptyTo),
+            ("=", RewriteTextFault::EmptyFrom),
+        ];
+        for (text, fault) in cases {
+            assert_eq!(text.parse::<RewriteRule>(), Err(fault), "{text:?}");
+        }
     }
 
     #[test]

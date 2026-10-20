@@ -12,13 +12,12 @@ use clap::builder::{NonEmptyStringValueParser, PossibleValuesParser, Styles, Typ
 use clap::{Args, Parser, Subcommand};
 use icetray_core::catalog::{is_relative_path, table_root_name};
 use icetray_core::config::{
-    Config, ConfigViolation, DEFAULT_RESIDENCY, Residency, RewriteFault, RewriteRule, ServerConfig,
-    SourceConfig, StorageConfig, TableConfig, ValueColumnConfig, ValueFormat,
+    Config, ConfigViolation, DEFAULT_RESIDENCY, Residency, RewriteRule, ServerConfig, SourceConfig,
+    StorageConfig, TableConfig, ValueColumnConfig, ValueFormat,
 };
 
 use crate::error::{
     CliError, ColumnTextFault, EXIT_BELOW_LEVEL, EXIT_FAILURE, EXIT_OK, EXIT_USAGE,
-    RewriteTextFault,
 };
 use crate::reload::{ConfigFile, ConfigSource as _, Reading};
 
@@ -48,10 +47,6 @@ pub const DEFAULT_REF: &str = "main";
 /// `disk` is not offered; the doctor under `full` already reports each
 /// tier's predicted bytes.
 const LOCATED_RESIDENCIES: [Residency; 2] = [Residency::Full, Residency::Bloom];
-
-/// What separates the two halves of a `--rewrite FROM=TO` rule; the first
-/// occurrence, since a location may itself carry one.
-const REWRITE_SEPARATOR: char = '=';
 
 /// What separates a `--column` name from its field list, `NAME=FIELDS`; the
 /// last occurrence, so a name holding one is still named, as `NAME=` for
@@ -272,7 +267,6 @@ pub struct Target {
     #[arg(
         long,
         value_name = "FROM=TO",
-        value_parser = parse_rewrite,
         help_heading = HEADING_TABLES
     )]
     pub rewrite: Vec<RewriteRule>,
@@ -407,24 +401,6 @@ fn located_residency() -> impl TypedValueParser<Value = Residency> {
     })
 }
 
-/// A `--rewrite` rule from `FROM=TO`, split at the first `=` and checked by
-/// `RewriteRule::fault`, the check a file's rules go through, so a rule
-/// the file would refuse is refused here as a usage error.
-fn parse_rewrite(text: &str) -> Result<RewriteRule, RewriteTextFault> {
-    let (from, to) = text
-        .split_once(REWRITE_SEPARATOR)
-        .ok_or(RewriteTextFault::NoSeparator)?;
-    let rule = RewriteRule {
-        from: from.to_string(),
-        to: to.to_string(),
-    };
-    match rule.fault() {
-        None => Ok(rule),
-        Some(RewriteFault::EmptyFrom) => Err(RewriteTextFault::EmptyFrom),
-        Some(RewriteFault::EmptyTo) => Err(RewriteTextFault::EmptyTo),
-    }
-}
-
 /// One `get --column`: the column's name and the field numbers to trim its
 /// values to, empty for the whole value.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -525,7 +501,7 @@ impl Target {
     /// location with server and storage defaults, never strict, since no
     /// configuration asks for it and a located table is opened to be
     /// inspected, and validated as a file is. The `--rewrite` rules, which
-    /// `parse_rewrite` already held to the file's rule check, then go ahead
+    /// `RewriteRule::from_str` already held to the file's rule check, then go ahead
     /// of the file's in `storage.rewrite`, and storage applies the first
     /// rule that matches, so a command-line rule takes precedence over the
     /// file's for the same prefix. A violation names a file rule by its
@@ -1136,30 +1112,6 @@ value_columns = ["value"]
                 ),
                 "{flag}: {refused:?}"
             );
-        }
-    }
-
-    #[test]
-    fn test_parse_rewrite_splits_at_the_first_separator() {
-        assert_eq!(
-            parse_rewrite("s3://a/=s3://b/?x=1"),
-            Ok(RewriteRule {
-                from: "s3://a/".to_string(),
-                to: "s3://b/?x=1".to_string(),
-            })
-        );
-    }
-
-    #[test]
-    fn test_parse_rewrite_refuses_a_rule_the_file_would_refuse() {
-        let cases = [
-            ("no-separator", RewriteTextFault::NoSeparator),
-            ("=s3://b/", RewriteTextFault::EmptyFrom),
-            ("s3://a/=", RewriteTextFault::EmptyTo),
-            ("=", RewriteTextFault::EmptyFrom),
-        ];
-        for (text, fault) in cases {
-            assert_eq!(parse_rewrite(text), Err(fault), "{text:?}");
         }
     }
 

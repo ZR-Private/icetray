@@ -4,9 +4,9 @@
 //! `serve` at start, and a refused reload report it; `ServeError` every
 //! failure of the daemon once its configuration and logging are in place,
 //! which reaches the exit code as `CliError::Serve`; `KeyTextFault` why
-//! command-line text is not a key; `RewriteTextFault` why `--rewrite` text
-//! is not a rule; `ColumnTextFault` why `--column` text is not a column
-//! read; `WireKeyFault` why a wire key is not a key; `WireScanFault` why a
+//! command-line text is not a key (core's `RewriteTextFault` says why
+//! `--rewrite` text is not a rule); `ColumnTextFault` why `--column` text
+//! is not a column read; `WireKeyFault` why a wire key is not a key; `WireScanFault` why a
 //! Scan's direction or bound is not one; `CallFault`
 //! why the service ended a call on one of its own bounds.
 //! `CliError::exit_code` is the one exhaustive match from a subcommand's
@@ -151,24 +151,6 @@ impl KeyTextFault {
             Self::NotAUuid { .. } => KeyType::Uuid,
         }
     }
-}
-
-/// Why `--rewrite` text is not a rule. clap reports it as a value
-/// validation failure with the flag and the text, so the run ends with
-/// `EXIT_USAGE` before anything is opened. The two empty halves are the
-/// faults `RewriteRule::fault` finds in a file's rule, named here by the
-/// halves of the flag's `FROM=TO`.
-#[derive(Debug, PartialEq, Eq, thiserror::Error)]
-pub enum RewriteTextFault {
-    /// No `=` separates `FROM` from `TO`.
-    #[error("no = separates FROM from TO")]
-    NoSeparator,
-    /// `FROM` is empty, so the rule would rewrite every location.
-    #[error("FROM is empty")]
-    EmptyFrom,
-    /// `TO` is empty, so every location it matches would become relative.
-    #[error("TO is empty")]
-    EmptyTo,
 }
 
 /// Why `--column` text is not a column read. clap reports it as a value

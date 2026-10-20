@@ -48,8 +48,8 @@ pub use check::{
 pub use column::ColumnMismatch;
 pub use config::{
     ColumnSetting, Config, ConfigError, ConfigViolation, DEFAULT_MAX_SCAN_ROWS, DEFAULT_RESIDENCY,
-    HedgeConfig, LocalConfig, LogConfig, Residency, RewriteFault, RewriteRule, S3Config,
-    ServerConfig, SourceConfig, SourceSetting, StandardField, StorageConfig, TableConfig,
+    HedgeConfig, LocalConfig, LogConfig, Residency, RewriteFault, RewriteRule, RewriteTextFault,
+    S3Config, ServerConfig, SourceConfig, SourceSetting, StandardField, StorageConfig, TableConfig,
     ValueColumnConfig, ValueFormat,
 };
 pub use deletes::{BlobFraming, DeleteFault, DeleteSummary};

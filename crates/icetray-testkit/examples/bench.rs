@@ -681,7 +681,7 @@ struct Cli {
     /// table written under a local directory and copied to object storage
     /// is read from the copy with
     /// `--rewrite-location file:///dir/=s3://bucket/dir/`.
-    #[arg(long, value_parser = parse_rewrite)]
+    #[arg(long)]
     rewrite_location: Vec<RewriteRule>,
     /// The GETs one `MultiGet` holds in flight on every table of the run,
     /// as `server.batch_fan_out` bounds them; its default when absent.
@@ -691,20 +691,6 @@ struct Cli {
         value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..),
     )]
     batch_fan_out: usize,
-}
-
-/// What separates a `--rewrite-location` rule's two prefixes.
-const REWRITE_SEPARATOR: char = '=';
-
-/// A `--rewrite-location` rule from `FROM=TO`, split at the first `=`.
-fn parse_rewrite(text: &str) -> Result<RewriteRule, String> {
-    let (from, to) = text
-        .split_once(REWRITE_SEPARATOR)
-        .ok_or_else(|| format!("{text:?} is not FROM=TO"))?;
-    Ok(RewriteRule {
-        from: from.to_string(),
-        to: to.to_string(),
-    })
 }
 
 /// How every table of the run is served: over the production storage
