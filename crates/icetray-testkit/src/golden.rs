@@ -2,12 +2,17 @@
 //! are, what each holds, and the key and value expressions of the recipe as
 //! Rust, so a G-tier test checks an answer without a stored oracle. The
 //! tables live outside the tree, named by `ICETRAY_GOLDEN_WAREHOUSE`; a run
-//! without it fails on `Precondition::GoldenUnset` rather than passing.
+//! without it fails on `Precondition::GoldenUnset` rather than passing. A
+//! copy of the warehouse elsewhere, whose metadata still names the original
+//! locations, is read through the rewrite rules `ICETRAY_GOLDEN_REWRITE`
+//! holds.
 
 use std::fmt::{self, Write as _};
 use std::ops::{Range, RangeInclusive};
 
-use icetray_core::config::{Config, ServerConfig, SourceConfig, StorageConfig, TableConfig};
+use icetray_core::config::{
+    Config, RewriteRule, ServerConfig, SourceConfig, StorageConfig, TableConfig,
+};
 use icetray_core::key::HEX_DIGITS_PER_BYTE;
 use icetray_core::{Key, KeyType, OrderValue, Residency};
 use sha2::digest::OutputSizeUser;
@@ -22,6 +27,18 @@ use crate::ordered::{ORDER_COLUMN, OrderKind};
 /// The environment variable naming the warehouse the recipe wrote into: an
 /// `s3a://` or `file://` location whose `db/` holds the tables.
 pub const WAREHOUSE_VAR: &str = "ICETRAY_GOLDEN_WAREHOUSE";
+
+/// The environment variable holding the rewrite rules of a copied
+/// warehouse, `FROM=TO` rules separated by `REWRITE_LIST_SEPARATOR`, each
+/// applied as `[[storage.rewrite]]` applies it; unset or empty is none.
+/// Spark names a local warehouse's files both as `file:///dir` (a table's
+/// location) and as `file:/dir` (its manifest lists and data files), so a
+/// copy of one takes a rule for each form.
+pub const REWRITE_VAR: &str = "ICETRAY_GOLDEN_REWRITE";
+
+/// What separates two rules in `REWRITE_VAR`: a character no location
+/// holds, unlike the `=` inside a rule and the `,` of an S3 key.
+pub const REWRITE_LIST_SEPARATOR: char = ';';
 
 /// The namespace the recipe creates every table in (`CATALOG.db`).
 const NAMESPACE: &str = "db";
@@ -456,10 +473,46 @@ impl fmt::Display for GoldenTable {
     }
 }
 
-/// The warehouse location from the environment; `Precondition::GoldenUnset`
-/// when the variable is absent or not text.
-pub fn warehouse() -> Result<String> {
-    required_var(WAREHOUSE_VAR, Precondition::GoldenUnset)
+/// Where the golden tables are read from: the warehouse the recipe wrote
+/// into or a copy of it, and the rewrite rules that send the locations its
+/// metadata names to the copy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Warehouse {
+    /// The location whose `db/` holds the tables.
+    pub location: String,
+    /// The rules every location is rewritten by, first match first.
+    pub rewrite: Vec<RewriteRule>,
+}
+
+impl Warehouse {
+    /// The warehouse `WAREHOUSE_VAR` names, read through the rules
+    /// `REWRITE_VAR` holds; `Precondition::GoldenUnset` when the warehouse
+    /// variable is absent or not text, `Precondition::GoldenRewrite` for a
+    /// rule that is not `FROM=TO`.
+    pub fn from_env() -> Result<Self> {
+        let location = required_var(WAREHOUSE_VAR, Precondition::GoldenUnset)?;
+        let rewrite = std::env::var(REWRITE_VAR)
+            .map_or_else(|_| Ok(Vec::new()), |text| rewrite_rules(&text))?;
+        Ok(Self { location, rewrite })
+    }
+}
+
+/// The rules of `text`, `FROM=TO` rules separated by
+/// `REWRITE_LIST_SEPARATOR`, in order; an empty entry, as a trailing
+/// separator leaves, is skipped.
+pub fn rewrite_rules(text: &str) -> Result<Vec<RewriteRule>> {
+    text.split(REWRITE_LIST_SEPARATOR)
+        .filter(|rule| !rule.is_empty())
+        .map(|rule| {
+            rule.parse().map_err(|fault| {
+                Precondition::GoldenRewrite {
+                    rule: rule.to_string(),
+                    fault,
+                }
+                .into()
+            })
+        })
+        .collect()
 }
 
 /// The root of `table` under `warehouse`: `{warehouse}/db/{name}`, as the
@@ -488,14 +541,18 @@ pub fn table_config(warehouse: &str, table: GoldenTable, strict: bool) -> TableC
     }
 }
 
-/// A configuration serving `table` alone with default server and storage
-/// settings; an `s3a://` warehouse needs the SDK's credential chain, so the
-/// G tests open it through `icetray_core::open`.
-pub fn config(warehouse: &str, table: GoldenTable, strict: bool) -> Config {
+/// A configuration serving `table` of `warehouse` alone with default server
+/// and storage settings and the warehouse's rewrite rules; an `s3a://`
+/// warehouse needs the SDK's credential chain, so the G tests open it
+/// through `icetray_core::open`.
+pub fn config(warehouse: &Warehouse, table: GoldenTable, strict: bool) -> Config {
     Config {
         server: ServerConfig::default(),
-        storage: StorageConfig::default(),
-        tables: vec![table_config(warehouse, table, strict)],
+        storage: StorageConfig {
+            rewrite: warehouse.rewrite.clone(),
+            ..StorageConfig::default()
+        },
+        tables: vec![table_config(&warehouse.location, table, strict)],
     }
 }
 
@@ -817,8 +874,14 @@ fn hex_digest(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::TestkitError;
+    use crate::fixture::{
+        FixtureSpec, NAMESPACE as FIXTURE_NAMESPACE, memory_catalog_local, write_fixture,
+    };
     use crate::keys::{STRING_KEY_FIXED_BYTES, STRING_PAD};
     use icetray_core::approx::count;
+    use icetray_core::config::RewriteTextFault;
+    use icetray_core::{ColumnRead, FILE_PREFIX, FindingLog, Row};
 
     /// Every table, beside the name the recipe writes it under.
     const NAMES: [(GoldenTable, &str); 24] = [
@@ -886,6 +949,137 @@ mod tests {
         assert_eq!(config.name, "str_2m");
         assert!(!config.strict);
         assert_eq!(config.residency, Residency::Full);
+    }
+
+    /// A rule of the form a local warehouse needs, and its manifests'.
+    const LOCAL_RULE: &str = "file:///w/=s3a://bucket/copy/";
+    const MANIFEST_RULE: &str = "file:/w/=s3a://bucket/copy/";
+
+    #[test]
+    fn test_rewrite_rules_reads_rules_in_order_skipping_empty_entries() {
+        let text = format!("{LOCAL_RULE};{MANIFEST_RULE};");
+        let rules = rewrite_rules(&text).unwrap();
+        assert_eq!(
+            rules,
+            [LOCAL_RULE, MANIFEST_RULE].map(|rule| rule.parse::<RewriteRule>().unwrap())
+        );
+        assert_eq!(rewrite_rules("").unwrap(), []);
+    }
+
+    #[test]
+    fn test_rewrite_rules_refuses_a_rule_that_is_not_from_to() {
+        let text = format!("{LOCAL_RULE};file:///w/");
+        assert!(matches!(
+            rewrite_rules(&text),
+            Err(TestkitError::Precondition(Precondition::GoldenRewrite {
+                ref rule,
+                fault: RewriteTextFault::NoSeparator,
+            })) if rule == "file:///w/"
+        ));
+    }
+
+    #[test]
+    fn test_config_carries_the_warehouse_rewrites() {
+        let warehouse = Warehouse {
+            location: "s3a://bucket/copy".to_string(),
+            rewrite: rewrite_rules(LOCAL_RULE).unwrap(),
+        };
+        let config = config(&warehouse, GoldenTable::Long2m, false);
+        assert_eq!(config.storage.rewrite, warehouse.rewrite);
+        assert_eq!(
+            config.tables[0].source,
+            SourceConfig::Static {
+                location: "s3a://bucket/copy/db/long_2m".to_string()
+            }
+        );
+    }
+
+    /// The table a test writes under one directory and moves to a
+    /// warehouse in another: a key-value table of long keys under a golden
+    /// name, so `config` serves it.
+    const MOVED_TABLE: GoldenTable = GoldenTable::Long2m;
+
+    /// A table moved out of the directory its metadata names is read from
+    /// its new place through the warehouse's rewrite, and not without it.
+    #[tokio::test]
+    async fn test_config_reads_a_moved_warehouse_through_its_rewrites() {
+        let written = tempfile::tempdir().unwrap();
+        let catalog = memory_catalog_local(written.path()).await.unwrap();
+        let spec = FixtureSpec::small(&MOVED_TABLE.to_string(), KeyType::Long);
+        let fixture = write_fixture(catalog.as_ref(), FIXTURE_NAMESPACE, spec)
+            .await
+            .unwrap();
+        fixture.write_hint().await.unwrap();
+        let moved = tempfile::tempdir().unwrap();
+        let moved_root = moved.path().join(NAMESPACE).join(MOVED_TABLE.to_string());
+        copy_tree(
+            &written
+                .path()
+                .join(FIXTURE_NAMESPACE)
+                .join(MOVED_TABLE.to_string()),
+            &moved_root,
+        );
+        drop(written);
+        let location = format!("{FILE_PREFIX}{}", moved.path().display());
+        let rewrite = RewriteRule {
+            from: fixture.root().to_string(),
+            to: format!("{FILE_PREFIX}{}", moved_root.display()),
+        };
+        let unrewritten = Warehouse {
+            location: location.clone(),
+            rewrite: Vec::new(),
+        };
+        let opened = icetray_core::open(
+            &config(&unrewritten, MOVED_TABLE, false),
+            None,
+            FindingLog::Events,
+        )
+        .await
+        .unwrap();
+        let unread = opened.tables()[0].load().await;
+        assert!(
+            matches!(
+                unread,
+                Err(icetray_core::Error::ObjectStore(
+                    object_store::Error::NotFound { .. }
+                ))
+            ),
+            "the metadata names the directory the table left: {unread:?}"
+        );
+        let warehouse = Warehouse {
+            location,
+            rewrite: vec![rewrite],
+        };
+        let opened = icetray_core::open(
+            &config(&warehouse, MOVED_TABLE, false),
+            None,
+            FindingLog::Events,
+        )
+        .await
+        .unwrap();
+        let table = &opened.tables()[0];
+        table.load().await.unwrap();
+        let key = fixture.key(0);
+        let lookup = table
+            .get(&key, &[ColumnRead::whole(VALUE_COLUMN)])
+            .await
+            .unwrap();
+        assert_eq!(lookup.row, fixture.expected(&key));
+        assert!(matches!(lookup.row, Row::Present(_)));
+    }
+
+    /// Copies the directory tree at `from` to `to`, creating `to`.
+    fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let path = entry.unwrap().path();
+            let target = to.join(path.file_name().unwrap());
+            if path.is_dir() {
+                copy_tree(&path, &target);
+            } else {
+                std::fs::copy(&path, &target).unwrap();
+            }
+        }
     }
 
     #[test]

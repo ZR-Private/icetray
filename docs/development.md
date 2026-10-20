@@ -129,6 +129,22 @@ dev/golden-tables.sh --only reference --reference-keys 20000
 ICETRAY_GOLDEN_WAREHOUSE=file://$PWD/target/golden-warehouse dev/test-golden.sh --reference
 ```
 
+The tables' metadata names every file by the absolute location it was
+written at, so a copy of the warehouse elsewhere, such as on object
+storage, is read through rewrite rules. `ICETRAY_GOLDEN_REWRITE` holds
+`FROM=TO` rules separated by `;`, applied to every location as
+`[[storage.rewrite]]` applies them, first match first; the Rust tests
+add them to their configuration, and the binary's tests pass each as a
+`--rewrite`. Spark names a local warehouse's tables as `file:///dir` and
+their manifest lists and data files as `file:/dir`, so a copy takes a
+rule for each form:
+
+```sh
+ICETRAY_GOLDEN_WAREHOUSE=s3a://bucket/copy \
+ICETRAY_GOLDEN_REWRITE="file://$PWD/target/golden-warehouse=s3a://bucket/copy;file:$PWD/target/golden-warehouse=s3a://bucket/copy" \
+dev/test-golden.sh --reference
+```
+
 The tables are also the quickest way to try the binary: `icetray get
 --location target/golden-warehouse/db/long_2m --value-column value
 --column value 42` answers from one of them, and

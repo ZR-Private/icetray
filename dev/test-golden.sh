@@ -7,6 +7,14 @@
 #   ICETRAY_GOLDEN_WAREHOUSE=file:///tmp/icetray-golden dev/test-golden.sh
 #   ICETRAY_GOLDEN_WAREHOUSE=file:///tmp/icetray-golden dev/test-golden.sh --reference
 #
+# A copy of the warehouse elsewhere is read through ICETRAY_GOLDEN_REWRITE,
+# FROM=TO rules separated by ';' that send the original locations its
+# metadata names to the copy, one for file:///dir and one for file:/dir:
+#
+#   ICETRAY_GOLDEN_WAREHOUSE=s3a://bucket/copy \
+#   ICETRAY_GOLDEN_REWRITE='file:///tmp/icetray-golden=s3a://bucket/copy;file:/tmp/icetray-golden=s3a://bucket/copy' \
+#   dev/test-golden.sh
+#
 # The reference group's tests, named test_golden_reference_*, read tables a
 # default recipe run does not write (dev/golden-tables.py --only reference),
 # so they run only under --reference, and then alone.
@@ -36,5 +44,9 @@ file://*)
   ;;
 esac
 export ICETRAY_GOLDEN_WAREHOUSE
+if [ -n "${ICETRAY_GOLDEN_REWRITE:-}" ]; then
+  echo "reading $ICETRAY_GOLDEN_WAREHOUSE through ICETRAY_GOLDEN_REWRITE=$ICETRAY_GOLDEN_REWRITE" >&2
+  export ICETRAY_GOLDEN_REWRITE
+fi
 
 cargo test --workspace --locked --test golden -- --ignored "${filter[@]}"

@@ -81,7 +81,7 @@ impl Golden {
 }
 
 async fn open_golden(table: GoldenTable, strict: bool) -> Result<Golden> {
-    let warehouse = golden::warehouse()?;
+    let warehouse = golden::Warehouse::from_env()?;
     open_config(&golden::config(&warehouse, table, strict)).await
 }
 
@@ -90,7 +90,7 @@ async fn open_golden(table: GoldenTable, strict: bool) -> Result<Golden> {
 /// a count the oracle predicts; the Disk tier's local directory lives
 /// under `scratch`.
 async fn open_in(table: GoldenTable, residency: Residency, scratch: &Path) -> Result<Golden> {
-    let warehouse = golden::warehouse()?;
+    let warehouse = golden::Warehouse::from_env()?;
     let mut config = golden::config(&warehouse, table, false);
     config.tables[0].residency = residency;
     let local = match residency {
@@ -103,6 +103,7 @@ async fn open_in(table: GoldenTable, residency: Residency, scratch: &Path) -> Re
     };
     config.storage = StorageConfig {
         local,
+        rewrite: warehouse.rewrite,
         ..verify::storage_config_for_tests()
     };
     open_config(&config).await
@@ -384,7 +385,7 @@ async fn test_golden_default_layout_is_balanced() -> Result<()> {
 #[tokio::test]
 #[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
 async fn test_golden_strict_refuses_the_default_layout() -> Result<()> {
-    let warehouse = golden::warehouse()?;
+    let warehouse = golden::Warehouse::from_env()?;
     let opened = open(
         &golden::config(&warehouse, GoldenTable::DefaultLayout1m, true),
         None,

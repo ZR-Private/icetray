@@ -8,10 +8,10 @@
 
 use std::env::VarError;
 
-use icetray_core::config::Residency;
+use icetray_core::config::{Residency, RewriteTextFault};
 use icetray_core::{Key, KeyType, OrderValue};
 
-use crate::golden::WAREHOUSE_VAR;
+use crate::golden::{REWRITE_VAR, WAREHOUSE_VAR};
 use crate::ordered::OrderKind;
 use crate::truth::TruthFault;
 
@@ -218,6 +218,14 @@ pub enum Precondition {
     /// The golden warehouse is not named in the environment.
     #[error("{WAREHOUSE_VAR} is not set")]
     GoldenUnset,
+    /// The golden warehouse's rewrite rules hold one that is not `FROM=TO`.
+    #[error("{REWRITE_VAR} holds {rule:?}, which is not a rewrite rule: {fault}")]
+    GoldenRewrite {
+        /// The rule as the variable holds it.
+        rule: String,
+        /// Why it is not one.
+        fault: RewriteTextFault,
+    },
     /// The REST catalog is not named in the environment.
     #[error("{REST_URI_VAR} is not set")]
     RestUriUnset,
