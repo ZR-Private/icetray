@@ -209,10 +209,11 @@ keeps them re-reads `TableInfo` when a call it sized by them fails as
 `FAILED_PRECONDITION` for its response size. The server rejects a `Get`
 or `MultiGet` of an ordered table, and a `Scan` or `MultiScan` of a
 key-value table, as `INVALID_ARGUMENT`. It decides this from the table's
-configuration before anything else about the call, so it answers
-`INVALID_ARGUMENT` even while the table is still loading, where a call
-of the right kind meets `UNAVAILABLE` until the load completes; a caller
-does not retry it.
+configuration, so it answers `INVALID_ARGUMENT` even while the table is
+still loading, where a call of the right kind meets `UNAVAILABLE` until
+the load completes; a caller does not retry it.
+[Errors and retries](#errors-and-retries) gives the order in which the
+server checks a request.
 
 A `Scan` request carries the table, the key, the value columns to read
 as `Get` reads them, a direction, a limit, and optional bounds:
@@ -467,6 +468,32 @@ worth a retry, and the client raises its limit, or the caller lowers its
 | `UNAVAILABLE` | A read from object storage or local disk failed, the table is not ready yet, or a lookup was canceled. | Yes |
 | `DEADLINE_EXCEEDED` | A `Get`, or a page fetch within any lookup, ran past `server.get_deadline`, a `MultiGet` ran past `server.multi_get_deadline`, a `Scan`, or a GET within any `Scan` or `MultiScan`, of a span of pages or of a key page under `bloom`, ran past `server.scan_deadline`, or a `MultiScan` ran past `server.multi_scan_deadline`. [Configuration](configuration.md#server) gives each deadline. | Yes, if the caller's own deadline allows |
 | `INTERNAL` | The table's data is faulty, such as a malformed file, or two live rows of a key at one order value, which a load refuses. | Only after the table advances to another snapshot |
+
+The server checks a `Get`, `MultiGet`, `Scan`, or `MultiScan` request in
+one order and answers the first fault it finds:
+
+1. Faults in the request itself: a missing key, an unset direction, a
+   bound with no variant, a `start` at or above a `before` of the same
+   variant, a column listed twice, and a field number outside 1 to
+   536,870,911 or listed twice. `INVALID_ARGUMENT`.
+2. Faults against the table's configuration: a table the server does
+   not serve (`NOT_FOUND`), a call of the wrong kind, a limit of 0 or
+   above `max_scan_rows`, and a `MultiGet` or `MultiScan` over its
+   values limit (`INVALID_ARGUMENT`).
+3. The server's in-flight limit: `RESOURCE_EXHAUSTED` when all
+   `server.max_in_flight` slots are taken.
+4. The table's readiness: `UNAVAILABLE` until its first load completes.
+5. Faults that need the loaded table: a key variant that does not match
+   the key type, a uuid key that is not sixteen bytes, a bound of another
+   variant than the order type takes, a column the table does not serve,
+   and a field list for a column that is not protobuf.
+   `INVALID_ARGUMENT`.
+
+So the faults of steps 1 and 2 come back whatever the table's state,
+while it loads included, and never cost an in-flight slot. A request
+with a fault of step 5 is `UNAVAILABLE` while the table loads and
+`INVALID_ARGUMENT` once it serves, so a caller that retries
+`UNAVAILABLE` sees the fault after the load.
 
 The gRPC layer enforces a deadline the client sends and reports its
 expiry to the client (a tonic client sees `CANCELLED`), and the server

@@ -1,5 +1,10 @@
 # Ordered rows per key
 
+> Updated 2026-10-20: a Scan's or MultiScan's own faults and those its
+> table's configuration finds, its limit and a MultiScan's values among
+> them, are answered before the in-flight bound and the table's
+> readiness, in the order RFD 010 (Transport and client contract) gives.
+
 ## Problem
 
 icetray serves tables with at most one row per key, and that remains its
@@ -89,10 +94,16 @@ direction under a limit and optional bounds on the order value.
   unspecified direction, a limit of 0 or above `max_scan_rows`, a key
   or bound of the wrong variant, a `start` at or above `before`, which
   is an empty window, a MultiScan above `max_multi_scan_values`, or a
-  call of the wrong kind for the table. The server checks a call's kind
-  against the table's configuration before the table's readiness and
-  before the call's key, direction, or bounds, so a call of the wrong
-  kind is `INVALID_ARGUMENT` even while the table loads, and never the
+  call of the wrong kind for the table. The server checks a request in
+  the order RFD 010 gives: the request's own faults, such as an
+  unspecified direction or a `start` at or above a `before` of its
+  variant; then the table's configuration, the call's kind, the limit
+  against `max_scan_rows`, and a MultiScan's values against
+  `server.max_multi_scan_values`; then the in-flight bound; then the
+  table's readiness; then a key or bound of the wrong variant and a
+  column the table does not serve, which need the loaded snapshot. So a
+  call of the wrong kind, or one whose limit or values are out of bounds,
+  is `INVALID_ARGUMENT` even while the table loads, and never the
   retryable `UNAVAILABLE`. A value that is not
   the protobuf its column declares is `FAILED_PRECONDITION` as for `Get`
   (RFD 024), naming the order value of its row, and so is a response

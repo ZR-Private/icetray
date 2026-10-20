@@ -20,12 +20,27 @@ package icetray.v1;
 // column in a way ColumnRead does not allow. Get and MultiGet serve a table
 // with no order column, and Scan and MultiScan serve a table that has one (an
 // ordered table); a call that names a table of the other kind is an
-// INVALID_ARGUMENT error, whether or not the table has finished loading and
-// whatever else the request holds, so a caller does not retry it. A key that
-// is not in the table is a successful response, never an error. A request
-// that lists fields of a value that is not the protobuf its column declares
-// is a FAILED_PRECONDITION error, the same on every attempt until the table's
-// data changes, so a caller does not retry it.
+// INVALID_ARGUMENT error. A key that is not in the table is a successful
+// response, never an error. A request that lists fields of a value that is
+// not the protobuf its column declares is a FAILED_PRECONDITION error, the
+// same on every attempt until the table's data changes, so a caller does not
+// retry it.
+//
+// Get, MultiGet, Scan, and MultiScan check a request in one order and answer
+// the first fault found. First the request on its own: a missing key or one
+// with no variant, an unset direction, a bound with no variant, `start` at or
+// above a `before` of the same variant, a value column listed twice, and a
+// field number out of range or listed twice. Then the table's configuration:
+// a table not served (NOT_FOUND), a call of the wrong kind, a limit of 0 or
+// above max_scan_rows, and a MultiGet or MultiScan over its values limit.
+// These are answered whether or not the table has finished loading, and
+// before the call counts against the server's limit on calls in flight
+// (RESOURCE_EXHAUSTED), so a caller does not retry them. Then that limit,
+// then the table's readiness (UNAVAILABLE while it loads), and then the
+// faults that need the loaded table: a key variant that does not match the
+// key type, a bound of another variant than the order type takes, a value
+// column the table does not serve, and fields of a column that is not
+// protobuf.
 service Icetray {
   // Look up one key in one table. The response carries the id of the
   // snapshot the server read it from.

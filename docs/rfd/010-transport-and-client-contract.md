@@ -24,6 +24,11 @@
 > loads. Scan's and MultiScan's errors are those RFD 025 (Wire, Limits)
 > states.
 
+> Updated 2026-10-20: Get, MultiGet, Scan, and MultiScan check a request
+> in one order, its own faults and its table's configuration before the
+> in-flight bound and the table's readiness, so those faults are
+> answered while the table loads.
+
 ## Problem
 
 icetray answers get-by-key lookups for programs written in more than one
@@ -69,6 +74,17 @@ to trim its value to, empty for the whole value (RFD 024 (Field
 projection)); a list for a column not declared protobuf, a number
 outside protobuf's range, or a number given twice is an
 invalid-argument error.
+
+Get, MultiGet, Scan, and MultiScan check a request in one order and
+answer the first fault found: what the request holds on its own, such as
+a missing key or a name given twice; then what the table's configuration
+holds it to, a table not served, a call of the wrong kind, and a batch
+over its values limit among them; then the in-flight bound (RFD 013
+(Tail latency)); then the table's readiness; then what needs the loaded
+snapshot, such as a key in the wrong variant or a column the table does
+not serve. A fault that needs no snapshot is answered as itself while
+the table loads, and takes no in-flight slot, so the retryable
+unavailable error never stands in for a fault a load cannot change.
 
 Every result says whether the key is present or absent. A present result
 carries one value per requested column, in the order requested, and each
