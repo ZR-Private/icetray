@@ -2,15 +2,17 @@
 //! a stand-in for the AWS catalogs, the fixture writer and its delete file
 //! writers, the ordered fixtures and their scan model (RFD 025), the
 //! brute-force merge-on-read oracle, the deterministic simulation
-//! transport, a store that counts GETs per object and one that counts the
-//! rounds a read's GETs take, shared assertions, the golden-table locator
-//! (RFD 014), and the truth file a check replays against a running server.
+//! transport, a store that counts GETs per object, one that counts the
+//! rounds a read's GETs take, and one that logs each GET's range and
+//! latency, shared assertions, the golden-table locator (RFD 014), and the
+//! truth file a check replays against a running server.
 
 pub mod aws_catalog;
 pub mod counting;
 pub mod delete_files;
 pub mod error;
 pub mod fixture;
+pub mod get_log;
 pub mod golden;
 pub mod keys;
 pub mod latency;
@@ -30,6 +32,7 @@ pub use fixture::{
     DeleteForm, Fixture, FixtureSpec, HandSnapshot, Nulls, Order, RawFile, memory_catalog_local,
     memory_catalog_s3, write_fixture,
 };
+pub use get_log::{GetLog, LoggedGet};
 /// The catalog `memory_catalog_local` and `memory_catalog_s3` return, so a
 /// caller without an `iceberg` dependency can hold it.
 pub use iceberg::memory::MemoryCatalog;
