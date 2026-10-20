@@ -658,6 +658,17 @@ through settings, mounted files, and environment variables.
   transient chunks, and the allocator's fragmentation and bookkeeping. The
   `icetray_allocator_*` gauges show how much of the resident set the
   allocator accounts for.
+- `server.max_scan_bytes` bounds the response a `Scan` or `MultiScan`
+  sends, not what the call holds while it reads. Each file that holds
+  the key reads up to the limit's rows of every requested column before
+  the merge cuts them back to the limit, so one call holds about the
+  files that hold the key times its limit times its requested columns in
+  values, and reads all of them before it refuses an oversized response.
+  Up to `server.max_in_flight` such calls run at once. The doctor's
+  `large_runs` advice names a table on which a `Scan` at the full limit
+  would be refused. The owner bounds what a call holds with the table's
+  `max_scan_rows` ([Configuration](configuration.md#tables)), and with
+  compaction, which lowers the files that hold a key.
 - For `disk` tables, raise the limit by their chunk files' size, the
   doctor's `predicted.disk_bytes`. On Linux, the kernel charges the page
   cache of the files a container reads to the container's memory limit,

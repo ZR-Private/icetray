@@ -283,7 +283,19 @@ direction under a limit and optional bounds on the order value.
   `FAILED_PRECONDITION`, returning no rows and naming its size, the
   bound, and the rows that would fit, and counts it as an error; a
   caller lowers its limit, and an owner whose clients accept larger
-  messages raises the bound. `server.max_in_flight` counts every Get,
+  messages raises the bound. The bound is on the response, not on what
+  a call holds while it reads: each file that holds the key reads up to
+  the limit's rows of every requested column before the merge cuts them
+  back to the limit, so one call holds about the files that hold the key
+  times its limit times its requested columns in values, and reads all
+  of them before it refuses an oversized response. The server accepts
+  this rather than merge order values across files before reading any
+  value, which would hold one limit's rows but add a round of GETs to a
+  Scan of a key in several files. `large_runs` (Levels and findings)
+  names a table on which a Scan at the full limit would be refused, and
+  an owner bounds what a call holds with `max_scan_rows`, and with
+  compaction, which lowers the files that hold a key.
+  `server.max_in_flight` counts every Get,
   MultiGet, Scan, and MultiScan, and TableInfo takes none of its slots.
 - **Levels and findings.** RFD 020 (Lookup levels) applies, read for a
   Scan of one key. When no two files in a bucket have key ranges that
