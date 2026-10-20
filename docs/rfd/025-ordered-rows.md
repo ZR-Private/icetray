@@ -454,9 +454,14 @@ the cache holds in part costs one GET per uncached span, and under
 MultiScan at the full limit with one value column covers
 `max_multi_scan_values` over twice `max_scan_rows` keys, few at the
 defaults, so a caller reading many keys requests a smaller limit. The
-span hedge window scales its delay with a span's pages; whether a span
-GET's latency on object storage follows its pages or a fixed first-byte
-time is to be measured by span size before the window changes.
+span hedge window scales its delay with a span's pages. On S3, spans of
+one to four pages, all a Scan of about 100-byte values issued, shared
+one first-byte latency, and the scaling makes their few multi-page
+spans wait longer before a hedge, within the hedge ceiling ([ordered
+rows on S3](../analysis/2026-10-19-ordered-rows-on-s3.md#span-get-latency-by-size)).
+The scaling stays for the spans of many pages that larger values or
+limits issue, whose transfer time does grow with their size; a span
+past four pages is unmeasured.
 
 A load reads the order column once per row group, so a file costs one
 more GET per row group than RFD 004 (Resident key-chunk index) counts,
