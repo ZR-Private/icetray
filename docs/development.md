@@ -102,7 +102,7 @@ instant, and its value 128 bytes of hex digests; the testkit's
 `golden.rs` derives every row from its key's index, and the tests read
 the key count from the table property `golden.reference-keys`. Spark
 writes each table as an initial load and appends of later rows of some
-keys, four of them but in `ref_large_appended`, then `ref_compacted`,
+keys, four of them, eight in `ref_large_appended`, then `ref_compacted`,
 `ref_string`, and `ref_large_files` compact it with a sort by key and
 order value:
 
@@ -114,15 +114,17 @@ order value:
   eight appends uncompacted: nine files a bucket, 576 in all, the first
   of three or four row groups and each append's of one, 2.2 GB, most of
   the appends' bytes their 1 MiB bloom filters. A load's uniqueness
-  merges start a cursor on each of its files, more than the 512 reads a
-  load of four worker threads holds in flight.
+  merges start a cursor on each of its files, more than the reads a load
+  of four worker threads holds in flight: four times icetray-core's
+  `LOAD_FILES_PER_WORKER` (`load_concurrency()`).
 
 After each compaction the recipe expires the older snapshots and
 removes the files no snapshot lists, so a table root holds only its live
 files. On the 4-CPU, 8 GiB colima VM `dev/runtime.sh` starts, the group
-takes about five minutes, about a minute a table (`ref_large_appended`
-alone, `--only ref_large_appended`, about 50 seconds), and the warehouse
-grows by about 9 GB. The VM's disk also grows while Spark spills, and
+takes an estimated five minutes, about a minute a table: the four other
+tables took about four minutes together, and `ref_large_appended` alone
+(`--only ref_large_appended`) took about 50 seconds, but the five have
+not been timed as one run. The warehouse grows by about 9 GB. The VM's disk also grows while Spark spills, and
 does not shrink, so keep about twice that free before writing the group.
 `--reference-keys` writes fewer keys for a quick run, and the tests
 derive the rows of whatever count the tables record; below the full size
