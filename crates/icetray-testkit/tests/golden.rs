@@ -1638,6 +1638,16 @@ const REFERENCE_LAYOUTS: [ReferenceLayout; 5] = [
     },
 ];
 
+/// `REFERENCE_LAYOUTS` gives a layout for every reference table, in the
+/// recipe's order, so a table added to the group is checked or fails here.
+#[test]
+fn test_reference_layouts_list_every_reference_table() {
+    assert_eq!(
+        REFERENCE_LAYOUTS.map(|layout| layout.table).to_vec(),
+        GoldenTable::reference()
+    );
+}
+
 /// The longest run reference table `table` of `keys` keys holds in one
 /// file: a key's whole run once compacted, and otherwise the longest one
 /// write holds.
@@ -1651,6 +1661,45 @@ fn longest_reference_run(table: GoldenTable, keys: u64, compacted: bool) -> u64 
             .max()
     };
     longest.expect("a reference table has keys")
+}
+
+/// The snapshot summary property in which Iceberg records the rows a
+/// snapshot added.
+const ADDED_RECORDS: &str = "added-records";
+
+/// The rows each write of reference table `table` of `keys` keys holds,
+/// the initial load first, as the recipe splits each key's rows
+/// (`golden::reference_writes`).
+fn reference_write_rows(table: GoldenTable, keys: u64) -> Vec<u64> {
+    let recipe = table.spec().order.expect("a reference table is ordered");
+    let appends = usize::try_from(recipe.appends).expect("a few appends");
+    let mut rows = vec![0; 1 + appends];
+    for id in 0..keys {
+        for (total, write) in rows.iter_mut().zip(golden::reference_writes(table, id)) {
+            *total += write.end - write.start;
+        }
+    }
+    rows
+}
+
+/// The rows each snapshot of `metadata` added, as its summary records
+/// them, oldest first along the current snapshot's ancestry.
+fn added_records(metadata: &TableMetadata) -> Vec<u64> {
+    let mut added = Vec::new();
+    let mut snapshot = metadata.current_snapshot();
+    while let Some(at) = snapshot {
+        let records = at
+            .summary()
+            .additional_properties
+            .get(ADDED_RECORDS)
+            .expect("Spark records the rows each snapshot added");
+        added.push(records.parse().expect("a row count"));
+        snapshot = at
+            .parent_snapshot_id()
+            .and_then(|parent| metadata.snapshot_by_id(parent));
+    }
+    added.reverse();
+    added
 }
 
 /// Each reference table earns the level and findings `REFERENCE_LAYOUTS`
@@ -1727,6 +1776,15 @@ async fn test_golden_reference_layouts_earn_their_level_and_findings() -> Result
             "{table}: the doctor shows the gauge's value"
         );
         assert_eq!(report.summary.deletes.rows, 0, "{table}");
+        // An uncompacted table keeps each write's snapshot, so what Spark
+        // added in each is the recipe's split of every key's rows.
+        if !layout.compacted {
+            assert_eq!(
+                added_records(&served_metadata(&golden).await?),
+                reference_write_rows(table, keys),
+                "{table}: each write's rows"
+            );
+        }
     }
     Ok(())
 }
