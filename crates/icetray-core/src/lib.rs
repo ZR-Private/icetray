@@ -51,7 +51,7 @@ pub use config::{
     ColumnSetting, Config, ConfigError, ConfigViolation, DEFAULT_MAX_SCAN_ROWS, DEFAULT_RESIDENCY,
     HedgeConfig, LocalConfig, LogConfig, Residency, RewriteFault, RewriteRule, RewriteTextFault,
     S3Config, ServerConfig, SourceConfig, SourceSetting, StandardField, StorageConfig, TableConfig,
-    ValueColumnConfig, ValueFormat,
+    ValueColumnConfig, ValueFormat, least_max_multi_scan_values,
 };
 pub use deletes::{BlobFraming, DeleteFault, DeleteSummary};
 pub use error::{

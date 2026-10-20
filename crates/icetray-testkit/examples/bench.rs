@@ -79,8 +79,8 @@ use clap::{Parser, ValueEnum};
 use iceberg::spec::MAIN_BRANCH;
 use icetray_core::ColumnRead;
 use icetray_core::config::{
-    Config, LocalConfig, MULTI_SCAN_VALUES_PER_SCAN_ROW, Residency, RewriteRule, ServerConfig,
-    SourceConfig, StorageConfig, TableConfig, ValueColumnConfig, ValueFormat,
+    Config, LocalConfig, Residency, RewriteRule, ServerConfig, SourceConfig, StorageConfig,
+    TableConfig, ValueColumnConfig, ValueFormat, least_max_multi_scan_values,
 };
 use icetray_core::contract::{TARGET_FILE_BYTES_MAX, VALUE_PAGE_BYTES};
 use icetray_core::{
@@ -808,10 +808,9 @@ static SERVING: OnceLock<Serving> = OnceLock::new();
 fn set_serving(cli: &Cli) {
     let defaults = Serving::default();
     let max_multi_scan_values = match cli.reference_max_scan_rows {
-        Some(rows) => {
-            let admits = approx::length(rows).saturating_mul(MULTI_SCAN_VALUES_PER_SCAN_ROW);
-            defaults.max_multi_scan_values.max(admits)
-        }
+        Some(rows) => defaults
+            .max_multi_scan_values
+            .max(least_max_multi_scan_values(rows)),
         None => defaults.max_multi_scan_values,
     };
     SERVING

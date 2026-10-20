@@ -141,7 +141,18 @@ pub const DEFAULT_MAX_SCAN_ROWS: u32 = 1_000;
 /// `max_multi_scan_values` holds: a `MultiScan` of one key at the full
 /// limit and one column counts each row once for its order value and once
 /// for the column (RFD 025), so such a call is always valid.
-pub const MULTI_SCAN_VALUES_PER_SCAN_ROW: usize = 2;
+const MULTI_SCAN_VALUES_PER_SCAN_ROW: usize = 2;
+
+/// The least `server.max_multi_scan_values` under which an ordered table
+/// of `max_scan_rows` is valid: `MULTI_SCAN_VALUES_PER_SCAN_ROW` values
+/// for each row, so a `MultiScan` of one key at the full limit and one
+/// column is always valid (RFD 025). The one statement of the rule, which
+/// configuration validation and anything that picks a configuration
+/// apply.
+#[must_use]
+pub fn least_max_multi_scan_values(max_scan_rows: u32) -> usize {
+    approx::length(max_scan_rows).saturating_mul(MULTI_SCAN_VALUES_PER_SCAN_ROW)
+}
 
 /// GETs one batch (a `MultiGet`, a `Scan`, or a `MultiScan`) holds in
 /// flight at once when the file says nothing: 64 (RFD 013, RFD 022, RFD
@@ -2117,8 +2128,7 @@ impl TableConfig {
             };
         };
         self.check_scan_rows_above_zero(Some(index))?;
-        let needed = approx::length(max_scan_rows).saturating_mul(MULTI_SCAN_VALUES_PER_SCAN_ROW);
-        if max_multi_scan_values < needed {
+        if max_multi_scan_values < least_max_multi_scan_values(max_scan_rows) {
             return Err(ConfigViolation::MaxMultiScanValuesBelowScanRows {
                 index,
                 max_scan_rows,
