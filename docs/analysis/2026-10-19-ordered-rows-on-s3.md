@@ -1,5 +1,14 @@
 # Ordered rows on S3
 
+> Updated 2026-10-20: a second run from the same host answers what the
+> first left open ([Stage 4](#stage-4-2026-10-20)). Spans of 5 to 16
+> pages share the one-page first-byte latency. A fifth table, whose
+> merges read files of several row groups with more cursors than
+> slots, loads at 0.53 to 0.64 times the serial wall and fills the
+> read-ahead budget. The CPU difference between parallel and serial
+> merges was the bench's resident-set sampler, not the merge: the merge's
+> own threads spend the same CPU either way.
+
 Measured 2026-10-19 from one Linux host in the same region as an S3
 bucket holding the four Spark-written reference tables (the golden
 `reference` group, `dev/golden-tables.py`). The earlier ordered-rows
@@ -20,19 +29,19 @@ them. It also checks every answer against the derivation in
   four. Both classes have the same first-byte latency (p50 25 ms, p99 53
   to 56 ms). The last byte adds 1 ms at p50 and 7 ms at p99. RFD 025
   scales a span's hedge delay with its pages, and these spans do not
-  justify that scaling. No Scan span reached five pages, so larger
-  spans are unmeasured.
+  justify that scaling. No Scan span here reached five pages; Stage 4
+  measures spans of 5 to 16.
 - **Parallel overlap groups halve the load and do not cost CPU here.**
   On the table of 64 buckets with five overlapping files each, merging
   groups at once cut the first load from 4.06 to 1.93 s under `full`
-  (medians of nine). Process CPU fell from 8.10 to 6.09 s. `disk` and
-  `bloom` show the same ratios. The laptop measurement saw CPU rise up
-  to 27% on a 4-bucket table. That result does not hold on this host at
-  this scale.
+  (medians of nine). `disk` and `bloom` show the same ratios. Process
+  CPU fell from 8.10 to 6.09 s, but Stage 4 traced that fall to the
+  bench's resident-set sampler, whose cost grows with the load's wall;
+  the merge's own CPU is the same either way.
 - **Neither read-ahead across row groups nor the shared slot reserve
   was exercised.** Every overlapping file here has one row group. The
   table with four row groups per file is compacted, so its load runs no
-  merge.
+  merge. Stage 4 adds a table that exercises both.
 
 ## Method
 
@@ -270,11 +279,11 @@ differences are noise (the `full` wall spread was 0.59 to 1.25 s). On
 second of wall it adds.
 
 The bench samples the resident set on its own thread every 1 ms, and on
-Linux that reads `/proc/self/smaps`. That sampler was the first
-suspect, and a per-thread count ruled it out. Over one serial and one
-parallel run of every `ref_appended` load, the thread named after the
-process used 2.14 and 2.34 s. That cost does not scale with the load's
-wall. Where the serial merge spends the extra CPU is not established.
+Linux that reads `/proc/self/smaps`. A first per-thread count seemed to
+rule that sampler out, but it counted only the threads alive when the
+process ended, and each load's sampler had exited by then. Stage 4's
+count keeps every thread and finds the difference there: the CPU
+figures above include the sampler, so their ratio is not the merge's.
 
 ## What this does and does not establish
 
@@ -287,22 +296,88 @@ It establishes:
 - Scan span GETs at one to four pages share one latency distribution.
 - On this host the parallel merge halves the overlapping first load and
   does not raise its CPU.
+- Scan span GETs of 5 to 16 pages (Stage 4) share the one-page
+  first-byte latency.
+- Read-ahead across row groups fills its budget with more cursors than
+  slots (Stage 4).
 
 It does not establish:
 
-- **Large spans.** Span latency past four pages under a Scan's fan-out.
-- **Read-ahead and the slot reserve.** Neither read-ahead across row
-  groups on object storage nor the shared slot reserve under many
-  cursors was exercised. `ref_appended`'s 320 cursors each hold one row
-  group, under the 512 slots of `load_concurrency()` at four workers.
-  Exercising them needs an overlapping table with several row groups
-  per file, for example `ref_large_files` with the append batches left
-  uncompacted.
+- **Spans past 16 pages.** The longest run in these tables is 9,998
+  rows, so no Scan span reached 17 pages.
+- **The slot reserve's cost.** Stage 4 shows a load with more cursors
+  than slots filling the read-ahead budget, but has no run of the same
+  table with slots to spare to compare its rounds against.
 - **Warm-hit cost on the host.** The profile ran on a laptop, not on the
   Linux host; the host's warm Scan is 2.7 times slower, and the shares
   there are inferred from the laptop's, not measured.
 - **Generality.** Every number comes from one host, one region, and one
   evening. Latency at other times or from other networks may differ.
+
+## Stage 4, 2026-10-20
+
+The same host, with a fifth reference table and binaries of `c9e8842`.
+
+- **Correctness.** The six golden reference tests passed against the
+  bucket (179.8 s).
+- **The fifth table.** `ref_large_appended` holds the same 19.9 million
+  rows in 576 files, 9 in each of the 64 buckets: one initial file of 3
+  or 4 row groups and 8 appended files of one row group. A first load's
+  merge therefore starts 576 cursors against the 512 slots
+  `load_concurrency()` gives four workers.
+- **Spans past four pages.** Cold Scans of heavy keys at a raised
+  `max_scan_rows` of 8,000 (`--reference-max-scan-rows`) issued 4,632
+  span GETs of 5 to 16 pages.
+
+### Span latency, 5 to 16 pages
+
+Pooled samples from the cold Scans of `ref_compacted` and `ref_appended`
+at a limit of 8,000, single task:
+
+| Class | Samples | Mean bytes | First byte p50 / p90 / p99 / max | Last byte p50 / p90 / p99 / max |
+|---|---|---|---|---|
+| 1 page | 17,391 | 32 KiB | 24.8 / 32.7 / 49.6 / 293 ms | 25.7 / 33.8 / 52.1 / 294 ms |
+| 2 to 4 pages | 2,728 | 143 KiB | 25.1 / 36.4 / 60.1 / 100 ms | 26.6 / 38.9 / 62.9 / 104 ms |
+| 5 to 16 pages | 4,632 | 269 KiB | 24.6 / 33.6 / 56.6 / 267 ms | 26.9 / 36.8 / 65.0 / 280 ms |
+
+The first byte does not depend on the span's pages up to 16, and the
+transfer adds about 2 ms at p50 and 13 ms at p99 for a 269 KiB span over
+a 32 KiB one. Under the page-scaled hedge delay, a 5-page span waits
+five times the per-page percentile, about 150 ms, before it hedges,
+where its latency is that of a one-page GET.
+
+### The merge with more cursors than slots
+
+Medians of nine loads of `ref_large_appended` per binary, alternated
+(wall and process CPU in s):
+
+| Load | Tier | Parallel wall / CPU | Serial wall / CPU | Wall ratio | GETs | Rounds parallel / serial | Held MiB |
+|---|---|---|---|---|---|---|---|
+| first | `full` | 2.94 / 8.59 | 5.29 / 11.07 | 0.56 | 3,333 | 24 / 26 | 64.0 |
+| first | `disk` | 2.69 / 8.25 | 4.82 / 10.35 | 0.56 | 2,610 | 17 / 18 | 64.0 |
+| first | `bloom` | 3.46 / 10.48 | 5.39 / 12.78 | 0.64 | 4,779 | 28 / 34 | 64.0 |
+| `disk`, reusing chunk files | `disk` | 2.29 / 6.80 | 4.35 / 9.05 | 0.53 | 1,164 | 13 / 13 | 64.0 |
+
+Both binaries hold the full 64 MiB read-ahead budget at their peak, so
+read-ahead across row groups runs with 576 cursors against 512 slots.
+
+### Where the serial merge's CPU went
+
+A probe sampled every thread's CPU each 0.2 s and kept each thread's last
+value, exited threads included. Over one run of three rounds of every
+load:
+
+| Run | tokio workers (s) | Threads named after the process (s) |
+|---|---|---|
+| parallel 1, 2, 3 | 59.5, 60.4, 62.9 | 30.4, 27.8, 26.7 |
+| serial 1, 2, 3 | 61.1, 61.1, 60.7 | 56.0, 58.0, 58.2 |
+
+The merge runs on the tokio workers and the blocking pool, which share
+the name, and spends the same CPU either way. The difference is in
+short-lived threads named after the process, one per measured load,
+almost all of their time in the kernel: the resident-set sampler, which
+reads `/proc/self/smaps` every 1 ms for as long as the load runs, so a
+longer serial load costs it more.
 
 ## Reproducing
 
