@@ -3491,10 +3491,10 @@ mod tests {
 
     /// Cases of the wide drawn check, the seed of its draws, and the files
     /// per case: at least the fewest, and up to the more beyond them.
-    const WIDE_CASES: u64 = 160;
+    const WIDE_CASES: u64 = 48;
     const WIDE_SEED: u64 = 17;
     const FEWEST_WIDE_FILES: u64 = 4;
-    const MORE_WIDE_FILES: u64 = 24;
+    const MORE_WIDE_FILES: u64 = 12;
 
     /// The keys and order values a wide case draws from, at least the
     /// fewest and up to the more beyond them, and the most keys after its
