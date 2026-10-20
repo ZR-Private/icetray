@@ -445,6 +445,18 @@ impl Storage {
     /// location no store serves is `Error::Location`, naming no table:
     /// the table whose load read it names itself (`Error::for_table`).
     fn locate_loaded(&self, location: &str) -> Result<Located> {
+        let (prefix, rest, store) = self.resolve(location)?;
+        let path = if prefix == FILE_PREFIX {
+            Path::from_absolute_path(&rest)?
+        } else {
+            Path::parse(&rest)?
+        };
+        Ok(Located { store, path })
+    }
+
+    /// The `scheme://authority/` prefix of `location` once rewritten, the
+    /// rest of it, and the store that serves the prefix (`locate_loaded`).
+    fn resolve(&self, location: &str) -> Result<(String, String, Arc<dyn ObjectStore>)> {
         let location = self.rewrite(location);
         let unserved = |fault| Error::Location {
             table: None,
@@ -457,12 +469,25 @@ impl Storage {
         let store = self
             .store_for(&prefix)?
             .ok_or_else(|| unserved(LocationFault::NoStore))?;
-        let path = if prefix == FILE_PREFIX {
-            Path::from_absolute_path(&rest)?
-        } else {
-            Path::parse(&rest)?
-        };
-        Ok(Located { store, path })
+        Ok((prefix, rest, store))
+    }
+
+    /// Registers `wrap` of the store that serves `location` in its place:
+    /// the store `locate` resolves the location to, rewritten, built first
+    /// when nothing serves its prefix yet, so an S3 store keeps the
+    /// credentials, retries, and timeouts this storage gives it. Every later
+    /// read under the location's `scheme://authority/` prefix goes through
+    /// what `wrap` returns; a read already holding the store keeps it. For
+    /// a benchmark that observes each request the store answers.
+    pub async fn wrap_store(
+        &self,
+        location: &str,
+        wrap: impl FnOnce(Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore>,
+    ) -> Result<()> {
+        self.load_sdk_for(location).await;
+        let (prefix, _, store) = self.resolve(location)?;
+        self.register(prefix, wrap(store));
+        Ok(())
     }
 
     /// Reads a whole object. One load GET of the object's size, counted
@@ -2284,6 +2309,50 @@ mod tests {
                 location: "relative/x".to_string(),
                 fault: LocationFault::NotAbsolute,
             }
+        );
+    }
+
+    /// The wrapped store serves every later read under the rewritten
+    /// location's prefix, and `wrap` is handed the store that served it.
+    #[tokio::test]
+    async fn test_wrap_store_reads_through_the_wrapper_of_the_rewritten_prefix() {
+        let storage = Storage::new(StorageConfig {
+            rewrite: vec![RewriteRule {
+                from: "s3://old-warehouse/".to_string(),
+                to: MEM_PREFIX.to_string(),
+            }],
+            ..StorageConfig::default()
+        });
+        let served: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        storage.register(MEM_PREFIX, Arc::clone(&served));
+        let location = format!("s3://old-warehouse/{OBJECT_KEY}");
+        let wrapper = Arc::new(InMemory::new());
+        wrapper
+            .put(&Path::from(OBJECT_KEY), PutPayload::from(PAYLOAD))
+            .await
+            .unwrap();
+        storage
+            .wrap_store(&location, |inner| {
+                assert!(
+                    Arc::ptr_eq(&inner, &served),
+                    "wrap is handed the served store"
+                );
+                Arc::<InMemory>::clone(&wrapper)
+            })
+            .await
+            .unwrap();
+        assert_eq!(storage.read_all(&location).await.unwrap(), PAYLOAD);
+        let located = storage.locate_loaded(&location).unwrap();
+        let registered: Arc<dyn ObjectStore> = wrapper;
+        assert!(Arc::ptr_eq(&located.store, &registered));
+        let refused = storage.wrap_store("gs://bucket-a/x", |inner| inner).await;
+        assert!(
+            matches!(
+                refused,
+                Err(Error::Location { table: None, ref source })
+                    if source.fault == LocationFault::NoStore
+            ),
+            "{refused:?}"
         );
     }
 

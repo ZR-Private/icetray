@@ -823,6 +823,18 @@ impl PageCache {
         }
     }
 
+    /// Evicts every page memory holds, as eviction does: a memory-only
+    /// cache drops it, so the next request for it fetches it again, and a
+    /// cache with a disk level writes it there. What a benchmark's cold read
+    /// starts from. The counters are unchanged. Eviction, not foyer's
+    /// `clear`, which leaves the usage it charged in place.
+    pub fn clear(&self) {
+        match self.level.as_ref() {
+            Level::Memory(cache) => cache.evict_all(),
+            Level::Hybrid { cache, .. } => cache.memory().evict_all(),
+        }
+    }
+
     /// Flushes the disk level and closes it, so what memory still held
     /// reaches disk before the process exits; `serve` calls it while
     /// draining (RFD 012). A memory-only cache has nothing to flush and
@@ -2544,6 +2556,32 @@ mod tests {
             cache.usage(),
             PAGE.len() + OTHER_PAGE.len() + 2 * ENTRY_OVERHEAD_BYTES
         );
+    }
+
+    #[tokio::test]
+    async fn test_clear_drops_every_page_so_the_next_request_fetches() {
+        let cache = PageCache::for_scans(ROOMY_BYTES);
+        let runs = Arc::new(AtomicU64::new(0));
+        for _ in 0..2 {
+            cache
+                .get_or_fetch(key(FIRST_OFFSET), Issue::default(), || {
+                    answering(PAGE, &runs)
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!((cache.fetches(), cache.hits()), (1, 1));
+        cache.clear();
+        assert_eq!(cache.usage(), 0);
+        let (page, origin) = cache
+            .get_or_fetch(key(FIRST_OFFSET), Issue::default(), || {
+                answering(PAGE, &runs)
+            })
+            .await
+            .unwrap();
+        assert_eq!(&page[..], PAGE);
+        assert_eq!(origin, PageOrigin::Fetched);
+        assert_eq!((cache.fetches(), cache.hits()), (2, 1));
     }
 
     #[tokio::test]
