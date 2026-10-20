@@ -145,6 +145,19 @@ ICETRAY_GOLDEN_REWRITE="file://$PWD/target/golden-warehouse=s3a://bucket/copy;fi
 dev/test-golden.sh --reference
 ```
 
+The benchmark program serves the same tables from a warehouse or its
+copy with `--reference`, and measures their Scans, `MultiScan`s, and
+loads in every tier, with each GET's latency by the pages it spans; its
+module doc and `--help` give what it runs, and it takes the copy's rules
+as repeated `--rewrite-location` flags:
+
+```sh
+cargo run --profile profiling -p icetray-testkit --example bench -- \
+  --reference s3a://bucket/copy \
+  --rewrite-location "file://$PWD/target/golden-warehouse=s3a://bucket/copy" \
+  --rewrite-location "file:$PWD/target/golden-warehouse=s3a://bucket/copy"
+```
+
 The tables are also the quickest way to try the binary: `icetray get
 --location target/golden-warehouse/db/long_2m --value-column value
 --column value 42` answers from one of them, and

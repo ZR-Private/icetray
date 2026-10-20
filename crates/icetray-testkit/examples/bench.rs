@@ -34,10 +34,35 @@
 //! with `cargo run -p icetray-testkit --example bench --release -- --help`;
 //! a profile of one scenario narrows `--scenario`, `--tier`, `--table`,
 //! `--values`, and `--mode`, and lengthens `--duration`.
+//!
+//! Reference mode. Under `--reference WAREHOUSE` the program writes and
+//! reads none of its own tables and serves the golden reference tables
+//! instead (`golden::GoldenTable::REFERENCE`, which `dev/golden-tables.py
+//! --only reference` writes), from a warehouse whose `db/` holds them, such
+//! as a copy on object storage read through `--rewrite-location` rules.
+//! Per table and tier it measures Scans of the keys the golden tests sample
+//! from each tier of rows per key (`golden::reference_tier_sample`), in
+//! both directions, whole and over a window of each run's middle half, cold
+//! (the page cache and the scan cache emptied before each operation,
+//! outside its timing) and warm (every key paged through first);
+//! `MultiScan`s of 10 and 100 keys at limits of 1 and 20; and first loads
+//! with their Disk restarts, whose rounds of GETs and held bytes show the
+//! uniqueness merge of `ref_appended`'s overlap groups and the read-ahead
+//! over `ref_large_files`' row groups. Every request's answers are first
+//! compared whole with the derivation (`golden::derived_scan`). Every
+//! request of the warehouse's store goes through a `GetLog` beneath the
+//! rounds count, and each run reports its window's GETs by the data pages
+//! each spans and by its bytes, with each class's latency to the answer
+//! and to the last byte. `--reference-table`, `--reference-scenario`, and
+//! `--rows-tier` narrow it, and its JSON says what it is (`"run":
+//! "reference"`) and, per row, what each figure is of.
 
 use std::alloc::{GlobalAlloc, Layout};
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeSet, HashMap};
 use std::error::Error;
 use std::io::Read as _;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -54,12 +79,15 @@ use icetray_core::config::{
 };
 use icetray_core::contract::{TARGET_FILE_BYTES_MAX, VALUE_PAGE_BYTES};
 use icetray_core::{
-    CallsInFlight, Direction, FILE_PREFIX, FindingLog, Key, KeyType, Level, LocalDir, OrderValue,
-    PageCache, ResidentParts, Row, ScanBounds, ScanRow, Scanned, Storage, Table, TableHandles,
-    TableSource,
+    CallsInFlight, Direction, FILE_PREFIX, FindingLog, Generation, Key, KeyType, Level, LocalDir,
+    OrderValue, PageCache, ResidentParts, Row, ScanBounds, ScanRow, Scanned, Storage, Table,
+    TableHandles, TableSource,
 };
 use icetray_core::{approx, catalog, time};
 use icetray_testkit::fixture::{NAMESPACE, SECOND_VALUE_COLUMN, memory_catalog_local};
+use icetray_testkit::golden::{
+    self, GoldenTable, REFERENCE_TIER_SAMPLES, REFERENCE_VALUE_BYTES, RowsTier,
+};
 use icetray_testkit::keys::{
     FIRST_VERSION, SCATTERED_ID_SPACE, SCATTERED_KEY_FIXED_BYTES, STRING_KEY_FIXED_BYTES,
     VALUE_BYTES,
@@ -70,11 +98,12 @@ use icetray_testkit::protobuf::{
     CHECKSUM_FIELD, FILLER_FIELD, FLAGS_FIELD, GROUP_FIELD, ID_FIELD, NAME_FIELD, SCORES_FIELD,
 };
 use icetray_testkit::{
-    FixtureSpec, KeyShape, MemoryCatalog, ORDER_COLUMN, OrderKind, Ordered, RoundsStore,
-    RowsPerKey, TestScan, ValueKind, absent_key_from, key_at_shaped, order_value, row_value,
-    scan_model, value_of_kind, write_fixture,
+    FixtureSpec, GetLog, KeyShape, LoggedGet, MemoryCatalog, ORDER_COLUMN, OrderKind, Ordered,
+    RoundsStore, RowsPerKey, TestScan, ValueKind, absent_key_from, key_at_shaped, order_value,
+    row_value, scan_model, value_of_kind, write_fixture,
 };
 use object_store::ObjectStore;
+use parquet::file::page_index::offset_index::PageLocation;
 use parquet::file::reader::{FileReader as _, SerializedFileReader};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -489,6 +518,15 @@ enum Tier {
 impl Tier {
     const ALL: [Self; 3] = [Self::Full, Self::Disk, Self::Bloom];
 
+    /// The tier's name in the results.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Disk => "disk",
+            Self::Bloom => "bloom",
+        }
+    }
+
     fn residency(self) -> Residency {
         match self {
             Self::Full => Residency::Full,
@@ -691,6 +729,28 @@ struct Cli {
         value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..),
     )]
     batch_fan_out: usize,
+    /// Serve the golden reference tables under WAREHOUSE, a location whose
+    /// `db/` holds them, in place of the program's own tables, which are
+    /// neither written nor read (the module doc's Reference mode). A copy
+    /// of the warehouse is read with a `--rewrite-location` for each form
+    /// of location its metadata names, `file:///dir` and `file:/dir`.
+    #[arg(
+        long,
+        value_name = "WAREHOUSE",
+        conflicts_with_all = ["scenario", "table", "values", "prepare", "rewrite", "row_group_rows"],
+    )]
+    reference: Option<String>,
+    /// The reference tables to serve: `ref_compacted`, `ref_appended`,
+    /// `ref_string`, `ref_large_files`.
+    #[arg(long, value_delimiter = ',', requires = "reference")]
+    reference_table: Vec<GoldenTable>,
+    /// What to measure of each reference table.
+    #[arg(long, value_enum, value_delimiter = ',', requires = "reference")]
+    reference_scenario: Vec<ReferenceScenario>,
+    /// The tiers of rows per key whose sampled keys the reference Scans
+    /// read: heavy, medium, light.
+    #[arg(long, value_delimiter = ',', requires = "reference")]
+    rows_tier: Vec<RowsTier>,
 }
 
 /// How every table of the run is served: over the production storage
@@ -1709,9 +1769,51 @@ struct Served {
     /// The store every `file://` read of an ordered table goes through,
     /// counting the rounds of a Scan's GETs (`count_rounds`); `None` for a
     /// key-value table, whose reads keep the store `Storage` builds, and
-    /// under `--rewrite-location`, whose reads leave `file://`.
+    /// under `--rewrite-location`, whose reads leave `file://`. A reference
+    /// table's reads count their rounds through the store of its warehouse.
     rounds: Option<Arc<RoundsStore>>,
+    /// The log of every GET of a reference table's warehouse
+    /// (`serve_reference`); `None` for the program's own tables.
+    gets: Option<Arc<GetLog>>,
     _local: Option<TempDir>,
+}
+
+/// What a process's tables are served over: the handles, and the local
+/// directory under the Disk tier, which must live as long as they do.
+struct Stack {
+    handles: TableHandles,
+    local: Option<Arc<LocalDir>>,
+    dir: Option<TempDir>,
+}
+
+/// The handles of a process serving over `storage` in `tier`, as
+/// `open_with` gives a process's tables: a `cache_bytes` page cache and a
+/// `cache_bytes` scan cache, the run's `--batch-fan-out`, the server's
+/// defaults otherwise, and under Disk a local directory with no page-cache
+/// disk level, `reuse`'s when given (`local_for`).
+async fn stack(
+    storage: &Arc<Storage>,
+    tier: Tier,
+    cache_bytes: usize,
+    reuse: Option<TempDir>,
+) -> BenchResult<Stack> {
+    let (local, dir) = local_for(tier, storage, reuse)?;
+    let handles = TableHandles {
+        storage: Arc::clone(storage),
+        cache: PageCache::new(cache_bytes, None).await?,
+        local: local.clone(),
+        calls: CallsInFlight::new(),
+        findings: FindingLog::Events,
+        batch_fan_out: serving().batch_fan_out,
+        scan_cache: PageCache::for_scans(cache_bytes),
+        max_multi_scan_values: ServerConfig::default().max_multi_scan_values,
+        max_scan_bytes: ServerConfig::default().max_scan_bytes,
+    };
+    Ok(Stack {
+        handles,
+        local,
+        dir,
+    })
 }
 
 /// `prepared` in `tier` from `source`, over the production storage
@@ -1737,20 +1839,11 @@ async fn serve(
     if let Some(store) = &rounds {
         storage.register(FILE_PREFIX, Arc::clone(store) as Arc<dyn ObjectStore>);
     }
-    let (local, dir) = local_for(tier, &storage, reuse)?;
-    let cache = PageCache::new(cache_bytes, None).await?;
-    let scan_cache = PageCache::for_scans(cache_bytes);
-    let handles = TableHandles {
-        storage: Arc::clone(&storage),
-        cache: cache.clone(),
-        local: local.clone(),
-        calls: CallsInFlight::new(),
-        findings: FindingLog::Events,
-        batch_fan_out: serving.batch_fan_out,
-        scan_cache: scan_cache.clone(),
-        max_multi_scan_values: ServerConfig::default().max_multi_scan_values,
-        max_scan_bytes: ServerConfig::default().max_scan_bytes,
-    };
+    let Stack {
+        handles,
+        local,
+        dir,
+    } = stack(&storage, tier, cache_bytes, reuse).await?;
     let beside = match beside {
         Some(other) => {
             let table = table_over(other, tier, pinned(other), handles.clone()).await?;
@@ -1760,6 +1853,8 @@ async fn serve(
         }
         None => None,
     };
+    let cache = handles.cache.clone();
+    let scan_cache = handles.scan_cache.clone();
     let table = table_over(prepared, tier, source, handles).await?;
     Ok(Served {
         table: Arc::new(table),
@@ -1769,6 +1864,7 @@ async fn serve(
         scan_cache,
         local,
         rounds,
+        gets: None,
         _local: dir,
     })
 }
@@ -1814,7 +1910,7 @@ async fn table_over(
 ) -> BenchResult<Table> {
     let config = TableConfig {
         name: prepared.shape.table_name(),
-        source: source.clone(),
+        source,
         r#ref: MAIN_BRANCH.to_string(),
         key_column: KEY_COLUMN.to_string(),
         value_columns: prepared.shape.value_columns(),
@@ -1825,10 +1921,17 @@ async fn table_over(
         residency: tier.residency(),
         resident_budget_bytes: None,
     };
+    table_of(config, handles).await
+}
+
+/// The table `config` names over `handles`, under the server's default
+/// deadlines.
+async fn table_of(config: TableConfig, handles: TableHandles) -> BenchResult<Table> {
     let server = ServerConfig::default();
+    let source = TableSource::from_config(&config.source).await?;
     Ok(Table::new(
         config,
-        TableSource::from_config(&source).await?,
+        source,
         handles,
         server.load_deadline,
         server.refresh_deadline,
@@ -2191,6 +2294,74 @@ enum Op {
         cases: Arc<Vec<ScanCase>>,
         value_bytes: usize,
     },
+    /// The next of `requests`, a `scan` or a `multi_scan` of a reference
+    /// table reading `VALUE_COLUMN`, each key answering its own case as
+    /// `Scan` requires; before it, out of its timing, `cold`'s caches
+    /// emptied (`Op::before`).
+    Reference {
+        requests: Arc<Vec<Request>>,
+        value_bytes: usize,
+        cold: Option<ColdCaches>,
+    },
+}
+
+/// One request of a reference op: the keys it asks, by key index and as
+/// keys, whether it is a `MultiScan`, and per key its case, every case
+/// under the request's one set of bounds.
+struct Request {
+    ids: Vec<u64>,
+    keys: Vec<Key>,
+    multi: bool,
+    cases: Vec<ScanCase>,
+}
+
+impl Request {
+    /// The bounds every key of the request is read under.
+    fn bounds(&self) -> &ScanBounds {
+        &self.cases[0].bounds
+    }
+
+    /// Runs the request as operation `i` and returns the value bytes it
+    /// read and returned; an answer that disagrees with a key's case is an
+    /// error (`ScanCase::check`).
+    async fn run(&self, table: &Table, value_bytes: usize, i: usize) -> BenchResult<ValueBytes> {
+        let mut returned = 0;
+        if self.multi {
+            let lookup = table
+                .multi_scan(&self.keys, &VALUE_READS, self.bounds())
+                .await?;
+            if lookup.results.len() != self.keys.len() {
+                return Err(format!(
+                    "batch {i} answered {} of {} keys",
+                    lookup.results.len(),
+                    self.keys.len()
+                )
+                .into());
+            }
+            for (scanned, case) in lookup.results.iter().zip(&self.cases) {
+                returned += case
+                    .check(scanned, value_bytes)
+                    .map_err(|fault| format!("batch {i}: {fault}"))?;
+            }
+        } else {
+            let lookup = table
+                .scan(&self.keys[0], &VALUE_READS, self.bounds())
+                .await?;
+            returned += self.cases[0]
+                .check(&lookup.scanned, value_bytes)
+                .map_err(|fault| format!("scan {i}: {fault}"))?;
+        }
+        Ok(ValueBytes::of(returned, returned))
+    }
+}
+
+/// The page cache and scan cache a cold reference op empties before each
+/// operation (`PageCache::clear`), so it reads every page from where the
+/// tier keeps it.
+#[derive(Clone)]
+struct ColdCaches {
+    cache: PageCache,
+    scan_cache: PageCache,
 }
 
 impl Op {
@@ -2201,6 +2372,10 @@ impl Op {
         match self {
             Self::Get { keys, .. } | Self::Scan { keys, .. } => {
                 let at = i % keys.len();
+                at..at + 1
+            }
+            Self::Reference { requests, .. } => {
+                let at = i % requests.len();
                 at..at + 1
             }
             Self::MultiGet { keys, batch, .. } | Self::MultiScan { keys, batch, .. } => {
@@ -2220,6 +2395,25 @@ impl Op {
         match self {
             Self::Get { .. } | Self::Scan { .. } => 1,
             Self::MultiGet { batch, .. } | Self::MultiScan { batch, .. } => *batch,
+            Self::Reference { requests, .. } => requests[0].keys.len(),
+        }
+    }
+
+    /// What runs before each operation, outside its timing: a cold
+    /// reference op's caches emptied; nothing for any other op.
+    fn before(&self) {
+        match self {
+            Self::Reference {
+                cold: Some(cold), ..
+            } => {
+                cold.cache.clear();
+                cold.scan_cache.clear();
+            }
+            Self::Reference { cold: None, .. }
+            | Self::Get { .. }
+            | Self::MultiGet { .. }
+            | Self::Scan { .. }
+            | Self::MultiScan { .. } => {}
         }
     }
 
@@ -2292,6 +2486,11 @@ impl Op {
                 }
                 Ok(ValueBytes::of(returned, returned))
             }
+            Self::Reference {
+                requests,
+                value_bytes,
+                ..
+            } => requests[at.start].run(table, *value_bytes, i).await,
         }
     }
 }
@@ -2305,7 +2504,7 @@ impl Op {
 async fn verify_scans(op: &Op, table: &Table, shape: TableShape) -> BenchResult<()> {
     let (keys, cases) = match op {
         Op::Scan { keys, cases, .. } | Op::MultiScan { keys, cases, .. } => (keys, cases),
-        Op::Get { .. } | Op::MultiGet { .. } => return Ok(()),
+        Op::Get { .. } | Op::MultiGet { .. } | Op::Reference { .. } => return Ok(()),
     };
     let ordered = shape.order()?;
     let ids = hit_ids(shape);
@@ -2363,8 +2562,10 @@ async fn task_loop(
     let mut done = 0;
     let mut bytes = ValueBytes::default();
     while Instant::now() < until {
+        let i = done * tasks + task;
+        op.before();
         let started = Instant::now();
-        let op_bytes = op.run(&table, done * tasks + task).await?;
+        let op_bytes = op.run(&table, i).await?;
         if let Some(samples) = samples.as_mut() {
             samples.push(started.elapsed());
         }
@@ -2597,27 +2798,21 @@ impl RunLabel {
 /// What separates a measured table's name from the one served beside it.
 const BESIDE_SEPARATOR: &str = "+";
 
-/// A measured run.
-struct Measured {
-    label: RunLabel,
+/// What one measured window of a run's operations did.
+struct Window {
     ops: usize,
-    /// Lookups per operation: one, or a `MultiGet`'s batch.
-    keys_per_op: usize,
     elapsed: Duration,
     /// Every operation's latency.
     latencies: Latencies,
     counters: Counters,
     /// The value bytes the operations read and returned.
     bytes: ValueBytes,
-    /// The rounds of GETs an operation waits on, counted apart from the
-    /// window (`count_rounds`); `None` where they are not counted.
-    rounds: Option<Rounds>,
 }
 
 /// One second, the unit of the throughput figure.
 const SECOND: Duration = Duration::from_secs(1);
 
-impl Measured {
+impl Window {
     fn ops_per_second(&self) -> f64 {
         approx::gauge(approx::count(self.ops)) * SECOND.div_duration_f64(self.elapsed)
     }
@@ -2626,19 +2821,11 @@ impl Measured {
         approx::ratio(total, approx::count(self.ops))
     }
 
+    /// The window's figures as a result row's JSON fields.
     fn to_json(&self) -> Json {
         let counters = self.counters;
         let latencies = &self.latencies;
         json!({
-            "scenario": self.label.scenario.name(),
-            "table": self.label.table.name.as_str(),
-            "values": self.label.table.values.as_str(),
-            "tier": format!("{:?}", self.label.tier).to_lowercase(),
-            "mode": self.label.mode.name(),
-            "tasks": self.label.tasks,
-            "batch_fan_out": self.label.batch_fan_out,
-            "beside": self.label.beside.map(TableShape::table_name),
-            "keys_per_op": self.keys_per_op,
             "ops": self.ops,
             "elapsed_us": micros(self.elapsed),
             "ops_per_second": self.ops_per_second(),
@@ -2657,42 +2844,107 @@ impl Measured {
             "hedges": counters.hedges,
             "value_bytes_read_per_op": self.per_op(self.bytes.read),
             "value_bytes_returned_per_op": self.per_op(self.bytes.returned),
-            "rounds_per_op": self.rounds.map(Rounds::per_op),
-            "rounds_max": self.rounds.map(|rounds| rounds.most),
-            "rounds_ops": self.rounds.map(|rounds| rounds.ops),
         })
     }
 }
 
-/// Runs `op` over `served` for the warm-up and then for the measured
-/// window, the samples of the window reserved from the warm-up's rate
-/// before the counters are first read, so recording allocates nothing
-/// inside the window.
-async fn measure(
+/// A measured run.
+struct Measured {
+    label: RunLabel,
+    /// Lookups per operation: one, or a `MultiGet`'s batch.
+    keys_per_op: usize,
+    window: Window,
+    /// The rounds of GETs an operation waits on, counted apart from the
+    /// window (`count_rounds`); `None` where they are not counted.
+    rounds: Option<Rounds>,
+}
+
+impl Measured {
+    /// `run` of an op of `keys_per_op` keys, labeled `label` with its mode
+    /// and tasks.
+    fn of(label: RunLabel, keys_per_op: usize, run: ModeRun) -> Self {
+        Self {
+            label: RunLabel {
+                mode: run.mode,
+                tasks: run.tasks,
+                ..label
+            },
+            keys_per_op,
+            window: run.window,
+            rounds: run.rounds,
+        }
+    }
+
+    fn to_json(&self) -> Json {
+        merged(
+            json!({
+                "scenario": self.label.scenario.name(),
+                "table": self.label.table.name.as_str(),
+                "values": self.label.table.values.as_str(),
+                "tier": self.label.tier.name(),
+                "mode": self.label.mode.name(),
+                "tasks": self.label.tasks,
+                "batch_fan_out": self.label.batch_fan_out,
+                "beside": self.label.beside.map(TableShape::table_name),
+                "keys_per_op": self.keys_per_op,
+            }),
+            [self.window.to_json(), rounds_json(self.rounds)],
+        )
+    }
+}
+
+/// `first`'s fields and then each of `rest`'s, every one a JSON object; a
+/// later field of one name replaces an earlier.
+fn merged(mut first: Json, rest: impl IntoIterator<Item = Json>) -> Json {
+    if let Json::Object(fields) = &mut first {
+        for other in rest {
+            if let Json::Object(more) = other {
+                fields.extend(more);
+            }
+        }
+    }
+    first
+}
+
+/// The JSON fields of an operation's rounds of GETs, null where they are
+/// not counted.
+fn rounds_json(rounds: Option<Rounds>) -> Json {
+    json!({
+        "rounds_per_op": rounds.map(Rounds::per_op),
+        "rounds_max": rounds.map(|rounds| rounds.most),
+        "rounds_ops": rounds.map(|rounds| rounds.ops),
+    })
+}
+
+/// Runs `op` over `served` with `tasks` tasks for the warm-up and then for
+/// the measured window, the samples of the window reserved from the
+/// warm-up's rate before the counters are first read, so recording
+/// allocates nothing inside the window. A GET log over the served store
+/// (`Served::gets`) starts anew with the window's counters.
+async fn measure_window(
     served: &Served,
     op: &Op,
-    label: RunLabel,
-    warmup: Duration,
-    duration: Duration,
-    windows: u64,
-) -> BenchResult<Measured> {
-    let (warm_ops, _, _) = spawn_run(served, op, label.tasks, warmup, None).await?;
-    let windows = approx::length(windows);
-    let reserve = (warm_ops / label.tasks + 1) * windows * SAMPLE_HEADROOM;
+    tasks: usize,
+    settings: &RunSettings,
+) -> BenchResult<Window> {
+    let (warm_ops, _, _) = spawn_run(served, op, tasks, settings.warmup, None).await?;
+    let windows = approx::length(settings.windows);
+    let reserve = (warm_ops / tasks + 1) * windows * SAMPLE_HEADROOM;
+    if let Some(log) = &served.gets {
+        log.restart();
+    }
     let before = Counters::read(served);
     let started = Instant::now();
-    let (ops, samples, bytes) = spawn_run(served, op, label.tasks, duration, Some(reserve)).await?;
+    let (ops, samples, bytes) =
+        spawn_run(served, op, tasks, settings.duration, Some(reserve)).await?;
     let elapsed = started.elapsed();
     let counters = Counters::read(served).since(before);
-    Ok(Measured {
-        label,
+    Ok(Window {
         ops,
-        keys_per_op: op.keys_per_op(),
         elapsed,
         latencies: Latencies::of(samples),
         counters,
         bytes,
-        rounds: None,
     })
 }
 
@@ -2706,30 +2958,35 @@ async fn prime_cache(table: &Table, shape: TableShape) -> BenchResult<()> {
     for id in (0..shape.rows).step_by(approx::length(shape.prime_stride())) {
         let key = shape.key(id);
         match shape.ordered {
-            Some(_) => {
-                let mut page = ScanBounds {
-                    direction: Direction::NewestFirst,
-                    limit: table
-                        .config()
-                        .scan_rows()
-                        .ok_or("an ordered table has a max_scan_rows")?,
-                    start: None,
-                    before: None,
-                };
-                loop {
-                    let scanned = table.scan(&key, shape.whole_reads(), &page).await?.scanned;
-                    match scanned.next {
-                        Some(next) => page.before = Some(next),
-                        None => break,
-                    }
-                }
-            }
+            Some(_) => page_through(table, &key, shape.whole_reads()).await?,
             None => {
                 table.get(&key, shape.whole_reads()).await?;
             }
         }
     }
     Ok(())
+}
+
+/// Scans every row of `key` in `table` reading `reads`, newest first at
+/// the table's `max_scan_rows`, each page from the last one's `next`, as a
+/// caller pages a run longer than one Scan returns.
+async fn page_through(table: &Table, key: &Key, reads: &[ColumnRead<'static>]) -> BenchResult<()> {
+    let mut page = ScanBounds {
+        direction: Direction::NewestFirst,
+        limit: table
+            .config()
+            .scan_rows()
+            .ok_or("an ordered table has a max_scan_rows")?,
+        start: None,
+        before: None,
+    };
+    loop {
+        let scanned = table.scan(key, reads, &page).await?.scanned;
+        match scanned.next {
+            Some(next) => page.before = Some(next),
+            None => return Ok(()),
+        }
+    }
 }
 
 /// Per key of the hit pool (`hit_ids`), the bytes of its whole
@@ -2860,25 +3117,36 @@ async fn lookups(
             batch_fan_out: serving().batch_fan_out,
             beside: beside.map(|other| other.shape),
         };
-        results.extend(measure_modes(served, &op, (label, rounds), settings).await?);
+        for run in measure_modes(served, &op, rounds, settings).await? {
+            let measured = Measured::of(label, op.keys_per_op(), run);
+            eprintln!("{}", row(&measured));
+            results.push(measured);
+        }
     }
     Ok(results)
 }
 
 /// The rounds of GETs a Scan op's operations wait on, from
 /// `served.rounds`: `ROUNDS_OPS` operations after the `VERIFIED_OPS` that
-/// `verify_scans` ran, one at a time, each counted on its own. `None` for
-/// a `Get` or `MultiGet` op, for a table served without the store that
-/// counts them, and for a `MultiScan`: its keys' reads run concurrently
+/// `verify_scans` ran, one at a time, each counted on its own after what
+/// `Op::before` does. `None` for a `Get` or `MultiGet` op, for a table
+/// served without the store that counts them, and for a `MultiScan`,
+/// a reference one included: its keys' reads run concurrently
 /// over one count, so a GET one key issues after another key's GET
 /// answered lands in a later round although it waits on nothing, and the
 /// count is no key's dependency depth.
 async fn count_rounds(served: &Served, op: &Op) -> BenchResult<Option<Rounds>> {
-    let (Some(store), Op::Scan { .. }) = (&served.rounds, op) else {
+    let one_key = match op {
+        Op::Scan { .. } => true,
+        Op::Reference { requests, .. } => !requests[0].multi,
+        Op::Get { .. } | Op::MultiGet { .. } | Op::MultiScan { .. } => false,
+    };
+    let (Some(store), true) = (&served.rounds, one_key) else {
         return Ok(None);
     };
     let mut rounds = Rounds::default();
     for i in VERIFIED_OPS..VERIFIED_OPS + ROUNDS_OPS {
+        op.before();
         store.restart();
         op.run(&served.table, i).await?;
         rounds.total += store.rounds();
@@ -2915,41 +3183,50 @@ async fn serve_loaded(
     Ok(served)
 }
 
-/// `op` over `served` measured in every selected mode, each row labeled
-/// `label` with that mode and its tasks; the single-task row carries
-/// `rounds`, counted one operation at a time as that row runs them.
+/// One mode of a measured op: the mode, its tasks, its window, the rounds
+/// counted for it, and the GETs a log over the served store holds of its
+/// window (`store_gets`).
+struct ModeRun {
+    mode: Mode,
+    tasks: usize,
+    window: Window,
+    rounds: Option<Rounds>,
+    gets: Option<Json>,
+}
+
+/// `op` over `served` measured in every selected mode; the single-task
+/// run carries `rounds`, counted one operation at a time as that run runs
+/// them, and every run the GETs of its window when a log is in place,
+/// with up to `GET_SAMPLES` of them one by one.
 async fn measure_modes(
     served: &Served,
     op: &Op,
-    (label, rounds): (RunLabel, Option<Rounds>),
+    rounds: Option<Rounds>,
     settings: &RunSettings,
-) -> BenchResult<Vec<Measured>> {
+) -> BenchResult<Vec<ModeRun>> {
+    let pages = match &served.gets {
+        Some(_) => Some(PageMap::of(&*served.table.serving()?)),
+        None => None,
+    };
     let mut runs = Vec::with_capacity(settings.modes.len());
     for &mode in &settings.modes {
-        let tasks = match mode {
-            Mode::Single => 1,
-            Mode::Multi => settings.tasks,
+        let (tasks, rounds) = match mode {
+            Mode::Single => (1, rounds),
+            Mode::Multi => (settings.tasks, None),
         };
-        let label = RunLabel {
+        let window = measure_window(served, op, tasks, settings).await?;
+        let gets = served
+            .gets
+            .as_ref()
+            .zip(pages.as_ref())
+            .map(|(log, pages)| store_gets(log, pages, GET_SAMPLES));
+        runs.push(ModeRun {
             mode,
             tasks,
-            ..label
-        };
-        let mut run = measure(
-            served,
-            op,
-            label,
-            settings.warmup,
-            settings.duration,
-            settings.windows,
-        )
-        .await?;
-        run.rounds = match mode {
-            Mode::Single => rounds,
-            Mode::Multi => None,
-        };
-        eprintln!("{}", row(&run));
-        runs.push(run);
+            window,
+            rounds,
+            gets,
+        });
     }
     Ok(runs)
 }
@@ -3173,22 +3450,26 @@ async fn two_tables(
     let rows = vec![
         Measured {
             label: label(string.shape, Mode::Single, one),
-            ops: batch_ops,
             keys_per_op: BATCH_1000,
-            elapsed,
-            latencies: Latencies::of(batch_samples),
-            counters: Counters::default(),
-            bytes: batch_bytes,
+            window: Window {
+                ops: batch_ops,
+                elapsed,
+                latencies: Latencies::of(batch_samples),
+                counters: Counters::default(),
+                bytes: batch_bytes,
+            },
             rounds: None,
         },
         Measured {
             label: label(long.shape, Mode::Multi, tasks),
-            ops: hit_ops,
             keys_per_op: 1,
-            elapsed,
-            latencies: Latencies::of(hit_samples),
-            counters: Counters::default(),
-            bytes: hit_bytes,
+            window: Window {
+                ops: hit_ops,
+                elapsed,
+                latencies: Latencies::of(hit_samples),
+                counters: Counters::default(),
+                bytes: hit_bytes,
+            },
             rounds: None,
         },
     ];
@@ -3273,10 +3554,40 @@ fn cpu_time(value: libc::timeval) -> Duration {
         + Duration::from_micros(u64::try_from(value.tv_usec).unwrap_or(0))
 }
 
+/// What a load is of: one of the program's own tables, or a golden
+/// reference table.
+#[derive(Clone, Copy, Debug)]
+enum Subject {
+    Bench(TableShape),
+    Reference(GoldenTable),
+}
+
+impl Subject {
+    /// The table's name in the printed rows.
+    fn table_name(self) -> String {
+        match self {
+            Self::Bench(shape) => shape.table_name(),
+            Self::Reference(table) => table.to_string(),
+        }
+    }
+
+    /// The table's JSON fields: a program table by its keys and values, a
+    /// reference table by its name.
+    fn to_json(self) -> Json {
+        match self {
+            Self::Bench(shape) => json!({
+                "table": shape.name.as_str(),
+                "values": shape.values.as_str(),
+            }),
+            Self::Reference(table) => json!({ "table": table.to_string() }),
+        }
+    }
+}
+
 /// One measured load or refresh, and the size of the generation it left.
 struct Loaded {
     what: &'static str,
-    table: TableShape,
+    table: Subject,
     tier: Tier,
     round: u32,
     wall: Duration,
@@ -3304,15 +3615,25 @@ struct Loaded {
     parts: ResidentParts,
     /// Under Disk, the bytes of the chunk files in the local directory.
     chunk_file_bytes: Option<u64>,
+    /// The GETs the served store logged (`store_gets`), where a log is in
+    /// place.
+    store_gets: Option<Json>,
 }
 
 impl Loaded {
     fn to_json(&self) -> Json {
+        let mut fields = merged(self.table.to_json(), [self.figures()]);
+        if let Some(gets) = &self.store_gets {
+            fields["store_gets"] = gets.clone();
+        }
+        fields
+    }
+
+    /// Every field but the table's.
+    fn figures(&self) -> Json {
         json!({
             "what": self.what,
-            "table": self.table.name.as_str(),
-            "values": self.table.values.as_str(),
-            "tier": format!("{:?}", self.tier).to_lowercase(),
+            "tier": self.tier.name(),
             "round": self.round,
             "wall_us": micros(self.wall),
             "cpu_us": micros(self.cpu),
@@ -3345,12 +3666,15 @@ impl Loaded {
 async fn timed<F: Future<Output = BenchResult<()>>>(
     served: &Served,
     what: &'static str,
-    (table, tier, round): (TableShape, Tier, u32),
+    (table, tier, round): (Subject, Tier, u32),
     work: F,
 ) -> BenchResult<Loaded> {
     let rss_before = resident_bytes();
     if let Some(store) = &served.rounds {
         store.restart();
+    }
+    if let Some(log) = &served.gets {
+        log.restart();
     }
     HeldBytes::take();
     let before = Counters::read(served);
@@ -3376,6 +3700,10 @@ async fn timed<F: Future<Output = BenchResult<()>>>(
         .as_ref()
         .map(|local| local.index_bytes_in_use())
         .transpose()?;
+    let store_gets = served
+        .gets
+        .as_ref()
+        .map(|log| store_gets(log, &PageMap::of(&generation), 0));
     Ok(Loaded {
         what,
         table,
@@ -3397,25 +3725,28 @@ async fn timed<F: Future<Output = BenchResult<()>>>(
         index_bytes: generation.index_bytes,
         parts,
         chunk_file_bytes,
+        store_gets,
     })
 }
 
-/// `rounds` first loads of `prepared` in `tier`, each over fresh storage,
-/// cache, and local directory; under Disk, each followed by a load over the
-/// same directory, which reuses the chunk files the first wrote.
-async fn loads(prepared: &Prepared, tier: Tier, rounds: u32) -> BenchResult<Vec<Loaded>> {
+/// `rounds` first loads of `table` in `tier`, each over the fresh storage,
+/// caches, and local directory `serve` gives it, here none to reuse; under
+/// Disk, each followed by a load over the same directory, which reuses the
+/// chunk files the first wrote.
+async fn loads<F, Fut>(
+    table: Subject,
+    tier: Tier,
+    rounds: u32,
+    serve: F,
+) -> BenchResult<Vec<Loaded>>
+where
+    F: Fn(Option<TempDir>) -> Fut,
+    Fut: Future<Output = BenchResult<Served>>,
+{
     let mut results = Vec::new();
     for round in 0..rounds {
-        let key = (prepared.shape, tier, round);
-        let served = serve(
-            prepared,
-            None,
-            tier,
-            WARM_CACHE_BYTES,
-            pinned(prepared),
-            None,
-        )
-        .await?;
+        let key = (table, tier, round);
+        let served = serve(None).await?;
         let run = timed(&served, "load", key, async {
             Ok(served.table.load().await?)
         })
@@ -3424,15 +3755,7 @@ async fn loads(prepared: &Prepared, tier: Tier, rounds: u32) -> BenchResult<Vec<
         results.push(run);
         if tier == Tier::Disk {
             let Served { _local: dir, .. } = served;
-            let again = serve(
-                prepared,
-                None,
-                tier,
-                WARM_CACHE_BYTES,
-                pinned(prepared),
-                dir,
-            )
-            .await?;
+            let again = serve(dir).await?;
             let run = timed(&again, "load-reusing-chunk-files", key, async {
                 Ok(again.table.load().await?)
             })
@@ -3455,7 +3778,7 @@ async fn refreshes(prepared: &Prepared, tier: Tier, rounds: u32) -> BenchResult<
     };
     let mut results = Vec::new();
     for round in 0..rounds {
-        let key = (prepared.shape, tier, round);
+        let key = (Subject::Bench(prepared.shape), tier, round);
         std::fs::write(&hint, &prepared.first)?;
         let served = serve(prepared, None, tier, WARM_CACHE_BYTES, source.clone(), None).await?;
         served.table.load().await?;
@@ -3498,12 +3821,20 @@ fn mib(bytes: u64) -> f64 {
 /// The column headings of the lookup table.
 fn header() -> String {
     format!(
-        "{:<24} {:<19} {:<6} {:<7} {:>5} {:>11} {:>10} {:>10} {:>10} {:>10} {:>9} {:>10} {:>8} {:>8} {:>10} {:>10} {:>11} {:>6}",
+        "{:<24} {:<19} {:<6} {:<7} {:>5} {}",
         "scenario",
         "table",
         "tier",
         "mode",
         "tasks",
+        window_header()
+    )
+}
+
+/// The headings of a window's figures (`window_cells`).
+fn window_header() -> String {
+    format!(
+        "{:>11} {:>10} {:>10} {:>10} {:>10} {:>9} {:>10} {:>8} {:>8} {:>10} {:>10} {:>11} {:>6}",
         "ops/s",
         "p50",
         "p90",
@@ -3521,27 +3852,35 @@ fn header() -> String {
 }
 
 fn row(run: &Measured) -> String {
-    let counters = run.counters;
     format!(
-        "{:<24} {:<19} {:<6} {:<7} {:>5} {:>11.0} {:>10.2?} {:>10.2?} {:>10.2?} {:>10.2?} {:>9.1} {:>10.0} {:>8.3} {:>8.3} {:>10.0} {:>10.0} {:>11.0} {:>6}",
+        "{:<24} {:<19} {:<6} {:<7} {:>5} {}",
         run.label.scenario.name(),
         run.label.table_label(),
-        format!("{:?}", run.label.tier).to_lowercase(),
+        run.label.tier.name(),
         run.label.mode.name(),
         run.label.tasks,
-        run.ops_per_second(),
-        run.latencies.percentile(P50),
-        run.latencies.percentile(P90),
-        run.latencies.percentile(P99),
-        run.latencies.max(),
-        run.per_op(counters.allocations.calls),
-        run.per_op(counters.allocations.bytes),
-        run.per_op(counters.fetches),
-        run.per_op(counters.gets + counters.local_reads),
-        run.per_op(run.bytes.read),
-        run.per_op(run.bytes.returned),
-        run.per_op(counters.get_bytes + counters.local_bytes),
-        run.rounds.map_or_else(
+        window_cells(&run.window, run.rounds)
+    )
+}
+
+/// A window's figures and its rounds, under `window_header`.
+fn window_cells(window: &Window, rounds: Option<Rounds>) -> String {
+    let counters = window.counters;
+    format!(
+        "{:>11.0} {:>10.2?} {:>10.2?} {:>10.2?} {:>10.2?} {:>9.1} {:>10.0} {:>8.3} {:>8.3} {:>10.0} {:>10.0} {:>11.0} {:>6}",
+        window.ops_per_second(),
+        window.latencies.percentile(P50),
+        window.latencies.percentile(P90),
+        window.latencies.percentile(P99),
+        window.latencies.max(),
+        window.per_op(counters.allocations.calls),
+        window.per_op(counters.allocations.bytes),
+        window.per_op(counters.fetches),
+        window.per_op(counters.gets + counters.local_reads),
+        window.per_op(window.bytes.read),
+        window.per_op(window.bytes.returned),
+        window.per_op(counters.get_bytes + counters.local_bytes),
+        rounds.map_or_else(
             || "-".to_string(),
             |rounds| format!("{:.2}", rounds.per_op())
         ),
@@ -3573,7 +3912,7 @@ fn load_row(run: &Loaded) -> String {
         "{:<26} {:<19} {:<6} {:>5} {:>10.1?} {:>10.1?} {:>11} {:>10.1} {:>10.1} {:>9} {:>9.1} {:>6} {:>10.1} {:>10}",
         run.what,
         run.table.table_name(),
-        format!("{:?}", run.tier).to_lowercase(),
+        run.tier.name(),
         run.round,
         run.wall,
         run.cpu,
@@ -3637,6 +3976,776 @@ fn write_report(out_dir: &Path, report: &Json) -> BenchResult<PathBuf> {
     let path = out_dir.join(format!("{stamp}.json"));
     std::fs::write(&path, serde_json::to_vec_pretty(report)?)?;
     Ok(path)
+}
+
+// ---------------------------------------------------------------------------
+// Reference mode.
+
+/// What `--reference` measures of each reference table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ReferenceScenario {
+    /// Scans of the keys sampled from each tier of rows per key, in both
+    /// directions, whole and over a window of each run's middle half
+    /// (`golden::reference_window`), at the table's `max_scan_rows`,
+    /// through a page cache and a scan cache emptied before each operation
+    /// (`PageCache::clear`, outside its timing), so every page comes from
+    /// object storage, or under Disk the key and order pages from the
+    /// local chunk files; in a multi-task run one task's operation may
+    /// still find a page another task's fetched since, which
+    /// `page_cache_hits_per_op` counts.
+    ScanCold,
+    /// The same Scans through caches primed with every sampled key's whole
+    /// run.
+    ScanWarm,
+    /// `MultiScan`s of 10 and of 100 keys (`REFERENCE_MULTI_KEYS`) at
+    /// limits of 1 and 20 (`REFERENCE_MULTI_LIMITS`), newest first,
+    /// unbounded, their keys the first of each tier in turn
+    /// (`multi_scan_ids`), through the emptied caches.
+    MultiScanCold,
+    /// The same `MultiScan`s through the primed caches.
+    MultiScanWarm,
+    /// First loads, and under Disk each followed by a restart over the
+    /// chunk files it left.
+    Load,
+}
+
+impl ReferenceScenario {
+    /// The scenario's name in the results.
+    fn name(self) -> &'static str {
+        match self {
+            Self::ScanCold => "scan-cold",
+            Self::ScanWarm => "scan-warm",
+            Self::MultiScanCold => "multi-scan-cold",
+            Self::MultiScanWarm => "multi-scan-warm",
+            Self::Load => "load",
+        }
+    }
+
+    /// Whether its reads go through the emptied caches.
+    fn cold(self) -> bool {
+        match self {
+            Self::ScanCold | Self::MultiScanCold => true,
+            Self::ScanWarm | Self::MultiScanWarm | Self::Load => false,
+        }
+    }
+
+    /// Whether it measures `MultiScan`s.
+    fn multi(self) -> bool {
+        match self {
+            Self::MultiScanCold | Self::MultiScanWarm => true,
+            Self::ScanCold | Self::ScanWarm | Self::Load => false,
+        }
+    }
+
+    /// Whether it measures loads, not lookups.
+    fn loads(self) -> bool {
+        match self {
+            Self::Load => true,
+            Self::ScanCold | Self::ScanWarm | Self::MultiScanCold | Self::MultiScanWarm => false,
+        }
+    }
+}
+
+/// Slots of the GET log over a reference table's store, `GetLog::SLOT_BYTES`
+/// each: more GETs than a measured window of a few seconds issues against
+/// object storage, or than a load of a reference table's 64 to 320 files
+/// does. A window over local files, whose GETs answer in microseconds, can
+/// fill it, and the results count what it dropped.
+const GET_LOG_SLOTS: usize = 1 << 16;
+
+/// The most GETs of a lookup run listed one by one in its results, beside
+/// the classes every GET of the window counts in (`store_gets`).
+const GET_SAMPLES: usize = 4_096;
+
+/// The classes of GETs by the data pages each spans, least and most, both
+/// included; `None` has no upper bound.
+const SPAN_CLASSES: [(u64, Option<u64>); 4] =
+    [(1, Some(1)), (2, Some(4)), (5, Some(16)), (17, None)];
+
+/// The least bytes of each class of GETs by bytes, ascending, each class
+/// below the next one's least: from nothing through 4 KiB, a small page,
+/// by fours to 4 MiB, a span of many value pages.
+const BYTE_CLASS_FLOORS: [u64; 7] = [
+    0,
+    4 * 1024,
+    16 * 1024,
+    64 * 1024,
+    256 * 1024,
+    1024 * 1024,
+    4 * 1024 * 1024,
+];
+
+/// Rows per key of the reference `MultiScan`s that read a short history:
+/// twenty, a fiftieth of the default `max_scan_rows`, which the light keys
+/// of a reference table hold at most.
+const MULTI_SCAN_SHORT_ROWS: u32 = 20;
+
+/// Keys of the reference `MultiScan`s: a batch of ten, and of a hundred,
+/// spread over several workers' runs.
+const REFERENCE_MULTI_KEYS: [usize; 2] = [MULTI_SCAN_KEYS, MULTI_SCAN_100_KEYS];
+
+/// Rows per key of the reference `MultiScan`s: each key's newest row, and
+/// a short history. A hundred keys at the longer limit, one column beside
+/// the order value, is `server.max_multi_scan_values` at its default.
+const REFERENCE_MULTI_LIMITS: [u32; 2] = [MULTI_SCAN_HEAD_ROWS, MULTI_SCAN_SHORT_ROWS];
+
+/// One lookup scenario of a reference table.
+#[derive(Clone, Copy, Debug)]
+struct RefLookup {
+    scenario: ReferenceScenario,
+    /// The tier whose sampled keys a Scan reads, one key an operation in
+    /// turn; `None` for a `MultiScan`, whose keys span every tier.
+    rows_tier: Option<RowsTier>,
+    direction: Direction,
+    /// Whether each key is read over its window, not its whole run.
+    bounded: bool,
+    limit: u32,
+    /// Keys per operation: one for a Scan.
+    keys: usize,
+}
+
+/// The lookup scenarios of `scenarios` over the keys of `rows_tiers`, Scans
+/// at `max`, the table's `max_scan_rows`, in the order they run.
+fn reference_lookups(
+    scenarios: &[ReferenceScenario],
+    rows_tiers: &[RowsTier],
+    max: u32,
+) -> Vec<RefLookup> {
+    let mut lookups = Vec::new();
+    for &scenario in scenarios.iter().filter(|scenario| !scenario.loads()) {
+        if scenario.multi() {
+            for keys in REFERENCE_MULTI_KEYS {
+                for limit in REFERENCE_MULTI_LIMITS {
+                    lookups.push(RefLookup {
+                        scenario,
+                        rows_tier: None,
+                        direction: Direction::NewestFirst,
+                        bounded: false,
+                        limit,
+                        keys,
+                    });
+                }
+            }
+            continue;
+        }
+        for &tier in rows_tiers {
+            for direction in [Direction::NewestFirst, Direction::OldestFirst] {
+                for bounded in [false, true] {
+                    lookups.push(RefLookup {
+                        scenario,
+                        rows_tier: Some(tier),
+                        direction,
+                        bounded,
+                        limit: max,
+                        keys: 1,
+                    });
+                }
+            }
+        }
+    }
+    lookups
+}
+
+/// The key indexes of a reference `MultiScan` of `batch` keys below
+/// `keys`: the first keys of each tier in turn, heaviest first
+/// (`golden::reference_tier_sample`), so a batch of fifteen or more holds
+/// the golden sample's tier keys.
+fn multi_scan_ids(keys: u64, batch: usize) -> Vec<u64> {
+    let per_tier = batch.div_ceil(RowsTier::ALL.len());
+    let tiers = RowsTier::ALL.map(|tier| golden::reference_tier_sample(keys, tier, per_tier));
+    (0..per_tier)
+        .flat_map(|at| tiers.iter().filter_map(move |ids| ids.get(at).copied()))
+        .take(batch)
+        .collect()
+}
+
+/// The request of `lookup` for the keys `ids` of `table`: per key its case
+/// from the derivation (`golden::derived_scan`), over its window when the
+/// lookup is bounded.
+fn reference_request(table: GoldenTable, ids: &[u64], lookup: &RefLookup) -> Request {
+    let cases = ids
+        .iter()
+        .map(|&id| {
+            let rows = golden::ordered_rows(table, id);
+            let (start, before) = if lookup.bounded {
+                let (start, before) = golden::reference_window(&rows);
+                (Some(start), Some(before))
+            } else {
+                (None, None)
+            };
+            let test = TestScan {
+                direction: lookup.direction,
+                limit: lookup.limit,
+                start,
+                before,
+            };
+            let (want, _) = golden::derived_scan(table, id, &rows, &test);
+            ScanCase {
+                bounds: test.bounds_by(|order| golden::ordered_order_value(table, id, order)),
+                orders: want.rows.into_iter().map(|row| row.order).collect(),
+                next: want.next,
+                test,
+            }
+        })
+        .collect();
+    Request {
+        ids: ids.to_vec(),
+        keys: ids
+            .iter()
+            .map(|&id| golden::ordered_key(table, id))
+            .collect(),
+        multi: lookup.scenario.multi(),
+        cases,
+    }
+}
+
+/// The op of `lookup` over `table` of `keys` keys: a Scan of each sampled
+/// key of its tier in turn, or one `MultiScan` of its batch; `cold` names
+/// the caches it empties before each operation.
+fn reference_op(table: GoldenTable, keys: u64, lookup: &RefLookup, cold: Option<ColdCaches>) -> Op {
+    let requests = match lookup.rows_tier {
+        Some(tier) => golden::reference_tier_sample(keys, tier, REFERENCE_TIER_SAMPLES)
+            .into_iter()
+            .map(|id| reference_request(table, &[id], lookup))
+            .collect(),
+        None => vec![reference_request(
+            table,
+            &multi_scan_ids(keys, lookup.keys),
+            lookup,
+        )],
+    };
+    Op::Reference {
+        requests: Arc::new(requests),
+        value_bytes: REFERENCE_VALUE_BYTES,
+        cold,
+    }
+}
+
+/// Every request of a reference op, each key's answer compared whole, every
+/// value's bytes included, with the derivation's, before the op is
+/// measured: `Op::run` checks the order values and value lengths alone.
+async fn verify_reference(op: &Op, table: &Table, golden_table: GoldenTable) -> BenchResult<()> {
+    let Op::Reference { requests, .. } = op else {
+        return Ok(());
+    };
+    for (i, request) in requests.iter().enumerate() {
+        op.before();
+        let answers = if request.multi {
+            table
+                .multi_scan(&request.keys, &VALUE_READS, request.bounds())
+                .await?
+                .results
+        } else {
+            vec![
+                table
+                    .scan(&request.keys[0], &VALUE_READS, request.bounds())
+                    .await?
+                    .scanned,
+            ]
+        };
+        if answers.len() != request.ids.len() {
+            return Err(format!(
+                "{golden_table} request {i} answered {} of {} keys",
+                answers.len(),
+                request.ids.len()
+            )
+            .into());
+        }
+        for ((answer, &id), case) in answers.iter().zip(&request.ids).zip(&request.cases) {
+            let rows = golden::ordered_rows(golden_table, id);
+            let (want, _) = golden::derived_scan(golden_table, id, &rows, &case.test);
+            if *answer != want {
+                return Err(format!(
+                    "{golden_table} request {i}: key index {id} under {:?} disagrees with the derivation",
+                    case.test
+                )
+                .into());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `table` of the reference warehouse `warehouse` in `tier`, as `serve`
+/// serves the program's own tables, over the run's storage and
+/// `cache_bytes` caches, with every request of the warehouse's store logged
+/// (`GetLog`) and its GETs' rounds counted (`RoundsStore`), the log beneath
+/// the count so a GET's logged latency is the store's alone; not loaded.
+/// Under Disk, `reuse`'s local directory when given.
+async fn serve_reference(
+    warehouse: &str,
+    table: GoldenTable,
+    tier: Tier,
+    cache_bytes: usize,
+    reuse: Option<TempDir>,
+) -> BenchResult<Served> {
+    let storage = Arc::new(Storage::with_sdk_defaults(serving().storage));
+    let mut logged = None;
+    let mut counted = None;
+    storage
+        .wrap_store(&golden::location(warehouse, table), |inner| {
+            let log = Arc::new(GetLog::over(inner, GET_LOG_SLOTS));
+            let rounds = Arc::new(RoundsStore::over(Arc::clone(&log) as Arc<dyn ObjectStore>));
+            logged = Some(log);
+            counted = Some(Arc::clone(&rounds));
+            rounds
+        })
+        .await?;
+    let Stack {
+        handles,
+        local,
+        dir,
+    } = stack(&storage, tier, cache_bytes, reuse).await?;
+    let cache = handles.cache.clone();
+    let scan_cache = handles.scan_cache.clone();
+    let config = TableConfig {
+        residency: tier.residency(),
+        ..golden::table_config(warehouse, table, false)
+    };
+    let table = table_of(config, handles).await?;
+    Ok(Served {
+        table: Arc::new(table),
+        beside: None,
+        storage,
+        cache,
+        scan_cache,
+        local,
+        rounds: counted,
+        gets: logged,
+        _local: dir,
+    })
+}
+
+/// The data pages of a generation's files, by `GetLog::name_of` each
+/// file's name: each page's byte range in its file, ascending, over every
+/// column whose offset index the footer keeps.
+struct PageMap {
+    files: HashMap<u64, Vec<Range<u64>>>,
+    /// Files whose names another file of the generation shares, so a GET
+    /// of either is placed among both's pages; zero for the tables Spark
+    /// writes, whose file names carry a UUID.
+    shared_names: usize,
+}
+
+impl PageMap {
+    fn of(generation: &Generation) -> Self {
+        let mut files: HashMap<u64, Vec<Range<u64>>> = HashMap::new();
+        let mut shared_names = 0;
+        for file in &generation.files {
+            let name = file.entry.path.rsplit('/').next().unwrap_or_default();
+            let mut pages: Vec<Range<u64>> = file
+                .index
+                .metadata()
+                .offset_index()
+                .into_iter()
+                .flatten()
+                .flatten()
+                .flat_map(|column| column.page_locations().iter().map(page_range))
+                .collect();
+            pages.sort_by_key(|page| page.start);
+            match files.entry(GetLog::name_of(name)) {
+                Entry::Occupied(mut held) => {
+                    shared_names += 1;
+                    held.get_mut().extend(pages);
+                    held.get_mut().sort_by_key(|page| page.start);
+                }
+                Entry::Vacant(free) => {
+                    free.insert(pages);
+                }
+            }
+        }
+        Self {
+            files,
+            shared_names,
+        }
+    }
+
+    /// The pages `range` of the file named `name` overlaps; `None` for a
+    /// file not in the generation, as a metadata file or manifest is.
+    fn spanned(&self, name: u64, range: &Range<u64>) -> Option<u64> {
+        let pages = self.files.get(&name)?;
+        let first = pages.partition_point(|page| page.end <= range.start);
+        let spanned = pages[first..]
+            .iter()
+            .take_while(|page| page.start < range.end)
+            .count();
+        Some(approx::count(spanned))
+    }
+}
+
+/// A page's bytes in its file, header included, as its offset index
+/// records them.
+fn page_range(page: &PageLocation) -> Range<u64> {
+    let start = u64::try_from(page.offset).unwrap_or(0);
+    start..start + u64::try_from(page.compressed_page_size).unwrap_or(0)
+}
+
+/// The GETs `log` holds as JSON: by the data pages of `pages` each spans
+/// (`SPAN_CLASSES`) and by its bytes (`BYTE_CLASS_FLOORS`), for each class
+/// how many, their mean bytes, and the percentiles of their latency to the
+/// store's answer and to their body's last byte; beside them the GETs no
+/// class holds (never answered, a ranged read of several, or outside every
+/// data page, as a footer, metadata, or manifest is), and up to `samples`
+/// of the classed GETs one by one, as [pages, bytes, first-byte µs,
+/// last-byte µs].
+fn store_gets(log: &GetLog, pages: &PageMap, samples: usize) -> Json {
+    let records = log.records();
+    let mut spanned: Vec<(u64, &LoggedGet)> = Vec::new();
+    let (mut unanswered, mut multi_range, mut outside) = (0_u64, 0_u64, 0_u64);
+    for get in &records {
+        match (&get.range, get.parts) {
+            (None, _) => unanswered += 1,
+            (Some(_), parts) if parts > 1 => multi_range += 1,
+            (Some(range), _) => match pages.spanned(get.name, range) {
+                Some(0) | None => outside += 1,
+                Some(count) => spanned.push((count, get)),
+            },
+        }
+    }
+    let by_pages: Vec<Json> = SPAN_CLASSES
+        .iter()
+        .map(|&(least, most)| {
+            let held = spanned
+                .iter()
+                .filter(|(count, _)| *count >= least && most.is_none_or(|most| *count <= most));
+            class_json(
+                json!({ "min_pages": least, "max_pages": most }),
+                held.map(|(_, get)| *get),
+            )
+        })
+        .collect();
+    let by_bytes: Vec<Json> = BYTE_CLASS_FLOORS
+        .iter()
+        .enumerate()
+        .map(|(at, &least)| {
+            let below = BYTE_CLASS_FLOORS.get(at + 1).copied();
+            let held = spanned.iter().filter(|(_, get)| {
+                get.bytes() >= least && below.is_none_or(|below| get.bytes() < below)
+            });
+            class_json(
+                json!({ "min_bytes": least, "below_bytes": below }),
+                held.map(|(_, get)| *get),
+            )
+        })
+        .collect();
+    let one_by_one: Vec<Json> = spanned
+        .iter()
+        .take(samples)
+        .map(|(count, get)| {
+            json!([
+                count,
+                get.bytes(),
+                get.first_byte.map(micros),
+                get.last_byte.map(micros)
+            ])
+        })
+        .collect();
+    json!({
+        "logged": records.len(),
+        "dropped": log.dropped(),
+        "unanswered": unanswered,
+        "multi_range": multi_range,
+        "outside_data_pages": outside,
+        "data_page_gets": spanned.len(),
+        "shared_file_names": pages.shared_names,
+        "by_pages": by_pages,
+        "by_bytes": by_bytes,
+        "samples": one_by_one,
+    })
+}
+
+/// One class of GETs as JSON: its `bounds`, how many `gets` it holds,
+/// their mean bytes, and their latencies to the answer and to the last
+/// byte.
+fn class_json<'a>(bounds: Json, gets: impl Iterator<Item = &'a LoggedGet>) -> Json {
+    let gets: Vec<&LoggedGet> = gets.collect();
+    let bytes: u64 = gets.iter().map(|get| get.bytes()).sum();
+    let first = Latencies::of(gets.iter().filter_map(|get| get.first_byte).collect());
+    let last = Latencies::of(gets.iter().filter_map(|get| get.last_byte).collect());
+    merged(
+        bounds,
+        [json!({
+            "gets": gets.len(),
+            "mean_bytes": approx::ratio(bytes, approx::count(gets.len())),
+            "first_byte": latency_json(&first),
+            "last_byte": latency_json(&last),
+        })],
+    )
+}
+
+/// `latencies`' count and percentiles in microseconds.
+fn latency_json(latencies: &Latencies) -> Json {
+    json!({
+        "count": latencies.len(),
+        "p50_us": micros(latencies.percentile(P50)),
+        "p90_us": micros(latencies.percentile(P90)),
+        "p99_us": micros(latencies.percentile(P99)),
+        "max_us": micros(latencies.max()),
+    })
+}
+
+/// The name of a Scan's direction in the results.
+fn direction_name(direction: Direction) -> &'static str {
+    match direction {
+        Direction::NewestFirst => "newest_first",
+        Direction::OldestFirst => "oldest_first",
+    }
+}
+
+/// A measured lookup scenario of a reference table in one mode.
+struct RefMeasured {
+    table: GoldenTable,
+    /// The keys the table was written with.
+    table_keys: u64,
+    tier: Tier,
+    lookup: RefLookup,
+    /// The key indexes the op asks, every request's in order.
+    ids: Vec<u64>,
+    run: ModeRun,
+}
+
+impl RefMeasured {
+    fn to_json(&self) -> Json {
+        let lookup = &self.lookup;
+        merged(
+            json!({
+                "scenario": lookup.scenario.name(),
+                "table": self.table.to_string(),
+                "table_keys": self.table_keys,
+                "tier": self.tier.name(),
+                "mode": self.run.mode.name(),
+                "tasks": self.run.tasks,
+                "batch_fan_out": serving().batch_fan_out,
+                "rows_tier": lookup.rows_tier.map(|tier| tier.to_string()),
+                "direction": direction_name(lookup.direction),
+                "bounded": lookup.bounded,
+                "limit": lookup.limit,
+                "keys_per_op": lookup.keys,
+                "key_ids": self.ids,
+                "key_rows": self.ids.iter().map(|&id| golden::reference_rows_of(id)).collect::<Vec<_>>(),
+                "store_gets": self.run.gets,
+            }),
+            [self.run.window.to_json(), rounds_json(self.run.rounds)],
+        )
+    }
+}
+
+/// The column headings of the reference lookup table.
+fn ref_header() -> String {
+    format!(
+        "{:<16} {:<15} {:<6} {:<7} {:>5} {:<6} {:<12} {:<6} {:>5} {:>4} {}",
+        "scenario",
+        "table",
+        "tier",
+        "mode",
+        "tasks",
+        "rows",
+        "direction",
+        "reads",
+        "limit",
+        "keys",
+        window_header()
+    )
+}
+
+fn ref_row(run: &RefMeasured) -> String {
+    let lookup = &run.lookup;
+    format!(
+        "{:<16} {:<15} {:<6} {:<7} {:>5} {:<6} {:<12} {:<6} {:>5} {:>4} {}",
+        lookup.scenario.name(),
+        run.table.to_string(),
+        run.tier.name(),
+        run.run.mode.name(),
+        run.run.tasks,
+        lookup
+            .rows_tier
+            .map_or_else(|| "mixed".to_string(), |tier| tier.to_string()),
+        direction_name(lookup.direction),
+        if lookup.bounded { "window" } else { "whole" },
+        lookup.limit,
+        lookup.keys,
+        window_cells(&run.run.window, run.run.rounds)
+    )
+}
+
+/// What a reference run measures: its scenarios, the tiers of rows per key
+/// its Scans read, and its settings.
+struct RefSelection<'a> {
+    scenarios: Vec<ReferenceScenario>,
+    rows_tiers: Vec<RowsTier>,
+    settings: &'a RunSettings,
+}
+
+/// Every selected lookup scenario of reference table `table` in `tier`:
+/// served warm, primed with every key the warm scenarios read, and cold,
+/// each loaded; per scenario its op checked whole against the derivation
+/// (`verify_reference`), its rounds counted, and each mode measured with
+/// the GETs of its window.
+async fn reference_lookups_in(
+    warehouse: &str,
+    table: GoldenTable,
+    tier: Tier,
+    selection: &RefSelection<'_>,
+) -> BenchResult<Vec<RefMeasured>> {
+    let wanted = |cold: bool| {
+        selection
+            .scenarios
+            .iter()
+            .any(|scenario| !scenario.loads() && scenario.cold() == cold)
+    };
+    let mut warm = None;
+    let mut cold = None;
+    for (wanted, cache_bytes, served) in [
+        (wanted(false), WARM_CACHE_BYTES, &mut warm),
+        (wanted(true), COLD_CACHE_BYTES, &mut cold),
+    ] {
+        if wanted {
+            let table_served = serve_reference(warehouse, table, tier, cache_bytes, None).await?;
+            table_served.table.load().await?;
+            *served = Some(table_served);
+        }
+    }
+    let Some(any) = warm.as_ref().or(cold.as_ref()) else {
+        return Ok(Vec::new());
+    };
+    let metadata = golden::served_metadata(&any.storage, &*any.table.serving()?).await?;
+    let keys = golden::reference_keys(&metadata, table)?;
+    let max = any
+        .table
+        .config()
+        .scan_rows()
+        .ok_or("an ordered table has a max_scan_rows")?;
+    let lookups = reference_lookups(&selection.scenarios, &selection.rows_tiers, max);
+    if let Some(warm) = &warm {
+        let mut primed = BTreeSet::new();
+        for lookup in lookups.iter().filter(|lookup| !lookup.scenario.cold()) {
+            if let Op::Reference { requests, .. } = reference_op(table, keys, lookup, None) {
+                primed.extend(requests.iter().flat_map(|request| request.ids.clone()));
+            }
+        }
+        for &id in &primed {
+            page_through(&warm.table, &golden::ordered_key(table, id), &VALUE_READS).await?;
+        }
+    }
+    let mut results = Vec::new();
+    for lookup in lookups {
+        let served = if lookup.scenario.cold() { &cold } else { &warm };
+        let served = served
+            .as_ref()
+            .expect("a table is served for every selected scenario");
+        let caches = lookup.scenario.cold().then(|| ColdCaches {
+            cache: served.cache.clone(),
+            scan_cache: served.scan_cache.clone(),
+        });
+        let op = reference_op(table, keys, &lookup, caches);
+        verify_reference(&op, &served.table, table).await?;
+        let rounds = count_rounds(served, &op).await?;
+        let ids: Vec<u64> = match &op {
+            Op::Reference { requests, .. } => requests
+                .iter()
+                .flat_map(|request| request.ids.iter().copied())
+                .collect(),
+            Op::Get { .. } | Op::MultiGet { .. } | Op::Scan { .. } | Op::MultiScan { .. } => {
+                Vec::new()
+            }
+        };
+        for run in measure_modes(served, &op, rounds, selection.settings).await? {
+            let measured = RefMeasured {
+                table,
+                table_keys: keys,
+                tier,
+                lookup,
+                ids: ids.clone(),
+                run,
+            };
+            eprintln!("{}", ref_row(&measured));
+            results.push(measured);
+        }
+    }
+    Ok(results)
+}
+
+/// The settings a reference report was measured under.
+fn reference_settings(cli: &Cli, warehouse: &str, tables: &[GoldenTable]) -> Json {
+    json!({
+        "warehouse": warehouse,
+        "rewrite_location": cli.rewrite_location.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "tables": tables.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "warmup_seconds": cli.warmup,
+        "duration_seconds": cli.duration,
+        "load_rounds": cli.load_rounds,
+        "batch_fan_out": cli.batch_fan_out,
+        "warm_cache_bytes": WARM_CACHE_BYTES,
+        "cold_cache_bytes": COLD_CACHE_BYTES,
+        "cold": "the page cache and the scan cache emptied before each operation, outside its timing",
+        "warm": "every key a warm scenario reads paged through whole before it is measured",
+        "verified": "every request's answers compared whole with the derivation before it is measured",
+        "tier_samples": REFERENCE_TIER_SAMPLES,
+        "multi_scan_keys": REFERENCE_MULTI_KEYS,
+        "multi_scan_limits": REFERENCE_MULTI_LIMITS,
+        "rounds_ops": ROUNDS_OPS,
+        "get_log": {
+            "slots": GET_LOG_SLOTS,
+            "slot_bytes": GetLog::SLOT_BYTES,
+            "per_get": "one atomic increment, a hash of the file name, three clock reads, six relaxed stores, and one boxed body stream",
+            "samples_per_run": GET_SAMPLES,
+        },
+        "span_classes": SPAN_CLASSES.map(|(least, most)| json!({ "min_pages": least, "max_pages": most })),
+        "byte_class_floors": BYTE_CLASS_FLOORS,
+    })
+}
+
+/// The `--reference` run: every selected scenario of every selected
+/// reference table in every selected tier, printed as it is measured and
+/// written as JSON under `--out-dir`.
+async fn reference_main(cli: &Cli, warehouse: &str, settings: &RunSettings) -> BenchResult<()> {
+    let tables = or_all(&cli.reference_table, &GoldenTable::REFERENCE);
+    if let Some(table) = tables.iter().find(|table| !table.is_reference()) {
+        return Err(format!("{table} is not a reference table").into());
+    }
+    let selection = RefSelection {
+        scenarios: or_all(&cli.reference_scenario, ReferenceScenario::value_variants()),
+        rows_tiers: or_all(&cli.rows_tier, &RowsTier::ALL),
+        settings,
+    };
+    let tiers = or_all(&cli.tier, &Tier::ALL);
+    let machine = machine(settings.tasks, !cli.no_metrics);
+    eprintln!("{machine}");
+    eprintln!("{}", ref_header());
+    let mut measured = Vec::new();
+    let mut loaded = Vec::new();
+    for &table in &tables {
+        for &tier in &tiers {
+            measured.extend(reference_lookups_in(warehouse, table, tier, &selection).await?);
+            if selection.scenarios.contains(&ReferenceScenario::Load) {
+                let serve_table =
+                    |reuse| serve_reference(warehouse, table, tier, WARM_CACHE_BYTES, reuse);
+                let subject = Subject::Reference(table);
+                loaded.extend(loads(subject, tier, cli.load_rounds, serve_table).await?);
+            }
+        }
+    }
+    println!("{machine}");
+    println!("{}", ref_header());
+    for run in &measured {
+        println!("{}", ref_row(run));
+    }
+    if !loaded.is_empty() {
+        println!("{}", load_header());
+        for run in &loaded {
+            println!("{}", load_row(run));
+        }
+    }
+    let report = json!({
+        "run": "reference",
+        "machine": machine,
+        "settings": reference_settings(cli, warehouse, &tables),
+        "lookups": measured.iter().map(RefMeasured::to_json).collect::<Vec<_>>(),
+        "loads": loaded.iter().map(Loaded::to_json).collect::<Vec<_>>(),
+    });
+    let path = write_report(&cli.out_dir, &report)?;
+    println!("results: {}", path.display());
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -3815,6 +4924,19 @@ fn report_settings(cli: &Cli, prepared: &[Prepared], compression: &[Json]) -> Js
     })
 }
 
+/// The settings every lookup run of `cli` shares.
+fn run_settings(cli: &Cli) -> RunSettings {
+    RunSettings {
+        modes: or_all(&cli.mode, &Mode::ALL),
+        tasks: cli.tasks.unwrap_or_else(|| {
+            std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
+        }),
+        warmup: Duration::from_secs(cli.warmup),
+        duration: Duration::from_secs(cli.duration),
+        windows: cli.duration.div_ceil(cli.warmup),
+    }
+}
+
 #[tokio::main]
 async fn main() -> BenchResult<()> {
     let cli = Cli::parse();
@@ -3824,6 +4946,18 @@ async fn main() -> BenchResult<()> {
         .expect("main sets the row groups once");
     if cfg!(debug_assertions) {
         eprintln!("warning: an unoptimized build; pass --release or --profile profiling");
+    }
+    let settings = run_settings(&cli);
+    if let Some(warehouse) = &cli.reference {
+        if !cli.no_metrics {
+            install_recorder()?;
+        }
+        if cli.reference_scenario.is_empty()
+            || cli.reference_scenario.contains(&ReferenceScenario::Load)
+        {
+            tracing::subscriber::set_global_default(HeldBytes)?;
+        }
+        return reference_main(&cli, warehouse, &settings).await;
     }
     let scenarios = or_all(&cli.scenario, Scenario::value_variants());
     let (measured_shapes, needed) = select_shapes(&cli, &scenarios);
@@ -3844,16 +4978,7 @@ async fn main() -> BenchResult<()> {
         primed += prime_os_cache(&local_path(&table.root)?)?;
     }
     eprintln!("read {:.0} MiB to prime the OS page cache", mib(primed));
-    let tasks = cli
-        .tasks
-        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, std::num::NonZero::get));
-    let settings = RunSettings {
-        modes: or_all(&cli.mode, &Mode::ALL),
-        tasks,
-        warmup: Duration::from_secs(cli.warmup),
-        duration: Duration::from_secs(cli.duration),
-        windows: cli.duration.div_ceil(cli.warmup),
-    };
+    let tasks = settings.tasks;
     let lookup_scenarios: Vec<Scenario> = scenarios
         .iter()
         .copied()
@@ -3876,7 +5001,10 @@ async fn main() -> BenchResult<()> {
                 measured.extend(lookups(table, None, tier, &table_lookups, &settings).await?);
             }
             if scenarios.contains(&Scenario::Load) {
-                loaded.extend(loads(table, tier, cli.load_rounds).await?);
+                let serve_table =
+                    |reuse| serve(table, None, tier, WARM_CACHE_BYTES, pinned(table), reuse);
+                let subject = Subject::Bench(table.shape);
+                loaded.extend(loads(subject, tier, cli.load_rounds, serve_table).await?);
             }
             if scenarios.contains(&Scenario::Refresh) {
                 loaded.extend(refreshes(table, tier, cli.load_rounds).await?);

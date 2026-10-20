@@ -313,6 +313,34 @@ pub enum GoldenTable {
 }
 
 impl GoldenTable {
+    /// Every table the recipe writes.
+    pub const ALL: [Self; 24] = [
+        Self::Long2m,
+        Self::Str2m,
+        Self::Bin16_500k,
+        Self::LongWide250k,
+        Self::LongV3_50k,
+        Self::DefaultLayout1m,
+        Self::Unpartitioned500k,
+        Self::Overlap250k,
+        Self::LongMorV2_100k,
+        Self::LongMorV3_100k,
+        Self::LongMorV2Compacted100k,
+        Self::LongMorV3Compacted100k,
+        Self::OrderedCompacted100k,
+        Self::OrderedRolled100k,
+        Self::OrderedAppended100k,
+        Self::OrderedOverlap100k,
+        Self::OrderedMergeV2_100k,
+        Self::OrderedMergeV3_100k,
+        Self::OrderedMergeV3Compacted100k,
+        Self::OrderedString100k,
+        Self::RefCompacted,
+        Self::RefAppended,
+        Self::RefString,
+        Self::RefLargeFiles,
+    ];
+
     /// Every table the recipe's `ordered` group writes.
     pub const ORDERED: [Self; 8] = [
         Self::OrderedCompacted100k,
@@ -486,6 +514,25 @@ impl fmt::Display for GoldenTable {
         f.write_str(name)
     }
 }
+
+/// A table by the name the recipe writes it under, its Display: the one
+/// parser of a golden table's name, for a program's command line.
+impl std::str::FromStr for GoldenTable {
+    type Err = UnknownName;
+
+    fn from_str(text: &str) -> std::result::Result<Self, UnknownName> {
+        Self::ALL
+            .into_iter()
+            .find(|table| table.to_string() == text)
+            .ok_or_else(|| UnknownName(text.to_string()))
+    }
+}
+
+/// Text that names no golden table, or no tier of rows per key
+/// (`FromStr`).
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{0:?} is not one of the names")]
+pub struct UnknownName(pub String);
 
 /// Where the golden tables are read from: the warehouse the recipe wrote
 /// into or a copy of it, and the rewrite rules that send the locations its
@@ -843,6 +890,19 @@ impl RowsTier {
     }
 }
 
+/// A tier by its Display name: the one parser of a tier's name, for a
+/// program's command line.
+impl std::str::FromStr for RowsTier {
+    type Err = UnknownName;
+
+    fn from_str(text: &str) -> std::result::Result<Self, UnknownName> {
+        Self::ALL
+            .into_iter()
+            .find(|tier| tier.to_string() == text)
+            .ok_or_else(|| UnknownName(text.to_string()))
+    }
+}
+
 impl fmt::Display for RowsTier {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
@@ -1087,6 +1147,26 @@ mod tests {
         for (table, name) in NAMES {
             assert_eq!(table.to_string(), name);
         }
+        assert_eq!(NAMES.map(|(table, _)| table), GoldenTable::ALL);
+    }
+
+    #[test]
+    fn test_from_str_golden_table_and_tier_read_display_and_refuse_other_text() {
+        for table in GoldenTable::ALL {
+            assert_eq!(table.to_string().parse(), Ok(table));
+        }
+        for tier in RowsTier::ALL {
+            assert_eq!(tier.to_string().parse(), Ok(tier));
+        }
+        let unknown = "ref_unknown";
+        assert_eq!(
+            unknown.parse::<GoldenTable>(),
+            Err(UnknownName(unknown.to_string()))
+        );
+        assert_eq!(
+            "Heavy".parse::<RowsTier>(),
+            Err(UnknownName("Heavy".to_string()))
+        );
     }
 
     #[test]
