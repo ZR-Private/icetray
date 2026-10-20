@@ -57,9 +57,9 @@
 //! rounds count, and each run reports its window's GETs by the data pages
 //! each spans and by its bytes, with each class's latency to the answer
 //! and to the last byte. `--reference-table`, `--reference-scenario`, and
-//! `--rows-tier` narrow it, `--reference-max-scan-rows` raises the tables'
-//! `max_scan_rows`, at which the Scans run, so a heavy key's spans hold
-//! more pages, and its JSON says what it is (`"run": "reference"`), the
+//! `--rows-tier` narrow it, `--reference-max-scan-rows` sets the tables'
+//! `max_scan_rows`, at which the Scans run, so a raised one gives a heavy
+//! key's spans more pages, and its JSON says what it is (`"run": "reference"`), the
 //! limits it served at, and, per row, what each figure is of.
 
 use std::alloc::{GlobalAlloc, Layout};
@@ -755,7 +755,7 @@ struct Cli {
     /// read longer spans. `server.max_multi_scan_values` rises to the least
     /// that admits it when its default does not. A value a server would
     /// refuse to start with is refused, and so is one below the `MultiScan`
-    /// scenarios' limits.
+    /// scenarios' limits when a `MultiScan` scenario runs.
     #[arg(
         long,
         value_name = "ROWS",
@@ -4016,6 +4016,7 @@ fn machine(tasks: usize, metrics: bool) -> Json {
     json!({
         "cpu": cpu_model(),
         "cores": std::thread::available_parallelism().map_or(0, std::num::NonZero::get),
+        "worker_threads": tokio::runtime::Handle::current().metrics().num_workers(),
         "tasks": tasks,
         "os": command_line("uname", &["-srm"]).unwrap_or_else(|| std::env::consts::OS.to_string()),
         "os_version": command_line("sw_vers", &["-productVersion"]),
@@ -4358,12 +4359,19 @@ fn reference_config(warehouse: &str, table: GoldenTable, tier: Tier) -> TableCon
 /// to start serving them: each table's configuration under the run's
 /// server settings, through the validation a configuration file goes
 /// through (`Config::validated`), under the Full tier, whose settings every
-/// tier's share. Refuses as well a `--reference-max-scan-rows` below a
-/// `MultiScan` limit (`reference_multi_limits`), which every `MultiScan`
-/// scenario would be refused at.
-fn validate_reference(warehouse: &str, tables: &[GoldenTable]) -> BenchResult<()> {
+/// tier shares. When `scenarios` hold a `MultiScan` one, refuses as well a
+/// `--reference-max-scan-rows` below a `MultiScan` limit
+/// (`reference_multi_limits`), which every `MultiScan` scenario would be
+/// refused at.
+fn validate_reference(
+    warehouse: &str,
+    tables: &[GoldenTable],
+    scenarios: &[ReferenceScenario],
+) -> BenchResult<()> {
     let serving = serving();
-    if let Some(rows) = serving.reference_max_scan_rows {
+    if let Some(rows) = serving.reference_max_scan_rows
+        && scenarios.iter().any(|scenario| scenario.multi())
+    {
         let limits = reference_multi_limits();
         if limits.iter().any(|&limit| limit > rows) {
             return Err(format!(
@@ -4743,6 +4751,7 @@ fn reference_settings(cli: &Cli, warehouse: &str, tables: &[GoldenTable]) -> Jso
         "warmup_seconds": cli.warmup,
         "duration_seconds": cli.duration,
         "load_rounds": cli.load_rounds,
+        "load_concurrency": icetray_core::load_concurrency(),
         "batch_fan_out": cli.batch_fan_out,
         "warm_cache_bytes": WARM_CACHE_BYTES,
         "cold_cache_bytes": COLD_CACHE_BYTES,
@@ -4779,9 +4788,10 @@ async fn reference_main(cli: &Cli, warehouse: &str, settings: &RunSettings) -> B
     if let Some(table) = tables.iter().find(|table| !table.is_reference()) {
         return Err(format!("{table} is not a reference table").into());
     }
-    validate_reference(warehouse, &tables)?;
+    let scenarios = or_all(&cli.reference_scenario, ReferenceScenario::value_variants());
+    validate_reference(warehouse, &tables, &scenarios)?;
     let selection = RefSelection {
-        scenarios: or_all(&cli.reference_scenario, ReferenceScenario::value_variants()),
+        scenarios,
         rows_tiers: or_all(&cli.rows_tier, &RowsTier::ALL),
         settings,
     };
@@ -4976,6 +4986,7 @@ fn report_settings(cli: &Cli, prepared: &[Prepared], compression: &[Json]) -> Js
         "cold_cache_bytes": COLD_CACHE_BYTES,
         "warmup_seconds": cli.warmup,
         "duration_seconds": cli.duration,
+        "load_concurrency": icetray_core::load_concurrency(),
         "batch_fan_out": cli.batch_fan_out,
         "ordered_rows_per_key": ORDERED_ROWS_PER_KEY,
         "long_run_rows": LONG_RUN_ROWS,
