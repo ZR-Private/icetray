@@ -117,8 +117,8 @@ const DEFAULT_GET_DEADLINE: Duration = Duration::from_secs(5);
 /// long before a caller's own patience runs out.
 const DEFAULT_MULTI_GET_DEADLINE: Duration = Duration::from_secs(15);
 
-/// Requests (`Get` and `MultiGet` together) in flight at once when the file
-/// says nothing: 1024. A request that finds every slot taken is refused at
+/// Requests (`Get`, `MultiGet`, `Scan`, and `MultiScan` together) in flight
+/// at once when the file says nothing: 1024. A request that finds every slot taken is refused at
 /// once rather than queued, so a wedged store cannot pile up requests until
 /// the process runs out of memory. A single-pod guess, to revisit with
 /// measurement (RFD 013).
@@ -1369,8 +1369,9 @@ pub struct ServerConfig {
     /// layer and reported as the client's.
     #[serde(with = "time::friendly_duration")]
     pub multi_get_deadline: Duration,
-    /// Requests, `Get` and `MultiGet` together, in flight at once; one more
-    /// is refused at once as `RESOURCE_EXHAUSTED`, never queued.
+    /// Requests, `Get`, `MultiGet`, `Scan`, and `MultiScan` together, in
+    /// flight at once; one more is refused at once as `RESOURCE_EXHAUSTED`,
+    /// never queued.
     pub max_in_flight: usize,
     /// Values one `MultiGet` may ask for: its keys times the columns it
     /// names, a key of a call that names none counting one (RFD 022); more
@@ -1378,8 +1379,8 @@ pub struct ServerConfig {
     pub max_multi_get_values: usize,
     /// GETs one `MultiGet`, `Scan`, or `MultiScan` holds in flight at once,
     /// across every task the batch runs on: each GET a lookup issues, a key
-    /// page under `bloom`, a value page, or a dictionary page, holds one
-    /// until it ends (RFD 013, RFD 022, RFD 025). Like `max_in_flight`, it
+    /// page under `bloom`, a value page, or a dictionary page, and each span
+    /// GET of a Scan, holds one until it ends (RFD 013, RFD 022, RFD 025). Like `max_in_flight`, it
     /// is set for the process: every table is built under it at start, so a
     /// reload that changes it is refused and a restart applies it (RFD
     /// 018).
@@ -1389,7 +1390,8 @@ pub struct ServerConfig {
     /// before any key is read (RFD 025).
     pub max_multi_scan_values: usize,
     /// How long a `Scan` may run before it is `DEADLINE_EXCEEDED`, and how
-    /// long each span GET of it may run (RFD 025).
+    /// long each GET of any Scan, span or key page, may run, in a
+    /// `MultiScan` too (RFD 025).
     #[serde(with = "time::friendly_duration")]
     pub scan_deadline: Duration,
     /// How long a `MultiScan` may run before it is `DEADLINE_EXCEEDED`,
@@ -1786,8 +1788,9 @@ pub struct TableConfig {
     pub order_column: Option<String>,
     /// The most rows one Scan of an ordered table, or one key of a
     /// `MultiScan`, returns, the largest limit either takes (RFD 025);
-    /// above zero, and set only on an ordered table. `None` there takes `DEFAULT_MAX_SCAN_ROWS`
-    /// (`TableConfig::scan_rows`). A change applies in place.
+    /// above zero, and set only on an ordered table. `None` there takes
+    /// `DEFAULT_MAX_SCAN_ROWS` (`TableConfig::scan_rows`). A change applies
+    /// in place.
     pub max_scan_rows: Option<u32>,
     /// Whether falling below `lookups` for a reason in the snapshot's
     /// layout is an error rather than a warning (RFD 020): a strict table

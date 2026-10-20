@@ -69,10 +69,10 @@ pub(crate) fn min_memory_bytes(shards: usize) -> u64 {
     approx::count(shards) * (VALUE_PAGE_BYTES + approx::count(ENTRY_OVERHEAD_BYTES))
 }
 
-/// `ConfigViolation::PageCacheTooSmall` for `cache`'s budget of `bytes` below `min_memory_bytes` of the shards a cache opened on
-/// the caller's runtime has; `open_with` calls it for each cache before it
-/// opens one, since the worker count is not known when the configuration is
-/// parsed.
+/// `ConfigViolation::PageCacheTooSmall` for `cache`'s budget of `bytes`
+/// below `min_memory_bytes` of the shards a cache opened on the caller's
+/// runtime has; `open_with` calls it for each cache before it opens one,
+/// since the worker count is not known when the configuration is parsed.
 pub(crate) fn check_capacity(
     cache: CacheName,
     bytes: u64,

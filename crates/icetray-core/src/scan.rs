@@ -275,8 +275,9 @@ pub(crate) fn check_bounds(
     Ok(())
 }
 
-/// `ScanRequestFault::TooManyValues` when `keys` keys at `limit` naming `columns` columns ask for more than `max` values, each row
-/// counting its order value and one value per column (RFD 025, Limits).
+/// `ScanRequestFault::TooManyValues` when `keys` keys at `limit` naming
+/// `columns` columns ask for more than `max` values, each row counting its
+/// order value and one value per column (RFD 025, Limits).
 pub(crate) fn check_multi_scan_values(
     keys: usize,
     limit: u32,

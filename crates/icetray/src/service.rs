@@ -491,21 +491,20 @@ async fn within<T>(
 /// the table does not serve, named twice (RFD 022), or read with a field
 /// list its format does not take (RFD 024), a malformed Scan or `MultiScan`
 /// request, and a call of the wrong kind for the table (RFD 025), is
-/// `INVALID_ARGUMENT`; a
-/// value a field list trims that is not the protobuf its column declares is
-/// `FAILED_PRECONDITION`, which a retry meets again (RFD 024), as is a Scan
-/// or `MultiScan` response above `server.max_scan_bytes` (RFD 025); a page
-/// fetch that ran past `server.get_deadline` is
-/// `DEADLINE_EXCEEDED`, the code the call's own deadline answers: a `Get`'s
-/// deadline and its fetch's pass moments apart, and the call answers one
-/// code whichever passes first; a read the caller can
-/// retry (no generation yet, an object-store, cache, or local-directory
-/// failure, a catalog call that failed, a catalog or load that did not
-/// answer in time, a load's key
-/// verification or a task of a `MultiGet` or `MultiScan` canceled as the
-/// runtime shut down) is
-/// `UNAVAILABLE`; every other failure is `INTERNAL`. The message is the
-/// error's `Display`.
+/// `INVALID_ARGUMENT`; a value a field list trims that is not the protobuf
+/// its column declares is `FAILED_PRECONDITION`, which a retry meets again
+/// (RFD 024), as is a Scan or `MultiScan` response above
+/// `server.max_scan_bytes` (RFD 025); a page fetch that ran past
+/// `server.get_deadline`, or a Scan's span GET past `server.scan_deadline`,
+/// is `DEADLINE_EXCEEDED`, the code the call's own deadline answers: a
+/// call's deadline and its fetch's pass moments apart, and the call answers
+/// one code whichever passes first; a read the caller can retry (no
+/// generation yet, an object-store, cache, or local-directory failure, a
+/// catalog call that failed, a catalog or load that did not answer in time,
+/// a load's key verification or a task of a `MultiGet` or `MultiScan`
+/// canceled as the runtime shut down) is `UNAVAILABLE`; every other
+/// failure, faulty table data among them, is `INTERNAL`. The message is
+/// the error's `Display`.
 pub fn status_from(error: &Error) -> Status {
     let message = error.to_string();
     match error {

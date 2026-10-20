@@ -32,9 +32,10 @@ pub const LATENCY_BUCKETS: [f64; 14] = [
 ];
 
 /// Histogram bucket bounds in seconds for `scan_seconds`: `LATENCY_BUCKETS`
-/// extended to 10 seconds. A cold Scan waits on its slowest span GET across
-/// every file that holds the key, after the key-page round under `bloom`
-/// (RFD 025, Cost), and `server.scan_deadline` is 5 seconds by default.
+/// extended to 10 seconds, past the default `server.scan_deadline`
+/// (`DEFAULT_SCAN_DEADLINE`). A cold Scan waits on its slowest span GET
+/// across every file that holds the key, after the key-page round under
+/// `bloom` (RFD 025, Cost).
 pub const SCAN_LATENCY_BUCKETS: [f64; 16] = [
     0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0,
     5.0, 10.0,
@@ -42,8 +43,8 @@ pub const SCAN_LATENCY_BUCKETS: [f64; 16] = [
 
 /// Histogram bucket bounds for `scan_rows`: 0 for a key with no rows inside
 /// the bounds, then a 1-2.5-5 progression through the default
-/// `max_scan_rows` of 1,000 and two bounds past it, for a table that raises
-/// it.
+/// `max_scan_rows` (`DEFAULT_MAX_SCAN_ROWS`) and two bounds past it, for a
+/// table that raises it.
 pub const SCAN_ROWS_BUCKETS: [f64; 14] = [
     0.0, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0,
 ];
@@ -56,10 +57,10 @@ pub const SCAN_FILES_BUCKETS: [f64; 11] =
     [0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 32.0, 64.0];
 
 /// Histogram bucket bounds in bytes for `scan_response_bytes`: fourfold from
-/// 1 KiB to 1 MiB, then doubling to 16 MiB through 4 MiB, the default
-/// `server.max_scan_bytes`, so a response at the bound and one just past
-/// it fall in different buckets, then fourfold to 256 MiB for the size of a
-/// refused response.
+/// 1 KiB to 1 MiB, then doubling to 16 MiB through the default
+/// `server.max_scan_bytes` (`DEFAULT_MAX_SCAN_BYTES`), so a response at the
+/// bound and one just past it fall in different buckets, then fourfold to
+/// 256 MiB for the size of a refused response.
 pub const SCAN_RESPONSE_BUCKETS: [f64; 12] = [
     1_024.0,
     4_096.0,
