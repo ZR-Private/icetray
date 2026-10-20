@@ -226,6 +226,16 @@ pub enum Precondition {
         /// Why it is not one.
         fault: RewriteTextFault,
     },
+    /// A reference table records no key count under the property the
+    /// recipe writes, so its rows cannot be derived.
+    #[error(
+        "{table} records no key count under {property}; regenerate it with dev/golden-tables.py --only reference",
+        property = crate::golden::REFERENCE_KEYS_PROPERTY
+    )]
+    ReferenceKeysUnrecorded {
+        /// The table.
+        table: String,
+    },
     /// The REST catalog is not named in the environment.
     #[error("{REST_URI_VAR} is not set")]
     RestUriUnset,

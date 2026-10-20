@@ -7,14 +7,20 @@
 //! locations, is read through the rewrite rules `ICETRAY_GOLDEN_REWRITE`
 //! holds.
 
+use std::collections::BTreeSet;
 use std::fmt::{self, Write as _};
 use std::ops::{Range, RangeInclusive};
+
+use bytes::Bytes;
+use iceberg::spec::TableMetadata;
 
 use icetray_core::config::{
     Config, RewriteRule, ServerConfig, SourceConfig, StorageConfig, TableConfig,
 };
 use icetray_core::key::HEX_DIGITS_PER_BYTE;
-use icetray_core::{Key, KeyType, OrderValue, Residency};
+use icetray_core::{
+    Generation, Key, KeyType, OrderValue, Residency, ScanRow, Scanned, Storage, next_bound,
+};
 use sha2::digest::OutputSizeUser;
 use sha2::digest::typenum::Unsigned as _;
 use sha2::{Digest as _, Sha256};
@@ -22,7 +28,7 @@ use sha2::{Digest as _, Sha256};
 use crate::error::{Precondition, Result, required_var};
 use crate::keys::{key_at, key_at_padded};
 use crate::layout::{KEY_COLUMN, VALUE_COLUMN};
-use crate::ordered::{ORDER_COLUMN, OrderKind};
+use crate::ordered::{ORDER_COLUMN, OrderKind, TestScan, scan_model};
 
 /// The environment variable naming the warehouse the recipe wrote into: an
 /// `s3a://` or `file://` location whose `db/` holds the tables.
@@ -175,6 +181,14 @@ const REFERENCE_BUCKETS: u32 = 64;
 /// The recipe's `REFERENCE_REPEATS`: a reference value concatenates this
 /// many distinct digests.
 const REFERENCE_REPEATS: usize = 2;
+
+/// The bytes of every reference value: `REFERENCE_REPEATS` hex digests.
+pub const REFERENCE_VALUE_BYTES: usize = REFERENCE_REPEATS * HEX_DIGEST_BYTES;
+
+/// The keys `reference_sample` takes from each tier of rows per key
+/// (`reference_tier_sample`), so the sample spans the skew whatever share
+/// of the keys each tier holds.
+pub const REFERENCE_TIER_SAMPLES: usize = 5;
 
 /// The recipe's `TIER_SCALE`: the hash of a key's index, modulo this, picks
 /// the key's tier, and the hash divided by it the count within the tier.
@@ -787,14 +801,152 @@ pub fn ordered_value(table: GoldenTable, id: u64, order: i64, version: u64) -> V
 pub fn reference_rows_of(id: u64) -> u64 {
     let hash = keyed_hash(id);
     let (tier, spread) = (hash % TIER_SCALE, hash / TIER_SCALE);
-    let rows = if tier < HEAVY_TIER {
-        HEAVY_ROWS
-    } else if tier < MEDIUM_TIER {
-        MEDIUM_ROWS
-    } else {
-        LIGHT_ROWS
-    };
+    let rows = RowsTier::of_tier(tier).rows();
     rows.start() + spread % (rows.end() - rows.start() + 1)
+}
+
+/// The tiers of rows per key a reference table's keys fall in, by the
+/// hash of the key's index (`reference_rows_of`). Display gives its name in
+/// lowercase.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RowsTier {
+    /// `HEAVY_ROWS`, the fewest keys.
+    Heavy,
+    /// `MEDIUM_ROWS`.
+    Medium,
+    /// `LIGHT_ROWS`, the most keys.
+    Light,
+}
+
+impl RowsTier {
+    /// Every tier, heaviest first.
+    pub const ALL: [Self; 3] = [Self::Heavy, Self::Medium, Self::Light];
+
+    /// The tier the recipe's `tier`, a hash modulo `TIER_SCALE`, picks.
+    fn of_tier(tier: u64) -> Self {
+        if tier < HEAVY_TIER {
+            Self::Heavy
+        } else if tier < MEDIUM_TIER {
+            Self::Medium
+        } else {
+            Self::Light
+        }
+    }
+
+    /// The row counts of a key in the tier.
+    pub fn rows(self) -> RangeInclusive<u64> {
+        match self {
+            Self::Heavy => HEAVY_ROWS,
+            Self::Medium => MEDIUM_ROWS,
+            Self::Light => LIGHT_ROWS,
+        }
+    }
+}
+
+impl fmt::Display for RowsTier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Heavy => "heavy",
+            Self::Medium => "medium",
+            Self::Light => "light",
+        })
+    }
+}
+
+/// The first `count` key indexes below `keys` whose rows fall in `tier`,
+/// ascending; fewer when the table holds fewer.
+pub fn reference_tier_sample(keys: u64, tier: RowsTier, count: usize) -> Vec<u64> {
+    (0..keys)
+        .filter(|&id| tier.rows().contains(&reference_rows_of(id)))
+        .take(count)
+        .collect()
+}
+
+/// The key indexes below `keys` whose Scans a reference table is checked
+/// on: the first `REFERENCE_TIER_SAMPLES` keys of each tier, the heaviest,
+/// the last key, the first key with no appended rows, with rows in some
+/// appends only, and with rows in every append, and `extra`.
+pub fn reference_sample(keys: u64, extra: &BTreeSet<u64>) -> BTreeSet<u64> {
+    let mut sample: BTreeSet<u64> = RowsTier::ALL
+        .into_iter()
+        .flat_map(|tier| reference_tier_sample(keys, tier, REFERENCE_TIER_SAMPLES))
+        .collect();
+    sample.extend(REFERENCE_HEAVIEST_IDS.iter().filter(|&&id| id < keys));
+    sample.insert(keys - 1);
+    let appended = |id: u64| -> Vec<bool> {
+        reference_writes(id)[1..]
+            .iter()
+            .map(|write| !write.is_empty())
+            .collect()
+    };
+    let shapes: [fn(&[bool]) -> bool; 3] = [
+        |batches| batches.iter().all(|&held| !held),
+        |batches| batches.iter().any(|&held| held) && batches.iter().any(|&held| !held),
+        |batches| batches.iter().all(|&held| held),
+    ];
+    for shape in shapes {
+        sample.extend((0..keys).find(|&id| shape(&appended(id))));
+    }
+    sample.extend(extra.iter().filter(|&&id| id < keys));
+    sample
+}
+
+/// The bounds of a reference Scan's window over a key holding `rows`,
+/// ascending, as raw order values: from its row a quarter in to past its
+/// row three quarters in, both included, `start` and `before`.
+pub fn reference_window(rows: &[OrderedRow]) -> (i64, i64) {
+    let at = |index: usize| rows[index].order;
+    (at(rows.len() / 4), at(rows.len() * 3 / 4) + 1)
+}
+
+/// What a Scan of key index `id` of `table` answers under `scan`, from the
+/// recipe's derivation of the key's live `rows` (`ordered_rows`), every
+/// value included, and the raw order value of the last row when rows
+/// remain past it.
+pub fn derived_scan(
+    table: GoldenTable,
+    id: u64,
+    rows: &[OrderedRow],
+    scan: &TestScan,
+) -> (Scanned, Option<i64>) {
+    let live = rows.iter().map(|row| (row.order, row.version));
+    let (answer, next) = scan_model(live, scan);
+    let scanned = Scanned {
+        rows: answer
+            .into_iter()
+            .map(|(order, version)| ScanRow {
+                order: ordered_order_value(table, id, order),
+                values: vec![Some(Bytes::from(ordered_value(table, id, order, version)))],
+            })
+            .collect(),
+        next: next.map(|last| next_bound(&ordered_order_value(table, id, last), scan.direction)),
+    };
+    (scanned, next)
+}
+
+/// The table metadata of the snapshot `generation` serves, read through
+/// `storage` and parsed as Iceberg's own reader parses it.
+pub async fn served_metadata(storage: &Storage, generation: &Generation) -> Result<TableMetadata> {
+    Ok(serde_json::from_slice(
+        &storage.read_all(&generation.metadata_location).await?,
+    )?)
+}
+
+/// The keys reference table `table` was written with, from the table
+/// property `REFERENCE_KEYS_PROPERTY` in `metadata`: `REFERENCE_KEYS`, or
+/// fewer under `--reference-keys`; `Precondition::ReferenceKeysUnrecorded`
+/// when the property is absent or not a count.
+pub fn reference_keys(metadata: &TableMetadata, table: GoldenTable) -> Result<u64> {
+    metadata
+        .properties()
+        .get(REFERENCE_KEYS_PROPERTY)
+        .and_then(|keys| keys.parse().ok())
+        .ok_or_else(|| {
+            Precondition::ReferenceKeysUnrecorded {
+                table: table.to_string(),
+            }
+            .into()
+        })
 }
 
 /// The rows of a reference table of `keys` keys, every key's
@@ -1354,6 +1506,113 @@ mod tests {
             ordered_order_value(GoldenTable::RefLargeFiles, PINNED_ID, order),
             OrderValue::Long(order)
         );
+    }
+
+    #[test]
+    fn test_reference_tier_sample_takes_the_first_keys_of_the_tier() {
+        for tier in RowsTier::ALL {
+            let sample = reference_tier_sample(REFERENCE_KEYS, tier, REFERENCE_TIER_SAMPLES);
+            assert_eq!(sample.len(), REFERENCE_TIER_SAMPLES, "{tier}");
+            assert!(sample.windows(2).all(|pair| pair[0] < pair[1]), "{tier}");
+            assert!(
+                sample
+                    .iter()
+                    .all(|&id| tier.rows().contains(&reference_rows_of(id))),
+                "{tier}"
+            );
+            let first = sample[0];
+            assert!(
+                (0..first).all(|id| !tier.rows().contains(&reference_rows_of(id))),
+                "{tier}: no earlier key is in the tier"
+            );
+        }
+        let one_key = 1;
+        assert_eq!(
+            reference_tier_sample(one_key, RowsTier::Heavy, REFERENCE_TIER_SAMPLES),
+            [0],
+            "the hash of 0 is 0, a heavy tier, and the table holds no other key"
+        );
+    }
+
+    #[test]
+    fn test_reference_sample_holds_each_tier_s_sample_and_the_heaviest() {
+        let sample = reference_sample(REFERENCE_KEYS, &BTreeSet::new());
+        for tier in RowsTier::ALL {
+            let tier_sample = reference_tier_sample(REFERENCE_KEYS, tier, REFERENCE_TIER_SAMPLES);
+            assert!(tier_sample.iter().all(|id| sample.contains(id)), "{tier}");
+        }
+        assert!(REFERENCE_HEAVIEST_IDS.iter().all(|id| sample.contains(id)));
+        assert!(sample.contains(&(REFERENCE_KEYS - 1)));
+        let heavy = sample
+            .iter()
+            .filter(|&&id| HEAVY_ROWS.contains(&reference_rows_of(id)))
+            .count();
+        assert_eq!((sample.len(), heavy), (19, 8));
+        let edge = BTreeSet::from([REFERENCE_KEYS / 2]);
+        let with_edge = reference_sample(REFERENCE_KEYS, &edge);
+        assert_eq!(with_edge, &sample | &edge, "the extra keys join the sample");
+    }
+
+    #[test]
+    fn test_reference_window_spans_the_middle_half_of_a_run() {
+        let id = REFERENCE_HEAVIEST_IDS[0];
+        let rows = ordered_rows(GoldenTable::RefCompacted, id);
+        let (start, before) = reference_window(&rows);
+        let inside = rows
+            .iter()
+            .filter(|row| (start..before).contains(&row.order))
+            .count();
+        assert_eq!(inside, rows.len() * 3 / 4 - rows.len() / 4 + 1);
+        let light = ordered_rows(GoldenTable::RefCompacted, PINNED_ID);
+        let (start, before) = reference_window(&light[..1]);
+        assert_eq!((start, before), (light[0].order, light[0].order + 1));
+    }
+
+    #[test]
+    fn test_derived_scan_returns_the_derived_rows_and_the_next_page_s_bound() {
+        let table = GoldenTable::RefString;
+        let rows = ordered_rows(table, PINNED_ID);
+        let whole = TestScan {
+            limit: u32::try_from(rows.len()).unwrap(),
+            ..TestScan::default()
+        };
+        let (scanned, last) = derived_scan(table, PINNED_ID, &rows, &whole);
+        assert_eq!(
+            (scanned.rows.len(), scanned.next, last),
+            (rows.len(), None, None)
+        );
+        let newest = &rows[rows.len() - 1];
+        assert_eq!(
+            scanned.rows[0],
+            ScanRow {
+                order: ordered_order_value(table, PINNED_ID, newest.order),
+                values: vec![Some(Bytes::from(ordered_value(
+                    table,
+                    PINNED_ID,
+                    newest.order,
+                    MOR_FIRST_VERSION
+                )))],
+            },
+            "newest first by default"
+        );
+        let one = TestScan {
+            limit: 1,
+            ..TestScan::default()
+        };
+        let (scanned, last) = derived_scan(table, PINNED_ID, &rows, &one);
+        assert_eq!(last, Some(newest.order));
+        assert_eq!(
+            scanned.next,
+            Some(next_bound(
+                &ordered_order_value(table, PINNED_ID, newest.order),
+                one.direction
+            ))
+        );
+        assert!(scanned.rows.iter().all(|row| {
+            row.values[0]
+                .as_ref()
+                .is_some_and(|value| value.len() == REFERENCE_VALUE_BYTES)
+        }));
     }
 
     #[test]

@@ -8,8 +8,6 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 
-use bytes::Bytes;
-
 use iceberg::spec::{
     DataContentType, DataFile, DataFileFormat, FormatVersion, Manifest, ManifestList, TableMetadata,
 };
@@ -18,8 +16,8 @@ use icetray_core::approx::count;
 use icetray_core::config::{Config, LocalConfig, ServerConfig, StorageConfig, ValueFormat};
 use icetray_core::{
     DEFAULT_MAX_SCAN_ROWS, Direction, Error, Finding, FindingCode, FindingLog, Generation, Key,
-    Level, LookupCost, OrderType, RefusalReason, Residency, Row, ScanBounds, ScanRow, Scanned,
-    Storage, Table, TableReport, diagnose, next_bound, open,
+    Level, LookupCost, OrderType, RefusalReason, Residency, Row, ScanBounds, Storage, Table,
+    TableReport, diagnose, open,
 };
 use icetray_testkit::golden::{
     self, CONTRACT_REPEATS, GoldenTable, HEX_DIGEST_BYTES, MERGE_KEY_IDS, MOR_DELETED_IDS,
@@ -29,7 +27,7 @@ use icetray_testkit::golden::{
 use icetray_testkit::keys::KEY_STEP;
 use icetray_testkit::layout::VALUE_COLUMN;
 use icetray_testkit::verify::{self, SeenPages};
-use icetray_testkit::{Result, TestScan, absent_key_from, scan_model};
+use icetray_testkit::{Result, TestScan, absent_key_from};
 
 /// Ids looked up on the two-million-row tables: the ends and the middle.
 const IDS_2M: [u64; 5] = [0, 1, 12_345, 999_999, 1_999_999];
@@ -596,12 +594,7 @@ fn assert_plan_names_the_update_s_copy(table: GoldenTable, full: &Generation) {
 /// The table metadata of the snapshot `golden` serves, as Iceberg's own
 /// reader parses it.
 async fn served_metadata(golden: &Golden) -> Result<TableMetadata> {
-    Ok(serde_json::from_slice(
-        &golden
-            .storage
-            .read_all(&golden.current().metadata_location)
-            .await?,
-    )?)
+    golden::served_metadata(&golden.storage, &golden.current()).await
 }
 
 /// The live delete entries of the snapshot `golden` serves, from its
@@ -877,37 +870,6 @@ fn ordered_scans(rows: &[OrderedRow], max: u32) -> Vec<TestScan> {
     scans
 }
 
-/// What a Scan of key index `id` answers under `scan`, from the recipe's
-/// derivation of the key's rows, and the raw order value of the last row
-/// when rows remain past it.
-fn derived_scan(
-    table: GoldenTable,
-    id: u64,
-    rows: &[OrderedRow],
-    scan: &TestScan,
-) -> (Scanned, Option<i64>) {
-    let live = rows.iter().map(|row| (row.order, row.version));
-    let (answer, next) = scan_model(live, scan);
-    let scanned = Scanned {
-        rows: answer
-            .into_iter()
-            .map(|(order, version)| ScanRow {
-                order: golden::ordered_order_value(table, id, order),
-                values: vec![Some(Bytes::from(golden::ordered_value(
-                    table, id, order, version,
-                )))],
-            })
-            .collect(),
-        next: next.map(|last| {
-            next_bound(
-                &golden::ordered_order_value(table, id, last),
-                scan.direction,
-            )
-        }),
-    };
-    (scanned, next)
-}
-
 /// Every sampled key of `table`, and the key indexes in `extra`, answers
 /// every Scan of `ordered_scans` in every tier as the derivation says, and a
 /// key the table lacks answers nothing.
@@ -929,7 +891,7 @@ async fn assert_ordered_scans_match_the_derivation(
             let key = golden::ordered_key(table, id);
             let rows = golden::ordered_rows(table, id);
             for scan in ordered_scans(&rows, max) {
-                let (want, _) = derived_scan(table, id, &rows, &scan);
+                let (want, _) = golden::derived_scan(table, id, &rows, &scan);
                 let got = served
                     .table
                     .scan(
@@ -1350,60 +1312,10 @@ async fn test_golden_ordered_merge_records_the_deletes_of_its_format_version() -
     Ok(())
 }
 
-/// The keys a reference table was written with, from the table property
-/// the recipe records: `golden::REFERENCE_KEYS`, or fewer under
-/// `--reference-keys`.
-async fn reference_keys(golden: &Golden) -> Result<u64> {
-    let metadata = served_metadata(golden).await?;
-    let keys = metadata
-        .properties()
-        .get(golden::REFERENCE_KEYS_PROPERTY)
-        .unwrap_or_else(|| {
-            panic!(
-                "dev/golden-tables.py records {} on every reference table; regenerate it",
-                golden::REFERENCE_KEYS_PROPERTY
-            )
-        });
-    Ok(keys
-        .parse()
-        .expect("the recipe records the key count in decimal digits"))
-}
-
-/// The keys `reference_sample` takes from each tier of rows per key, so
-/// the sample spans the skew whatever share of the keys each tier holds.
-const REFERENCE_TIER_SAMPLES: usize = 5;
-
-/// The key indexes below `keys` whose Scans a reference table is checked
-/// on: the first `REFERENCE_TIER_SAMPLES` keys of each tier, the heaviest,
-/// the last key, the first key with no appended rows, with rows in some
-/// appends only, and with rows in every append, and `extra`.
-fn reference_sample(keys: u64, extra: &BTreeSet<u64>) -> BTreeSet<u64> {
-    let mut sample = BTreeSet::new();
-    for tier in [golden::HEAVY_ROWS, golden::MEDIUM_ROWS, golden::LIGHT_ROWS] {
-        sample.extend(
-            (0..keys)
-                .filter(|&id| tier.contains(&golden::reference_rows_of(id)))
-                .take(REFERENCE_TIER_SAMPLES),
-        );
-    }
-    sample.extend(REFERENCE_HEAVIEST_IDS.iter().filter(|&&id| id < keys));
-    sample.insert(keys - 1);
-    let appended = |id: u64| -> Vec<bool> {
-        golden::reference_writes(id)[1..]
-            .iter()
-            .map(|write| !write.is_empty())
-            .collect()
-    };
-    let shapes: [fn(&[bool]) -> bool; 3] = [
-        |batches| batches.iter().all(|&held| !held),
-        |batches| batches.iter().any(|&held| held) && batches.iter().any(|&held| !held),
-        |batches| batches.iter().all(|&held| held),
-    ];
-    for shape in shapes {
-        sample.extend((0..keys).find(|&id| shape(&appended(id))));
-    }
-    sample.extend(extra.iter().filter(|&&id| id < keys));
-    sample
+/// The keys reference table `table` was written with, from the table
+/// property the recipe records (`golden::reference_keys`).
+async fn reference_keys(golden: &Golden, table: GoldenTable) -> Result<u64> {
+    golden::reference_keys(&served_metadata(golden).await?, table)
 }
 
 /// The limit of a reference Scan that pages a long run: prime, so pages end
@@ -1415,12 +1327,8 @@ const REFERENCE_PAGE_LIMIT: u32 = 251;
 /// `REFERENCE_PAGE_LIMIT`: the whole run, a window over its middle half,
 /// everything from its middle row, and everything before it.
 fn reference_scans(rows: &[OrderedRow], max: u32) -> Vec<TestScan> {
-    let orders: Vec<i64> = rows.iter().map(|row| row.order).collect();
-    let (quarter, middle, three_quarters) = (
-        orders[orders.len() / 4],
-        orders[orders.len() / 2],
-        orders[orders.len() * 3 / 4],
-    );
+    let (quarter, past_three_quarters) = golden::reference_window(rows);
+    let middle = rows[rows.len() / 2].order;
     let mut scans = Vec::new();
     for direction in [Direction::NewestFirst, Direction::OldestFirst] {
         for limit in [max, REFERENCE_PAGE_LIMIT] {
@@ -1432,7 +1340,7 @@ fn reference_scans(rows: &[OrderedRow], max: u32) -> Vec<TestScan> {
             };
             scans.extend([
                 scan(None, None),
-                scan(Some(quarter), Some(three_quarters + 1)),
+                scan(Some(quarter), Some(past_three_quarters)),
                 scan(Some(middle), None),
                 scan(None, Some(middle)),
             ]);
@@ -1460,7 +1368,7 @@ async fn page_through(
     let mut pages = 0;
     loop {
         let got = served.table.scan(&key, &columns, &bounds).await?.scanned;
-        let (want, last) = derived_scan(table, id, rows, &scan);
+        let (want, last) = golden::derived_scan(table, id, rows, &scan);
         assert_eq!(got, want, "{table} {key} {first:?} page {pages}");
         pages += 1;
         read.extend(got.rows);
@@ -1477,7 +1385,7 @@ async fn page_through(
         limit: u32::MAX,
         ..first
     };
-    let (want, _) = derived_scan(table, id, rows, &whole);
+    let (want, _) = golden::derived_scan(table, id, rows, &whole);
     assert_eq!(
         read, want.rows,
         "{table} {key} {first:?}: the pages tile the window"
@@ -1547,7 +1455,8 @@ async fn assert_multi_scan_matches_scans(
                 compared += count(result.rows.len());
             }
             for (&id, result) in ids.iter().zip(&multi.results) {
-                let (want, _) = derived_scan(table, id, &golden::ordered_rows(table, id), &scan);
+                let (want, _) =
+                    golden::derived_scan(table, id, &golden::ordered_rows(table, id), &scan);
                 assert_eq!(result, &want, "{table} {id} {scan:?}");
             }
             let absent = &multi.results[ids.len()];
@@ -1566,13 +1475,13 @@ async fn assert_reference_serves(table: GoldenTable) -> Result<()> {
     let (mut pages, mut multi_rows) = (0_u64, 0_u64);
     for residency in Residency::ALL {
         let served = open_in(table, residency, scratch.path()).await?;
-        let keys = reference_keys(&served).await?;
+        let keys = reference_keys(&served, table).await?;
         let max = served
             .table
             .config()
             .scan_rows()
             .expect("an ordered table has a max_scan_rows");
-        let sample = reference_sample(keys, &shared_edge_ids(&served));
+        let sample = golden::reference_sample(keys, &shared_edge_ids(&served));
         for &id in &sample {
             let rows = golden::ordered_rows(table, id);
             for scan in reference_scans(&rows, max) {
@@ -1705,7 +1614,7 @@ async fn test_golden_reference_layouts_earn_their_level_and_findings() -> Result
     for layout in REFERENCE_LAYOUTS {
         let table = layout.table;
         let golden = open_golden(table, false).await?;
-        let keys = reference_keys(&golden).await?;
+        let keys = reference_keys(&golden, table).await?;
         let report = golden.report();
         assert_eq!(report.summary.level, layout.level, "{table}");
         assert_eq!(codes_of(&report), layout.capping, "{table}");
