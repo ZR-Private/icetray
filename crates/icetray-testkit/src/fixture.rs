@@ -53,7 +53,7 @@ use icetray_core::config::{Residency, SourceConfig, TableConfig, ValueColumnConf
 use icetray_core::contract::KEY_BYTES_ADVICE;
 use icetray_core::key::UUID_BYTES;
 use icetray_core::time::millis_after;
-use icetray_core::{ColumnRead, Key, KeyType, Row, ScanRow, Scanned};
+use icetray_core::{ColumnRead, Key, KeyType, Row, Scanned};
 use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
 use parquet::file::properties::WriterProperties;
 use roaring::RoaringTreemap;
@@ -69,7 +69,7 @@ use crate::layout::{KEY_COLUMN, Layout, VALUE_COLUMN};
 use crate::merge_oracle::{MergeOracle, RowCopy};
 use crate::ordered::{
     LiveRows, ORDER_COLUMN, ORDER_FIELD_ID, Ordered, RowId, ScanRows, TestScan, order_value,
-    row_value, scan_model,
+    row_value, scan_model, scanned_of,
 };
 use crate::protobuf;
 use crate::s3::S3Fixture;
@@ -835,30 +835,28 @@ impl Fixture {
         scan_model(rows, scan)
     }
 
-    /// `expected_scan` as the core's answer: each row's order value in the
-    /// fixture's order kind, and its values as bytes.
+    /// `expected_scan` as the core's answer (`scanned_of`): each row's order
+    /// value in the fixture's order kind, and its values as bytes.
     ///
     /// Panics as `expected_scan` does.
     pub fn expected_scanned(&self, key: &Key, columns: &[&str], scan: &TestScan) -> Scanned {
-        let (rows, next) = self.expected_scan(key, columns, scan);
+        let answer = self.expected_scan(key, columns, scan);
         let kind = self
             .spec
             .ordered
             .expect("expected_scan answered, so the fixture has an order column")
             .kind;
-        Scanned {
-            rows: rows
-                .into_iter()
-                .map(|(order, values)| ScanRow {
-                    order: order_value(kind, order),
-                    values: values
-                        .into_iter()
-                        .map(|value| value.map(Bytes::from))
-                        .collect(),
-                })
-                .collect(),
-            next: next.and_then(|last| scan.next_after(kind, last)),
-        }
+        scanned_of(
+            answer,
+            scan,
+            |order| order_value(kind, order),
+            |_, values| {
+                values
+                    .into_iter()
+                    .map(|value| value.map(Bytes::from))
+                    .collect()
+            },
+        )
     }
 
     /// Every key written, ascending by id.

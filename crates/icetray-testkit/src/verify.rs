@@ -1,8 +1,9 @@
 //! Assertions shared by the acceptance tests (RFD 014): one table served
 //! over its own storage and cache, the cost oracle on `Generation::plan`,
 //! the hit and miss checks that compare a lookup's answer with the
-//! fixture's derivation and its GETs with the oracle's count, and the
-//! reader of one series out of a metrics scrape.
+//! fixture's derivation and its GETs with the oracle's count, the paging
+//! of a key's Scans against a model, the reading of a `duplicate_rows`
+//! refusal, and the reader of one series out of a metrics scrape.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -15,14 +16,16 @@ use icetray_core::ColumnRead;
 use icetray_core::approx::count;
 use icetray_core::config::{HedgeConfig, LocalConfig, ServerConfig, StorageConfig, TableConfig};
 use icetray_core::{
-    CallsInFlight, FindingLog, Generation, Key, LocalDir, PageCache, Residency, Row, Storage,
-    Table, TableHandles, TableSource,
+    CallsInFlight, Error, FindingLog, Generation, Key, LocalDir, OrderValue, PageCache,
+    RefusalReason, Residency, Row, ScanBounds, ScanRow, Scanned, Storage, Table, TableHandles,
+    TableSource,
 };
 
 use crate::error::{Precondition, Result};
 use crate::fixture::Fixture;
 use crate::keys::far_key;
 use crate::layout::VALUE_COLUMN;
+use crate::ordered::{TestScan, follow};
 
 /// The page cache budget of a served table: large enough that nothing a
 /// test touches is evicted, so a repeat batch is served from memory and a
@@ -589,6 +592,58 @@ pub async fn verify_hit_cost(served: Served, fixture: &Fixture, ids: &[u64]) -> 
     let warm = verify_hits(&served, fixture, ids).await?;
     assert_eq!(warm, 0, "repeat hits are served from the page cache");
     Ok(served)
+}
+
+/// Pages through the Scans of `key` in `table` reading `columns` from
+/// `first`, the model's request and the request as the table takes it,
+/// each page from the last one's `next` (`follow`) and the model's request
+/// after its last row (`TestScan::after_page`), asserting each page is
+/// `model`'s answer to its request, labelled `case`; the rows the pages
+/// returned, in order, and how many pages there were.
+pub async fn page_scans(
+    table: &Table,
+    key: &Key,
+    columns: &[ColumnRead<'_>],
+    first: (TestScan, ScanBounds),
+    model: impl Fn(&TestScan) -> (Scanned, Option<i64>),
+    case: &str,
+) -> Result<(Vec<ScanRow>, usize)> {
+    let (mut scan, mut bounds) = first;
+    let mut read = Vec::new();
+    let mut pages = 0;
+    loop {
+        let got = table.scan(key, columns, &bounds).await?.scanned;
+        let (want, last) = model(&scan);
+        assert_eq!(got, want, "{case}: page {pages} under {scan:?}");
+        pages += 1;
+        read.extend(got.rows);
+        let (Some(next), Some(last)) = (got.next, last) else {
+            return Ok((read, pages));
+        };
+        scan = scan.after_page(last);
+        follow(&mut bounds, next);
+    }
+}
+
+/// The file, key, and order value a `duplicate_rows` refusal names (RFD
+/// 025, Uniqueness).
+///
+/// Panics on any other reason.
+pub fn duplicate_rows(reason: &RefusalReason) -> (&str, &Key, &OrderValue) {
+    let RefusalReason::DuplicateRows { path, key, order } = reason else {
+        panic!("expected duplicate_rows, got {reason:?}");
+    };
+    (path, key, order)
+}
+
+/// `duplicate_rows` of the reason `error` refuses the table for.
+///
+/// Panics on any other error.
+pub fn refused_duplicate_rows(error: &Error) -> (&str, &Key, &OrderValue) {
+    let Error::Refused { reason, .. } = error else {
+        panic!("expected a refusal, got {error:?}");
+    };
+    duplicate_rows(reason)
 }
 
 /// The absent key near every id and the far key are `Absent` and the GET

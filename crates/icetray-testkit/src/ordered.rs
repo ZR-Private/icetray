@@ -7,6 +7,7 @@
 //! it the obvious way; it shares nothing with the server's merge.
 
 use std::collections::BTreeMap;
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 
 use arrow::array::{
@@ -14,8 +15,11 @@ use arrow::array::{
     TimestampMicrosecondArray, TimestampNanosecondArray,
 };
 use arrow::buffer::Buffer;
+use bytes::Bytes;
 use iceberg::spec::PrimitiveType;
-use icetray_core::{DEFAULT_MAX_SCAN_ROWS, Direction, Key, OrderValue, ScanBounds, next_bound};
+use icetray_core::{
+    DEFAULT_MAX_SCAN_ROWS, Direction, Key, OrderValue, ScanBounds, ScanRow, Scanned, next_bound,
+};
 
 use crate::error::{Result, SpecFault};
 use crate::keys::{FIRST_VERSION, ValueKind, value_of_version};
@@ -43,6 +47,11 @@ const ORDER_LONG_BYTES: usize = size_of::<u64>();
 /// The zone a timestamp-with-zone column's values are in: UTC, as the
 /// library's schema conversion gives it.
 const UTC: &str = "+00:00";
+
+/// One minute in a microsecond timestamp's raw order values. A literal so
+/// a constant `Ordered` can take it, `jiff`'s `as_micros` being `i128`; a
+/// unit test checks it against `jiff::SignedDuration`.
+pub const MINUTE_MICROS: i64 = 60_000_000;
 
 /// The types the order column takes (RFD 025, Order values).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -263,15 +272,32 @@ impl PartialEq for RowsPerKey {
 impl Eq for RowsPerKey {}
 
 impl Ordered {
+    /// `rows` rows for every id, of `kind`, from `start`, `step` apart.
+    pub const fn each(kind: OrderKind, rows: u64, start: i64, step: i64) -> Self {
+        Self {
+            kind,
+            rows_per_key: RowsPerKey::Each(rows),
+            start,
+            step,
+        }
+    }
+
+    /// The raw order value of a key's row at `index`, `start + step *
+    /// index`, whether or not a key has that many rows; `None` past the
+    /// range of a long.
+    pub fn order_at(&self, index: u64) -> Option<i64> {
+        i64::try_from(index)
+            .ok()
+            .and_then(|index| self.step.checked_mul(index))
+            .and_then(|offset| self.start.checked_add(offset))
+    }
+
     /// The raw order values of `id`'s rows, in the order they are written;
     /// one past the largest long is `SpecFault::OrderOverflow`.
     pub fn orders_of(&self, id: u64) -> Result<Vec<i64>> {
         (0..self.rows_per_key.of(id))
             .map(|index| {
-                i64::try_from(index)
-                    .ok()
-                    .and_then(|index| self.step.checked_mul(index))
-                    .and_then(|offset| self.start.checked_add(offset))
+                self.order_at(index)
                     .ok_or_else(|| SpecFault::OrderOverflow { id }.into())
             })
             .collect()
@@ -451,6 +477,50 @@ pub fn scan_model<T>(
     (inside, last)
 }
 
+/// What a run's length is divided by to find the rows `middle_half`
+/// leaves out at each end: a quarter.
+const QUARTERS: usize = 4;
+
+/// The positions of the middle half of a run of `len` rows, ascending: from
+/// its row a quarter in to its row three quarters in, both included. A
+/// window over a run's middle half is the same rows whichever table it is
+/// read on.
+pub fn middle_half(len: usize) -> RangeInclusive<usize> {
+    len / QUARTERS..=len * (QUARTERS - 1) / QUARTERS
+}
+
+/// Sets `bounds` to read the page after one whose `next` is `next` (RFD
+/// 025, Paging): newest first `before` it, oldest first from it, the other
+/// bound, the direction, and the limit kept, as a caller pages a run.
+pub fn follow(bounds: &mut ScanBounds, next: OrderValue) {
+    match bounds.direction {
+        Direction::NewestFirst => bounds.before = Some(next),
+        Direction::OldestFirst => bounds.start = Some(next),
+    }
+}
+
+/// A `scan_model` answer to `scan` as the core's `Scanned`: each row's
+/// order value `encode` of its raw one and its values `values` of its raw
+/// order value and payload, and `next` the bound after the last row
+/// (`next_bound`), present when live rows remain past it.
+pub fn scanned_of<T>(
+    (rows, last): (Vec<(i64, T)>, Option<i64>),
+    scan: &TestScan,
+    encode: impl Fn(i64) -> OrderValue,
+    values: impl Fn(i64, T) -> Vec<Option<Bytes>>,
+) -> Scanned {
+    Scanned {
+        rows: rows
+            .into_iter()
+            .map(|(order, payload)| ScanRow {
+                order: encode(order),
+                values: values(order, payload),
+            })
+            .collect(),
+        next: last.and_then(|last| next_bound(&encode(last), scan.direction)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -511,6 +581,14 @@ mod tests {
     /// The orders of the rows a model answer holds.
     fn orders_of(answer: &(Vec<(i64, i64)>, Option<i64>)) -> Vec<i64> {
         answer.0.iter().map(|(order, _)| *order).collect()
+    }
+
+    #[test]
+    fn test_minute_micros_is_jiff_s_minute() {
+        assert_eq!(
+            i128::from(MINUTE_MICROS),
+            jiff::SignedDuration::from_mins(1).as_micros()
+        );
     }
 
     #[test]

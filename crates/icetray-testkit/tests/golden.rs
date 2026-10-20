@@ -491,7 +491,7 @@ fn mor_edge_ids(table: GoldenTable) -> [u64; 6] {
         MOR_DELETED_IDS.end - 1,
         MOR_UPDATED_IDS.start,
         MOR_UPDATED_IDS.end - 1,
-        table.rows() - 1,
+        table.spec().rows - 1,
     ]
 }
 
@@ -527,7 +527,7 @@ async fn assert_merge_on_read_serves(table: GoldenTable) -> Result<()> {
         assert_eq!(generation.residency, *residency);
         let stats = served.storage.stats();
         let mut seen = SeenPages::default();
-        let lookups = (0..table.rows())
+        let lookups = (0..table.spec().rows)
             .map(|id| (golden::long_key(id), golden::merge_on_read_value(id)))
             .chain(absent.iter().map(|key| (key.clone(), None)));
         for (key, expected) in lookups {
@@ -677,7 +677,7 @@ async fn test_golden_merge_on_read_updates_overlap_permissive() -> Result<()> {
         let generation = golden.current();
         assert_eq!(
             generation.overlapping_buckets().len(),
-            usize::try_from(table.buckets()).unwrap(),
+            usize::try_from(table.spec().buckets).unwrap(),
             "{table}: every bucket gains an overlapping file"
         );
         let report = golden.report();
@@ -788,7 +788,7 @@ async fn test_golden_merge_on_read_deletes_summary_matches_the_manifests() -> Re
             assert_eq!(summary.deletes.rows, listed_rows, "{table}");
             assert_eq!(summary.deletes.files, count(deletes.len()), "{table}");
             let updated_rows = MOR_UPDATED_IDS.end - MOR_UPDATED_IDS.start;
-            assert_eq!(summary.records, table.rows() + updated_rows, "{table}");
+            assert_eq!(summary.records, table.spec().rows + updated_rows, "{table}");
         } else {
             let dangling = format == DataFileFormat::Parquet;
             assert_eq!(!deletes.is_empty(), dangling, "{table}: {deletes:?}");
@@ -798,7 +798,7 @@ async fn test_golden_merge_on_read_deletes_summary_matches_the_manifests() -> Re
             assert_eq!(summary.deletes.rows, 0, "{table}");
             assert_eq!(summary.deletes.files, 0, "{table}");
             let deleted_rows = MOR_DELETED_IDS.end - MOR_DELETED_IDS.start;
-            assert_eq!(summary.records, table.rows() - deleted_rows, "{table}");
+            assert_eq!(summary.records, table.spec().rows - deleted_rows, "{table}");
         }
     }
     Ok(())
@@ -1011,31 +1011,39 @@ fn longest_derived_run(table: GoldenTable) -> u64 {
         .expect("an ordered table has keys")
 }
 
+/// The order type the doctor reads `table`'s order column as: the type of
+/// the recipe's order column.
+fn recipe_order_type(table: GoldenTable) -> Option<OrderType> {
+    let recipe = table.spec().order.expect("an ordered table has a recipe");
+    OrderType::from_iceberg(&recipe.kind.primitive())
+}
+
+/// The GETs a cold Scan of a key in one file of a golden ordered table
+/// served Full costs, as `icetray_table_gets_per_scan` predicts it: the key
+/// pages resident, one span of order pages and one of the one value
+/// column's pages.
+const FULL_SCAN_GETS: u64 = 2;
+
 /// What the doctor reports of every ordered table: it is read as an ordered
 /// table of the order column's type, and its longest run is a run the
-/// recipe wrote.
+/// recipe wrote, whole in one file once compacted, and where an append or a
+/// MERGE wrote a second file over the key's range, the first fill's
+/// `ORDERED_ROWS_PER_KEY`, the MERGE's deleted rows still counted.
 #[tokio::test]
 #[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
 async fn test_golden_ordered_doctor_reads_the_order_column_and_runs() -> Result<()> {
-    for table in GoldenTable::ORDERED {
+    for table in GoldenTable::ordered() {
         let golden = open_golden(table, false).await?;
         let summary = golden.report().summary;
         let order = summary
             .order
             .expect("an ordered table reports its order column");
-        let expected_type = if table == GoldenTable::OrderedString100k {
-            OrderType::String
-        } else {
-            OrderType::Long
-        };
-        assert_eq!(order.order_type, expected_type, "{table}");
+        assert_eq!(Some(order.order_type), recipe_order_type(table), "{table}");
         assert_eq!(order.max_scan_rows, DEFAULT_MAX_SCAN_ROWS, "{table}");
-        assert!(order.longest_run > 0, "{table}");
-        let derived = longest_derived_run(table);
         if ORDERED_COMPACTED.contains(&table) {
-            assert_eq!(order.longest_run, derived, "{table}");
+            assert_eq!(order.longest_run, longest_derived_run(table), "{table}");
         } else {
-            assert!(order.longest_run <= derived, "{table}");
+            assert_eq!(order.longest_run, ORDERED_ROWS_PER_KEY, "{table}");
         }
         let advice = advice_codes(&golden);
         assert!(
@@ -1071,17 +1079,18 @@ async fn test_golden_ordered_compacted_is_optimal_with_one_file_per_bucket() -> 
         assert_eq!(report.summary.max_files_per_bucket, 1, "{table}");
         assert_eq!(
             report.summary.buckets_with_files,
-            usize::try_from(table.buckets()).unwrap(),
+            usize::try_from(table.spec().buckets).unwrap(),
             "{table}"
         );
         assert!(golden.current().overlapping_buckets().is_empty(), "{table}");
         assert_eq!(report.summary.lookup_cost, None, "{table}");
         let order = report.summary.order.as_ref().expect("an ordered table");
         assert_eq!(order.files_probed, 1, "{table}");
+        assert_eq!(order.gets_per_scan, FULL_SCAN_GETS, "{table}");
         assert_eq!(
             Some(order.gets_per_scan),
             golden.current().gets_per_scan,
-            "{table}: the doctor and the gauge predict one Scan"
+            "{table}: the doctor shows the gauge's value"
         );
         let advice = advice_codes(&golden);
         assert!(!advice.contains(&FindingCode::DeletesPending), "{table}");
@@ -1104,7 +1113,7 @@ async fn test_golden_ordered_appends_and_merges_are_permissive_for_overlapping_f
     for table in ORDERED_OVERLAPPING {
         let golden = open_golden(table, false).await?;
         let report = golden.report();
-        let buckets = usize::try_from(table.buckets()).unwrap();
+        let buckets = usize::try_from(table.spec().buckets).unwrap();
         assert_eq!(report.summary.level, Level::Permissive, "{table}");
         assert_eq!(
             codes_of(&report),
@@ -1133,7 +1142,11 @@ async fn test_golden_ordered_appends_and_merges_are_permissive_for_overlapping_f
         if table == GoldenTable::OrderedAppended100k {
             assert!(!advice.contains(&FindingCode::DeletesPending), "{table}");
             let appended = ORDERED_KEYS * golden::APPEND_ROWS_PER_KEY;
-            assert_eq!(report.summary.records, table.rows() + appended, "{table}");
+            assert_eq!(
+                report.summary.records,
+                table.spec().rows + appended,
+                "{table}"
+            );
             assert_eq!(report.summary.deletes.rows, 0, "{table}");
         } else {
             assert!(
@@ -1144,7 +1157,7 @@ async fn test_golden_ordered_appends_and_merges_are_permissive_for_overlapping_f
             assert_eq!(report.summary.deletes.files, count(buckets), "{table}");
             assert_eq!(
                 report.summary.records,
-                table.rows() + inserted_rows + matched_rows,
+                table.spec().rows + inserted_rows + matched_rows,
                 "{table}"
             );
         }
@@ -1164,7 +1177,7 @@ async fn test_golden_ordered_merge_compaction_applies_the_deletes() -> Result<()
     let inserted_rows = merged_keys * (ORDERED_ROWS_PER_KEY / golden::MERGE_INSERT_EVERY);
     assert_eq!(summary.deletes.rows, 0);
     assert_eq!(summary.deletes.files, 0);
-    assert_eq!(summary.records, table.rows() + inserted_rows);
+    assert_eq!(summary.records, table.spec().rows + inserted_rows);
     Ok(())
 }
 
@@ -1191,7 +1204,7 @@ async fn test_golden_ordered_overlap_is_permissive_for_overlapping_files() -> Re
     assert!(!generation.overlapping_buckets().is_empty());
     assert_eq!(
         report.summary.records,
-        table.rows(),
+        table.spec().rows,
         "no key is repeated across files with the same order value"
     );
     let deepest = generation
@@ -1289,7 +1302,7 @@ async fn test_golden_ordered_merge_records_the_deletes_of_its_format_version() -
         let deletes = listed_deletes(&golden).await?;
         assert_eq!(
             deletes.len(),
-            usize::try_from(table.buckets()).unwrap(),
+            usize::try_from(table.spec().buckets).unwrap(),
             "{table}"
         );
         for delete in &deletes {
@@ -1362,25 +1375,16 @@ async fn page_through(
 ) -> Result<u64> {
     let key = golden::ordered_key(table, id);
     let columns = [ColumnRead::whole(VALUE_COLUMN)];
-    let mut scan = first;
-    let mut bounds = first.bounds_by(|order| golden::ordered_order_value(table, id, order));
-    let mut read = Vec::new();
-    let mut pages = 0;
-    loop {
-        let got = served.table.scan(&key, &columns, &bounds).await?.scanned;
-        let (want, last) = golden::derived_scan(table, id, rows, &scan);
-        assert_eq!(got, want, "{table} {key} {first:?} page {pages}");
-        pages += 1;
-        read.extend(got.rows);
-        let (Some(next), Some(last)) = (got.next, last) else {
-            break;
-        };
-        scan = scan.after_page(last);
-        match scan.direction {
-            Direction::NewestFirst => bounds.before = Some(next),
-            Direction::OldestFirst => bounds.start = Some(next),
-        }
-    }
+    let bounds = first.bounds_by(|order| golden::ordered_order_value(table, id, order));
+    let (read, pages) = verify::page_scans(
+        &served.table,
+        &key,
+        &columns,
+        (first, bounds),
+        |scan| golden::derived_scan(table, id, rows, scan),
+        &format!("{table} {key} {first:?}"),
+    )
+    .await?;
     let whole = TestScan {
         limit: u32::MAX,
         ..first
@@ -1390,15 +1394,15 @@ async fn page_through(
         read, want.rows,
         "{table} {key} {first:?}: the pages tile the window"
     );
-    Ok(pages)
+    Ok(count(pages))
 }
 
 /// The keys of the `MultiScan`s `assert_multi_scan_matches_scans` sends, the
 /// absent key and a repeated one included, and their limit:
 /// `server.max_multi_scan_values` holds their keys times the limit times
 /// one more than the one column.
-const REFERENCE_MULTI_KEYS: usize = 16;
-const REFERENCE_MULTI_LIMIT: u32 = 100;
+const GOLDEN_MULTI_KEYS: usize = 16;
+const GOLDEN_MULTI_LIMIT: u32 = 100;
 
 /// The row indexes whose instants bound the windowed `MultiScan`s, from the
 /// heaviest sampled key: past the first rows of most keys, and before
@@ -1414,11 +1418,7 @@ async fn assert_multi_scan_matches_scans(
     table: GoldenTable,
     sample: &BTreeSet<u64>,
 ) -> Result<u64> {
-    let ids: Vec<u64> = sample
-        .iter()
-        .copied()
-        .take(REFERENCE_MULTI_KEYS - 2)
-        .collect();
+    let ids: Vec<u64> = sample.iter().copied().take(GOLDEN_MULTI_KEYS - 2).collect();
     let mut keys: Vec<Key> = ids
         .iter()
         .map(|&id| golden::ordered_key(table, id))
@@ -1440,7 +1440,7 @@ async fn assert_multi_scan_matches_scans(
         for (start, before) in [(None, None), window] {
             let scan = TestScan {
                 direction,
-                limit: REFERENCE_MULTI_LIMIT,
+                limit: GOLDEN_MULTI_LIMIT,
                 start,
                 before,
             };
@@ -1628,9 +1628,9 @@ async fn test_golden_reference_layouts_earn_their_level_and_findings() -> Result
         let records = golden::reference_rows(keys);
         assert_eq!(report.summary.records, records, "{table}");
         if full {
-            assert_eq!(records, table.rows(), "{table}");
+            assert_eq!(records, table.spec().rows, "{table}");
         }
-        let buckets = usize::try_from(table.buckets()).unwrap();
+        let buckets = usize::try_from(table.spec().buckets).unwrap();
         let files_per_bucket = if layout.compacted {
             1
         } else {
@@ -1657,22 +1657,18 @@ async fn test_golden_reference_layouts_earn_their_level_and_findings() -> Result
             );
         }
         let order = report.summary.order.as_ref().expect("an ordered table");
-        let expected_type = if table == GoldenTable::RefString {
-            OrderType::String
-        } else {
-            OrderType::Long
-        };
-        assert_eq!(order.order_type, expected_type, "{table}");
+        assert_eq!(Some(order.order_type), recipe_order_type(table), "{table}");
         assert_eq!(order.files_probed, files_per_bucket, "{table}");
         assert_eq!(
             order.longest_run,
             longest_reference_run(keys, layout.compacted),
             "{table}"
         );
+        assert_eq!(order.gets_per_scan, FULL_SCAN_GETS, "{table}");
         assert_eq!(
             Some(order.gets_per_scan),
             golden.current().gets_per_scan,
-            "{table}: the doctor and the gauge predict one Scan"
+            "{table}: the doctor shows the gauge's value"
         );
         assert_eq!(report.summary.deletes.rows, 0, "{table}");
     }

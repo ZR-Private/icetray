@@ -44,8 +44,8 @@ pub use keys::{
 pub use layout::{Bloom, Dictionary, Layout, Statistics};
 pub use merge_oracle::{MergeOracle, RowCopy};
 pub use ordered::{
-    ORDER_COLUMN, ORDER_FIELD_ID, OrderKind, Ordered, RowsPerKey, ScanRows, TestScan, order_value,
-    row_value, scan_model,
+    MINUTE_MICROS, ORDER_COLUMN, ORDER_FIELD_ID, OrderKind, Ordered, RowsPerKey, ScanRows,
+    TestScan, follow, middle_half, order_value, row_value, scan_model, scanned_of,
 };
 pub use rounds::RoundsStore;
 pub use s3::S3Fixture;

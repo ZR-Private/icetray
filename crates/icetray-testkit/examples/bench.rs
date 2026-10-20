@@ -37,7 +37,7 @@
 //!
 //! Reference mode. Under `--reference WAREHOUSE` the program writes and
 //! reads none of its own tables and serves the golden reference tables
-//! instead (`golden::GoldenTable::REFERENCE`, which `dev/golden-tables.py
+//! instead (`golden::GoldenTable::reference`, which `dev/golden-tables.py
 //! --only reference` writes), from a warehouse whose `db/` holds them, such
 //! as a copy on object storage read through `--rewrite-location` rules.
 //! Per table and tier it measures Scans of the keys the golden tests sample
@@ -79,9 +79,9 @@ use icetray_core::config::{
 };
 use icetray_core::contract::{TARGET_FILE_BYTES_MAX, VALUE_PAGE_BYTES};
 use icetray_core::{
-    CallsInFlight, Direction, FILE_PREFIX, FindingLog, Generation, Key, KeyType, Level, LocalDir,
-    OrderValue, PageCache, ResidentParts, Row, ScanBounds, ScanRow, Scanned, Storage, Table,
-    TableHandles, TableSource,
+    CallsInFlight, DEFAULT_MAX_SCAN_ROWS, Direction, FILE_PREFIX, FindingLog, Generation, Key,
+    KeyType, Level, LocalDir, OrderValue, PageCache, ResidentParts, Row, ScanBounds, Scanned,
+    Storage, Table, TableHandles, TableSource,
 };
 use icetray_core::{approx, catalog, time};
 use icetray_testkit::fixture::{NAMESPACE, SECOND_VALUE_COLUMN, memory_catalog_local};
@@ -98,9 +98,10 @@ use icetray_testkit::protobuf::{
     CHECKSUM_FIELD, FILLER_FIELD, FLAGS_FIELD, GROUP_FIELD, ID_FIELD, NAME_FIELD, SCORES_FIELD,
 };
 use icetray_testkit::{
-    FixtureSpec, GetLog, KeyShape, LoggedGet, MemoryCatalog, ORDER_COLUMN, OrderKind, Ordered,
-    RoundsStore, RowsPerKey, TestScan, ValueKind, absent_key_from, key_at_shaped, order_value,
-    row_value, scan_model, value_of_kind, write_fixture,
+    FixtureSpec, GetLog, KeyShape, LoggedGet, MINUTE_MICROS, MemoryCatalog, ORDER_COLUMN,
+    OrderKind, Ordered, RoundsStore, RowsPerKey, TestScan, ValueKind, absent_key_from, follow,
+    key_at_shaped, middle_half, order_value, row_value, scan_model, scanned_of, value_of_kind,
+    write_fixture,
 };
 use object_store::ObjectStore;
 use parquet::file::page_index::offset_index::PageLocation;
@@ -312,7 +313,7 @@ enum Scenario {
     /// table only.
     #[value(name = "multi-scan-10-cold")]
     MultiScan10Cold,
-    /// A `MultiScan` of `MULTI_SCAN_100_KEYS` keys at a limit of
+    /// A `MultiScan` of `SMALL_BATCH_KEYS` keys at a limit of
     /// `MULTI_SCAN_HEAD_ROWS`, warm: each key's newest row, at the scale a
     /// call's keys are spread over workers. Ordered table only.
     #[value(name = "multi-scan-100")]
@@ -321,7 +322,7 @@ enum Scenario {
     /// table only.
     #[value(name = "multi-scan-100-cold")]
     MultiScan100Cold,
-    /// `multi-scan-100` of `MULTI_SCAN_1000_KEYS` keys. Ordered table only.
+    /// `multi-scan-100` of `LARGE_BATCH_KEYS` keys. Ordered table only.
     #[value(name = "multi-scan-1000")]
     MultiScan1000,
     /// `multi-scan-1000` through the `COLD_CACHE_BYTES` scan cache. Ordered
@@ -862,23 +863,16 @@ const ORDERED_KEYS: u64 = ROWS / ORDERED_ROWS_PER_KEY;
 /// Keys the ordered table's second build appends, each with its whole run.
 const ORDERED_APPENDED_KEYS: u64 = ORDERED_KEYS / APPEND_DIVISOR;
 
-/// The timestamp of every key's first row: 2026-01-01T00:00:00Z, in the
-/// order column's microseconds.
-const ORDER_START: i64 = 1_767_225_600_000_000;
-
-/// The raw distance between a key's consecutive rows: one minute, in the
-/// order column's microseconds.
-const ORDER_STEP: i64 = 60_000_000;
-
 /// The order column of the ordered table: every key holds
-/// `ORDERED_ROWS_PER_KEY` rows a minute apart from `ORDER_START`, the same
+/// `ORDERED_ROWS_PER_KEY` rows a minute apart (`MINUTE_MICROS`) from
+/// 2026-01-01T00:00:00Z (`golden::TS_START`), in microseconds, the same
 /// order values for every key, so one answer of the model serves a Scan
 /// scenario's every key (`ScanCase`).
 const ORDERED: Ordered = Ordered {
     kind: OrderKind::Timestamp,
     rows_per_key: RowsPerKey::Each(ORDERED_ROWS_PER_KEY),
-    start: ORDER_START,
-    step: ORDER_STEP,
+    start: golden::TS_START,
+    step: MINUTE_MICROS,
 };
 
 /// Rows per key of the long-run tables: ten times the default
@@ -971,9 +965,6 @@ const SECOND_BUILD_PREFIX: &str = "build2";
 
 /// The name of the file under `--data-dir` recording what was written.
 const MANIFEST_FILE: &str = "manifest.json";
-
-/// The scheme the fixture writer's local catalog records locations under.
-const FILE_URI: &str = "file://";
 
 /// A benchmark table as written: its name, key type and shape, the bytes a
 /// key and a value hold before compression, from which a contract table's
@@ -1731,9 +1722,9 @@ const PARQUET_EXTENSION: &str = "parquet";
 /// A location the local catalog recorded, as the path it names.
 fn local_path(location: &str) -> BenchResult<PathBuf> {
     location
-        .strip_prefix(FILE_URI)
+        .strip_prefix(FILE_PREFIX)
         .map(PathBuf::from)
-        .ok_or_else(|| format!("{location} is not a {FILE_URI} location").into())
+        .ok_or_else(|| format!("{location} is not a {FILE_PREFIX} location").into())
 }
 
 // ---------------------------------------------------------------------------
@@ -2107,14 +2098,15 @@ fn returned_bytes(row: &Row, columns: usize) -> Option<usize> {
 /// Keys of a `MultiScan` scenario's batch.
 const MULTI_SCAN_KEYS: usize = 10;
 
-/// Keys of the `multi-scan-100` scenarios' batch: a batch of heads a
-/// caller pages through, spread over several workers' runs.
-const MULTI_SCAN_100_KEYS: usize = 100;
+/// Keys of the `-100` scenarios' batch, `MultiGet` and `MultiScan`: a
+/// batch of heads a caller pages through, spread over several workers'
+/// runs.
+const SMALL_BATCH_KEYS: usize = 100;
 
-/// Keys of the `multi-scan-1000` scenarios' batch: ten times as many, the
-/// order of the most `server.max_multi_scan_values` admits at a limit of
-/// one row.
-const MULTI_SCAN_1000_KEYS: usize = 1_000;
+/// Keys of the `-1000` scenarios' batch, `MultiGet` and `MultiScan`, and
+/// of `two-table`'s: ten times as many, the order of the most
+/// `server.max_multi_scan_values` admits at a limit of one row.
+const LARGE_BATCH_KEYS: usize = 1_000;
 
 /// Rows per key of the `multi-scan-100` and `multi-scan-1000` scenarios:
 /// each key's newest row.
@@ -2122,11 +2114,6 @@ const MULTI_SCAN_HEAD_ROWS: u32 = 1;
 
 /// Rows of the bounded Scan's page: a page of a read paged by order value.
 const SCAN_PAGE_ROWS: u32 = 10;
-
-/// A key's run over the rows the bounded Scan's window leaves out at each
-/// end: a quarter, so the window is the run's middle half, which holds
-/// more rows than `SCAN_PAGE_ROWS`.
-const WINDOW_MARGIN_DIVISOR: usize = 4;
 
 /// Operations of a Scan scenario whose answers are compared whole with
 /// the model's before it is measured (`verify_scans`).
@@ -2138,9 +2125,13 @@ const VERIFIED_OPS: usize = 100;
 /// operations whose pages those did not just read.
 const ROUNDS_OPS: usize = 100;
 
+/// What the default `max_scan_rows` is divided by for the head Scan of a
+/// long run: a tenth of a full page.
+const HEAD_DIVISOR: u32 = 10;
+
 /// Rows of the head Scan of a long run: the newest hundred, a tenth of
 /// the default `max_scan_rows`.
-const HEAD_ROWS: u32 = 100;
+const HEAD_ROWS: u32 = DEFAULT_MAX_SCAN_ROWS / HEAD_DIVISOR;
 
 /// Bounds a long-run Scan scenario draws its `before` from, one per
 /// request in turn (`bounded_in_run`): enough that the bounds fall all
@@ -2172,16 +2163,20 @@ impl ScanCase {
     fn of(shape: TableShape, test: TestScan) -> BenchResult<Self> {
         let ordered = shape.order()?;
         let rows = ordered.orders_of(0)?.into_iter().map(|order| (order, ()));
-        let (rows, next) = scan_model(rows, &test);
-        Ok(Self {
-            bounds: test.bounds(ordered.kind),
-            orders: rows
-                .into_iter()
-                .map(|(order, ())| order_value(ordered.kind, order))
-                .collect(),
-            next: next.and_then(|last| test.next_after(ordered.kind, last)),
+        let encode = |order| order_value(ordered.kind, order);
+        let model = scanned_of(scan_model(rows, &test), &test, encode, |_, ()| Vec::new());
+        Ok(Self::of_scanned(test, test.bounds(ordered.kind), &model))
+    }
+
+    /// The case of `test`, asked as `bounds`, whose answer by the model is
+    /// `model`: its order values and its `next`.
+    fn of_scanned(test: TestScan, bounds: ScanBounds, model: &Scanned) -> Self {
+        Self {
             test,
-        })
+            bounds,
+            orders: model.rows.iter().map(|row| row.order.clone()).collect(),
+            next: model.next.clone(),
+        }
     }
 
     /// The cases of `tests` over `shape`, which operation `i` takes in
@@ -2247,17 +2242,12 @@ fn modeled_scan(
         );
         (order, value)
     });
-    let (rows, next) = scan_model(rows, test);
-    Ok(Scanned {
-        rows: rows
-            .into_iter()
-            .map(|(order, value)| ScanRow {
-                order: order_value(ordered.kind, order),
-                values: vec![Some(value.into())],
-            })
-            .collect(),
-        next: next.and_then(|last| test.next_after(ordered.kind, last)),
-    })
+    Ok(scanned_of(
+        scan_model(rows, test),
+        test,
+        |order| order_value(ordered.kind, order),
+        |_, value| vec![Some(value.into())],
+    ))
 }
 
 /// What one operation of a run does.
@@ -2306,13 +2296,15 @@ enum Op {
 }
 
 /// One request of a reference op: the keys it asks, by key index and as
-/// keys, whether it is a `MultiScan`, and per key its case, every case
-/// under the request's one set of bounds.
+/// keys, whether it is a `MultiScan`, and per key its case and the
+/// derivation's whole answer (`golden::derived_scan`), every case under the
+/// request's one set of bounds.
 struct Request {
     ids: Vec<u64>,
     keys: Vec<Key>,
     multi: bool,
     cases: Vec<ScanCase>,
+    wants: Vec<Scanned>,
 }
 
 impl Request {
@@ -2320,39 +2312,43 @@ impl Request {
     fn bounds(&self) -> &ScanBounds {
         &self.cases[0].bounds
     }
+}
 
-    /// Runs the request as operation `i` and returns the value bytes it
-    /// read and returned; an answer that disagrees with a key's case is an
-    /// error (`ScanCase::check`).
-    async fn run(&self, table: &Table, value_bytes: usize, i: usize) -> BenchResult<ValueBytes> {
-        let mut returned = 0;
-        if self.multi {
-            let lookup = table
-                .multi_scan(&self.keys, &VALUE_READS, self.bounds())
-                .await?;
-            if lookup.results.len() != self.keys.len() {
-                return Err(format!(
-                    "batch {i} answered {} of {} keys",
-                    lookup.results.len(),
-                    self.keys.len()
-                )
-                .into());
-            }
-            for (scanned, case) in lookup.results.iter().zip(&self.cases) {
-                returned += case
-                    .check(scanned, value_bytes)
-                    .map_err(|fault| format!("batch {i}: {fault}"))?;
-            }
-        } else {
-            let lookup = table
-                .scan(&self.keys[0], &VALUE_READS, self.bounds())
-                .await?;
-            returned += self.cases[0]
-                .check(&lookup.scanned, value_bytes)
-                .map_err(|fault| format!("scan {i}: {fault}"))?;
-        }
-        Ok(ValueBytes::of(returned, returned))
+/// A `scan` of `keys`' one key, or with `multi` a `multi_scan` of them,
+/// under `bounds` as operation `i`, each key's answer checked against its
+/// case of `cases` in turn (`ScanCase::check`); the value bytes it read and
+/// returned. Allocates nothing past the read's own answer when every key
+/// agrees, so the check costs a measured operation no allocation.
+async fn checked_scan<'a>(
+    table: &Table,
+    (keys, multi, bounds): (&[Key], bool, &ScanBounds),
+    cases: impl Iterator<Item = &'a ScanCase>,
+    value_bytes: usize,
+    i: usize,
+) -> BenchResult<ValueBytes> {
+    let (single, batch);
+    let (answers, what) = if multi {
+        batch = table.multi_scan(keys, &VALUE_READS, bounds).await?;
+        (batch.results.as_slice(), "batch")
+    } else {
+        single = table.scan(&keys[0], &VALUE_READS, bounds).await?;
+        (std::slice::from_ref(&single.scanned), "scan")
+    };
+    if answers.len() != keys.len() {
+        return Err(format!(
+            "{what} {i} answered {} of {} keys",
+            answers.len(),
+            keys.len()
+        )
+        .into());
     }
+    let mut returned = 0;
+    for (scanned, case) in answers.iter().zip(cases) {
+        returned += case
+            .check(scanned, value_bytes)
+            .map_err(|fault| format!("{what} {i}: {fault}"))?;
+    }
+    Ok(ValueBytes::of(returned, returned))
 }
 
 /// The page cache and scan cache a cold reference op empties before each
@@ -2447,90 +2443,117 @@ impl Op {
                 Ok(ValueBytes::of(reads.read_bytes(at, returned), returned))
             }
             Self::Scan {
-                keys,
-                cases,
-                value_bytes,
+                cases, value_bytes, ..
             } => {
-                let case = Self::case(cases, i);
-                let lookup = table
-                    .scan(&keys[at.start], &VALUE_READS, &case.bounds)
-                    .await?;
-                let returned = case
-                    .check(&lookup.scanned, *value_bytes)
-                    .map_err(|fault| format!("scan {i}: {fault}"))?;
-                Ok(ValueBytes::of(returned, returned))
+                let asked = self.scan_request(i).expect("a Scan op asks a Scan");
+                let cases = std::iter::once(Self::case(cases, i));
+                checked_scan(table, asked, cases, *value_bytes, i).await
             }
             Self::MultiScan {
-                keys,
-                cases,
-                value_bytes,
-                ..
+                cases, value_bytes, ..
             } => {
-                let case = Self::case(cases, i);
-                let lookup = table
-                    .multi_scan(&keys[at.clone()], &VALUE_READS, &case.bounds)
-                    .await?;
-                if lookup.results.len() != at.len() {
-                    return Err(format!(
-                        "batch {i} answered {} of {} keys",
-                        lookup.results.len(),
-                        at.len()
-                    )
-                    .into());
-                }
-                let mut returned = 0;
-                for scanned in &lookup.results {
-                    returned += case
-                        .check(scanned, *value_bytes)
-                        .map_err(|fault| format!("batch {i}: {fault}"))?;
-                }
-                Ok(ValueBytes::of(returned, returned))
+                let asked = self.scan_request(i).expect("a MultiScan op asks a Scan");
+                let cases = std::iter::repeat_n(Self::case(cases, i), at.len());
+                checked_scan(table, asked, cases, *value_bytes, i).await
             }
             Self::Reference {
                 requests,
                 value_bytes,
                 ..
-            } => requests[at.start].run(table, *value_bytes, i).await,
+            } => {
+                let asked = self.scan_request(i).expect("a reference op asks a Scan");
+                let cases = requests[at.start].cases.iter();
+                checked_scan(table, asked, cases, *value_bytes, i).await
+            }
+        }
+    }
+
+    /// What operation `i` of a Scan op asks: its keys, whether as one
+    /// `MultiScan`, and the bounds every key is read under; `None` for a
+    /// `Get` or `MultiGet` op.
+    fn scan_request(&self, i: usize) -> Option<(&[Key], bool, &ScanBounds)> {
+        let at = self.pool_range(i);
+        match self {
+            Self::Scan { keys, cases, .. } => {
+                Some((&keys[at], false, &Self::case(cases, i).bounds))
+            }
+            Self::MultiScan { keys, cases, .. } => {
+                Some((&keys[at], true, &Self::case(cases, i).bounds))
+            }
+            Self::Reference { requests, .. } => {
+                let request = &requests[at.start];
+                Some((&request.keys, request.multi, request.bounds()))
+            }
+            Self::Get { .. } | Self::MultiGet { .. } => None,
         }
     }
 }
 
-/// The first `VERIFIED_OPS` operations of a Scan or `MultiScan` op over
-/// `shape`, each key's answer compared whole, every value's bytes
-/// included, with the model's (`modeled_scan`), before the scenario is
-/// measured: `Op::run` checks the order values and value lengths alone, so
-/// this is what fails a run whose Scans return wrong bytes. A `Get` or
-/// `MultiGet` op is checked by `Op::run` alone.
-async fn verify_scans(op: &Op, table: &Table, shape: TableShape) -> BenchResult<()> {
-    let (keys, cases) = match op {
-        Op::Scan { keys, cases, .. } | Op::MultiScan { keys, cases, .. } => (keys, cases),
-        Op::Get { .. } | Op::MultiGet { .. } | Op::Reference { .. } => return Ok(()),
-    };
-    let ordered = shape.order()?;
-    let ids = hit_ids(shape);
-    for i in 0..VERIFIED_OPS {
-        let at = op.pool_range(i);
-        let case = Op::case(cases, i);
-        let answers = table
-            .multi_scan(&keys[at.clone()], &VALUE_READS, &case.bounds)
-            .await?
-            .results;
-        let single = table
-            .scan(&keys[at.start], &VALUE_READS, &case.bounds)
-            .await?
-            .scanned;
+/// The first `ops` operations of a Scan, `MultiScan`, or reference op,
+/// each key's answer compared whole, every value's bytes included, with
+/// `want` of the operation and the key's place in it, the key's index and
+/// its model answer, before the scenario is measured: `Op::run` checks the
+/// order values and value lengths alone, so this is what fails a run whose
+/// Scans return wrong bytes. Each operation is read as one `MultiScan` and
+/// its first key as a Scan too, after the op's `before`, and the two must
+/// agree. A `Get` or `MultiGet` op is checked by `Op::run` alone.
+async fn verify_answers(
+    op: &Op,
+    table: &Table,
+    ops: usize,
+    want: impl Fn(usize, usize) -> BenchResult<(u64, Scanned)>,
+) -> BenchResult<()> {
+    for i in 0..ops {
+        let Some((keys, _, bounds)) = op.scan_request(i) else {
+            return Ok(());
+        };
+        op.before();
+        let answers = table.multi_scan(keys, &VALUE_READS, bounds).await?.results;
+        let single = table.scan(&keys[0], &VALUE_READS, bounds).await?.scanned;
+        if answers.len() != keys.len() {
+            return Err(format!(
+                "operation {i} answered {} of {} keys",
+                answers.len(),
+                keys.len()
+            )
+            .into());
+        }
         if single != answers[0] {
             return Err(
                 format!("operation {i}: a Scan and a MultiScan of one key disagree").into(),
             );
         }
-        for (answer, &id) in answers.iter().zip(&ids[at]) {
-            if *answer != modeled_scan(shape, ordered, id, &case.test)? {
-                return Err(format!("operation {i}: key {id} disagrees with the model").into());
+        for (at, answer) in answers.iter().enumerate() {
+            let (id, want) = want(i, at)?;
+            if *answer != want {
+                return Err(format!(
+                    "operation {i}: key index {id} under {bounds:?} disagrees with the model"
+                )
+                .into());
             }
         }
     }
     Ok(())
+}
+
+/// `verify_answers` of the first `VERIFIED_OPS` operations of a Scan or
+/// `MultiScan` op over `shape`, against the model's answers
+/// (`modeled_scan`).
+async fn verify_scans(op: &Op, table: &Table, shape: TableShape) -> BenchResult<()> {
+    let cases = match op {
+        Op::Scan { cases, .. } | Op::MultiScan { cases, .. } => cases,
+        Op::Get { .. } | Op::MultiGet { .. } | Op::Reference { .. } => return Ok(()),
+    };
+    let ordered = shape.order()?;
+    let ids = hit_ids(shape);
+    verify_answers(op, table, VERIFIED_OPS, |i, at| {
+        let id = ids[op.pool_range(i)][at];
+        Ok((
+            id,
+            modeled_scan(shape, ordered, id, &Op::case(cases, i).test)?,
+        ))
+    })
+    .await
 }
 
 /// Whether a task loop gives its worker up between operations.
@@ -2824,15 +2847,10 @@ impl Window {
     /// The window's figures as a result row's JSON fields.
     fn to_json(&self) -> Json {
         let counters = self.counters;
-        let latencies = &self.latencies;
-        json!({
+        let fields = json!({
             "ops": self.ops,
             "elapsed_us": micros(self.elapsed),
             "ops_per_second": self.ops_per_second(),
-            "p50_us": micros(latencies.percentile(P50)),
-            "p90_us": micros(latencies.percentile(P90)),
-            "p99_us": micros(latencies.percentile(P99)),
-            "max_us": micros(latencies.max()),
             "allocations_per_op": self.per_op(counters.allocations.calls),
             "allocated_bytes_per_op": self.per_op(counters.allocations.bytes),
             "page_fetches_per_op": self.per_op(counters.fetches),
@@ -2844,7 +2862,8 @@ impl Window {
             "hedges": counters.hedges,
             "value_bytes_read_per_op": self.per_op(self.bytes.read),
             "value_bytes_returned_per_op": self.per_op(self.bytes.returned),
-        })
+        });
+        merged(fields, [percentiles_json(&self.latencies)])
     }
 }
 
@@ -2983,7 +3002,7 @@ async fn page_through(table: &Table, key: &Key, reads: &[ColumnRead<'static>]) -
     loop {
         let scanned = table.scan(key, reads, &page).await?.scanned;
         match scanned.next {
-            Some(next) => page.before = Some(next),
+            Some(next) => follow(&mut page, next),
             None => return Ok(()),
         }
     }
@@ -3067,9 +3086,9 @@ async fn lookups(
             Scenario::WarmHit | Scenario::ColdHit => get(&hits, true, WHOLE_VALUE),
             Scenario::Miss => get(&misses, false, WHOLE_VALUE),
             Scenario::MultiGet100 | Scenario::MultiGet100Cold => {
-                multi(&hits, BATCH_100, WHOLE_VALUE)
+                multi(&hits, SMALL_BATCH_KEYS, WHOLE_VALUE)
             }
-            Scenario::MultiGet1000 => multi(&hits, BATCH_1000, WHOLE_VALUE),
+            Scenario::MultiGet1000 => multi(&hits, LARGE_BATCH_KEYS, WHOLE_VALUE),
             Scenario::WarmHitBoth | Scenario::ColdHitBoth => {
                 get(&hits, true, Reads::Whole(&BOTH_READS))
             }
@@ -3079,19 +3098,19 @@ async fn lookups(
             }
             Scenario::WarmHitProjectMost => get(&hits, true, projected(&MOST_READS)),
             Scenario::MultiGet100Both | Scenario::MultiGet100ColdBoth => {
-                multi(&hits, BATCH_100, Reads::Whole(&BOTH_READS))
+                multi(&hits, SMALL_BATCH_KEYS, Reads::Whole(&BOTH_READS))
             }
-            Scenario::MultiGet100Project => multi(&hits, BATCH_100, projected(&FEW_READS)),
+            Scenario::MultiGet100Project => multi(&hits, SMALL_BATCH_KEYS, projected(&FEW_READS)),
             Scenario::ScanWarm | Scenario::ScanCold => scan_one(TestScan::default())?,
             Scenario::ScanBounded => scan_one(bounded_page()?)?,
             Scenario::MultiScan10 | Scenario::MultiScan10Cold => {
                 scan_batch(multi_scan_whole_runs(), MULTI_SCAN_KEYS)?
             }
             Scenario::MultiScan100 | Scenario::MultiScan100Cold => {
-                scan_batch(multi_scan_heads(), MULTI_SCAN_100_KEYS)?
+                scan_batch(multi_scan_heads(), SMALL_BATCH_KEYS)?
             }
             Scenario::MultiScan1000 | Scenario::MultiScan1000Cold => {
-                scan_batch(multi_scan_heads(), MULTI_SCAN_1000_KEYS)?
+                scan_batch(multi_scan_heads(), LARGE_BATCH_KEYS)?
             }
             Scenario::ScanBoundedLong
             | Scenario::ScanBoundedString
@@ -3231,36 +3250,35 @@ async fn measure_modes(
     Ok(runs)
 }
 
-/// The bounded Scan's request: `SCAN_PAGE_ROWS` rows, newest first, from
-/// the order value of the row just past a quarter into a key's run up to
-/// that of the row three quarters in, left out (`WINDOW_MARGIN_DIVISOR`),
-/// counted oldest first.
+/// The bounded Scan's request: `SCAN_PAGE_ROWS` rows, newest first, over
+/// the middle half of a key's run (`middle_half`), both its edge rows
+/// included, as the reference tables' window (`golden::reference_window`).
 fn bounded_page() -> BenchResult<TestScan> {
     let orders = ORDERED.orders_of(0)?;
-    let margin = orders.len() / WINDOW_MARGIN_DIVISOR;
+    let half = middle_half(orders.len());
     Ok(TestScan {
         direction: Direction::NewestFirst,
         limit: SCAN_PAGE_ROWS,
-        start: Some(orders[margin + 1]),
-        before: Some(orders[orders.len() - margin]),
+        start: Some(orders[*half.start()]),
+        before: Some(orders[*half.end()] + 1),
     })
 }
 
 /// The long-run Scans' requests (`scan-bounded-long`,
 /// `scan-bounded-string`): `SCAN_PAGE_ROWS` rows, newest first, before an
 /// order value drawn uniformly from the middle half of a key's run of
-/// `shape` (`WINDOW_MARGIN_DIVISOR`), `BOUND_POOL` of them, so a bound
-/// lands anywhere in a run's pages.
+/// `shape` (`middle_half`), `BOUND_POOL` of them, so a bound lands
+/// anywhere in a run's pages.
 fn bounded_in_run(shape: TableShape) -> BenchResult<Vec<TestScan>> {
     let ordered = shape.order()?;
     let orders = ordered.orders_of(0)?;
-    let margin = orders.len() / WINDOW_MARGIN_DIVISOR;
+    let half = middle_half(orders.len());
     let mut rng = StdRng::seed_from_u64(BOUND_SEED);
     Ok((0..BOUND_POOL)
         .map(|_| TestScan {
             direction: Direction::NewestFirst,
             limit: SCAN_PAGE_ROWS,
-            before: Some(orders[rng.random_range(margin..orders.len() - margin)]),
+            before: Some(orders[rng.random_range(half.clone())]),
             ..TestScan::default()
         })
         .collect())
@@ -3298,10 +3316,6 @@ fn multi_scan_heads() -> TestScan {
         ..TestScan::default()
     }
 }
-
-/// The two `MultiGet` sizes measured.
-const BATCH_100: usize = 100;
-const BATCH_1000: usize = 1_000;
 
 fn get(keys: &Arc<Vec<Key>>, present: bool, reads: Reads) -> Op {
     Op::Get {
@@ -3409,7 +3423,7 @@ async fn two_tables(
         .as_ref()
         .expect("the string table is served beside the long one");
     let hit_op = get(&key_pools(long.shape).0, true, WHOLE_VALUE);
-    let batch_op = multi(&key_pools(string.shape).0, BATCH_1000, WHOLE_VALUE);
+    let batch_op = multi(&key_pools(string.shape).0, LARGE_BATCH_KEYS, WHOLE_VALUE);
     let hits = (&hit_op, Pace::Yielding);
     let batches = (&batch_op, Pace::Yielding);
     let tasks = settings.tasks;
@@ -3450,7 +3464,7 @@ async fn two_tables(
     let rows = vec![
         Measured {
             label: label(string.shape, Mode::Single, one),
-            keys_per_op: BATCH_1000,
+            keys_per_op: LARGE_BATCH_KEYS,
             window: Window {
                 ops: batch_ops,
                 elapsed,
@@ -3998,7 +4012,7 @@ enum ReferenceScenario {
     /// run.
     ScanWarm,
     /// `MultiScan`s of 10 and of 100 keys (`REFERENCE_MULTI_KEYS`) at
-    /// limits of 1 and 20 (`REFERENCE_MULTI_LIMITS`), newest first,
+    /// limits of 1 and 20 (`reference_multi_limits`), newest first,
     /// unbounded, their keys the first of each tier in turn
     /// (`multi_scan_ids`), through the emptied caches.
     MultiScanCold,
@@ -4057,10 +4071,10 @@ const GET_LOG_SLOTS: usize = 1 << 16;
 /// the classes every GET of the window counts in (`store_gets`).
 const GET_SAMPLES: usize = 4_096;
 
-/// The classes of GETs by the data pages each spans, least and most, both
-/// included; `None` has no upper bound.
-const SPAN_CLASSES: [(u64, Option<u64>); 4] =
-    [(1, Some(1)), (2, Some(4)), (5, Some(16)), (17, None)];
+/// The least data pages of each class of GETs by the pages each spans,
+/// ascending, each class below the next one's least: one page, a few, up
+/// to sixteen, and more.
+const SPAN_FLOORS: [u64; 4] = [1, 2, 5, 17];
 
 /// The least bytes of each class of GETs by bytes, ascending, each class
 /// below the next one's least: from nothing through 4 KiB, a small page,
@@ -4075,19 +4089,19 @@ const BYTE_CLASS_FLOORS: [u64; 7] = [
     4 * 1024 * 1024,
 ];
 
-/// Rows per key of the reference `MultiScan`s that read a short history:
-/// twenty, a fiftieth of the default `max_scan_rows`, which the light keys
-/// of a reference table hold at most.
-const MULTI_SCAN_SHORT_ROWS: u32 = 20;
-
 /// Keys of the reference `MultiScan`s: a batch of ten, and of a hundred,
 /// spread over several workers' runs.
-const REFERENCE_MULTI_KEYS: [usize; 2] = [MULTI_SCAN_KEYS, MULTI_SCAN_100_KEYS];
+const REFERENCE_MULTI_KEYS: [usize; 2] = [MULTI_SCAN_KEYS, SMALL_BATCH_KEYS];
 
 /// Rows per key of the reference `MultiScan`s: each key's newest row, and
-/// a short history. A hundred keys at the longer limit, one column beside
-/// the order value, is `server.max_multi_scan_values` at its default.
-const REFERENCE_MULTI_LIMITS: [u32; 2] = [MULTI_SCAN_HEAD_ROWS, MULTI_SCAN_SHORT_ROWS];
+/// a short history, twenty, a fiftieth of the default `max_scan_rows`, the
+/// most a light key of a reference table holds (`golden::LIGHT_ROWS`). A
+/// hundred keys at the longer limit, one column beside the order value,
+/// is `server.max_multi_scan_values` at its default.
+fn reference_multi_limits() -> [u32; 2] {
+    let short = u32::try_from(*golden::LIGHT_ROWS.end()).expect("a light key's rows fit a limit");
+    [MULTI_SCAN_HEAD_ROWS, short]
+}
 
 /// One lookup scenario of a reference table.
 #[derive(Clone, Copy, Debug)]
@@ -4115,7 +4129,7 @@ fn reference_lookups(
     for &scenario in scenarios.iter().filter(|scenario| !scenario.loads()) {
         if scenario.multi() {
             for keys in REFERENCE_MULTI_KEYS {
-                for limit in REFERENCE_MULTI_LIMITS {
+                for limit in reference_multi_limits() {
                     lookups.push(RefLookup {
                         scenario,
                         rows_tier: None,
@@ -4160,10 +4174,10 @@ fn multi_scan_ids(keys: u64, batch: usize) -> Vec<u64> {
 }
 
 /// The request of `lookup` for the keys `ids` of `table`: per key its case
-/// from the derivation (`golden::derived_scan`), over its window when the
-/// lookup is bounded.
+/// and its answer from the derivation (`golden::derived_scan`), over its
+/// window when the lookup is bounded.
 fn reference_request(table: GoldenTable, ids: &[u64], lookup: &RefLookup) -> Request {
-    let cases = ids
+    let (cases, wants) = ids
         .iter()
         .map(|&id| {
             let rows = golden::ordered_rows(table, id);
@@ -4180,14 +4194,10 @@ fn reference_request(table: GoldenTable, ids: &[u64], lookup: &RefLookup) -> Req
                 before,
             };
             let (want, _) = golden::derived_scan(table, id, &rows, &test);
-            ScanCase {
-                bounds: test.bounds_by(|order| golden::ordered_order_value(table, id, order)),
-                orders: want.rows.into_iter().map(|row| row.order).collect(),
-                next: want.next,
-                test,
-            }
+            let bounds = test.bounds_by(|order| golden::ordered_order_value(table, id, order));
+            (ScanCase::of_scanned(test, bounds, &want), want)
         })
-        .collect();
+        .unzip();
     Request {
         ids: ids.to_vec(),
         keys: ids
@@ -4196,24 +4206,31 @@ fn reference_request(table: GoldenTable, ids: &[u64], lookup: &RefLookup) -> Req
             .collect(),
         multi: lookup.scenario.multi(),
         cases,
+        wants,
+    }
+}
+
+/// The key indexes each request of `lookup` over a table of `keys` keys
+/// asks: each sampled key of its tier alone, or one `MultiScan`'s batch.
+fn lookup_ids(keys: u64, lookup: &RefLookup) -> Vec<Vec<u64>> {
+    match lookup.rows_tier {
+        Some(tier) => golden::reference_tier_sample(keys, tier, REFERENCE_TIER_SAMPLES)
+            .into_iter()
+            .map(|id| vec![id])
+            .collect(),
+        None => vec![multi_scan_ids(keys, lookup.keys)],
     }
 }
 
 /// The op of `lookup` over `table` of `keys` keys: a Scan of each sampled
-/// key of its tier in turn, or one `MultiScan` of its batch; `cold` names
-/// the caches it empties before each operation.
+/// key of its tier in turn, or one `MultiScan` of its batch
+/// (`lookup_ids`); `cold` names the caches it empties before each
+/// operation.
 fn reference_op(table: GoldenTable, keys: u64, lookup: &RefLookup, cold: Option<ColdCaches>) -> Op {
-    let requests = match lookup.rows_tier {
-        Some(tier) => golden::reference_tier_sample(keys, tier, REFERENCE_TIER_SAMPLES)
-            .into_iter()
-            .map(|id| reference_request(table, &[id], lookup))
-            .collect(),
-        None => vec![reference_request(
-            table,
-            &multi_scan_ids(keys, lookup.keys),
-            lookup,
-        )],
-    };
+    let requests = lookup_ids(keys, lookup)
+        .iter()
+        .map(|ids| reference_request(table, ids, lookup))
+        .collect();
     Op::Reference {
         requests: Arc::new(requests),
         value_bytes: REFERENCE_VALUE_BYTES,
@@ -4221,49 +4238,18 @@ fn reference_op(table: GoldenTable, keys: u64, lookup: &RefLookup, cold: Option<
     }
 }
 
-/// Every request of a reference op, each key's answer compared whole, every
-/// value's bytes included, with the derivation's, before the op is
-/// measured: `Op::run` checks the order values and value lengths alone.
+/// `verify_answers` of every request of a reference op, against the
+/// derivation's answers each request holds.
 async fn verify_reference(op: &Op, table: &Table, golden_table: GoldenTable) -> BenchResult<()> {
     let Op::Reference { requests, .. } = op else {
         return Ok(());
     };
-    for (i, request) in requests.iter().enumerate() {
-        op.before();
-        let answers = if request.multi {
-            table
-                .multi_scan(&request.keys, &VALUE_READS, request.bounds())
-                .await?
-                .results
-        } else {
-            vec![
-                table
-                    .scan(&request.keys[0], &VALUE_READS, request.bounds())
-                    .await?
-                    .scanned,
-            ]
-        };
-        if answers.len() != request.ids.len() {
-            return Err(format!(
-                "{golden_table} request {i} answered {} of {} keys",
-                answers.len(),
-                request.ids.len()
-            )
-            .into());
-        }
-        for ((answer, &id), case) in answers.iter().zip(&request.ids).zip(&request.cases) {
-            let rows = golden::ordered_rows(golden_table, id);
-            let (want, _) = golden::derived_scan(golden_table, id, &rows, &case.test);
-            if *answer != want {
-                return Err(format!(
-                    "{golden_table} request {i}: key index {id} under {:?} disagrees with the derivation",
-                    case.test
-                )
-                .into());
-            }
-        }
-    }
-    Ok(())
+    verify_answers(op, table, requests.len(), |i, at| {
+        let request = &requests[i];
+        Ok((request.ids[at], request.wants[at].clone()))
+    })
+    .await
+    .map_err(|fault| format!("{golden_table} {fault}").into())
 }
 
 /// `table` of the reference warehouse `warehouse` in `tier`, as `serve`
@@ -4316,8 +4302,8 @@ async fn serve_reference(
     })
 }
 
-/// The data pages of a generation's files, by `GetLog::name_of` each
-/// file's name: each page's byte range in its file, ascending, over every
+/// The data pages of a generation's files, by `GetLog::name_of_location`
+/// of each file: each page's byte range in its file, ascending, over every
 /// column whose offset index the footer keeps.
 struct PageMap {
     files: HashMap<u64, Vec<Range<u64>>>,
@@ -4332,7 +4318,6 @@ impl PageMap {
         let mut files: HashMap<u64, Vec<Range<u64>>> = HashMap::new();
         let mut shared_names = 0;
         for file in &generation.files {
-            let name = file.entry.path.rsplit('/').next().unwrap_or_default();
             let mut pages: Vec<Range<u64>> = file
                 .index
                 .metadata()
@@ -4343,7 +4328,7 @@ impl PageMap {
                 .flat_map(|column| column.page_locations().iter().map(page_range))
                 .collect();
             pages.sort_by_key(|page| page.start);
-            match files.entry(GetLog::name_of(name)) {
+            match files.entry(GetLog::name_of_location(&file.entry.path)) {
                 Entry::Occupied(mut held) => {
                     shared_names += 1;
                     held.get_mut().extend(pages);
@@ -4381,7 +4366,7 @@ fn page_range(page: &PageLocation) -> Range<u64> {
 }
 
 /// The GETs `log` holds as JSON: by the data pages of `pages` each spans
-/// (`SPAN_CLASSES`) and by its bytes (`BYTE_CLASS_FLOORS`), for each class
+/// (`SPAN_FLOORS`) and by its bytes (`BYTE_CLASS_FLOORS`), for each class
 /// how many, their mean bytes, and the percentiles of their latency to the
 /// store's answer and to their body's last byte; beside them the GETs no
 /// class holds (never answered, a ranged read of several, or outside every
@@ -4402,32 +4387,25 @@ fn store_gets(log: &GetLog, pages: &PageMap, samples: usize) -> Json {
             },
         }
     }
-    let by_pages: Vec<Json> = SPAN_CLASSES
-        .iter()
-        .map(|&(least, most)| {
-            let held = spanned
-                .iter()
-                .filter(|(count, _)| *count >= least && most.is_none_or(|most| *count <= most));
-            class_json(
-                json!({ "min_pages": least, "max_pages": most }),
-                held.map(|(_, get)| *get),
-            )
-        })
-        .collect();
-    let by_bytes: Vec<Json> = BYTE_CLASS_FLOORS
-        .iter()
-        .enumerate()
-        .map(|(at, &least)| {
-            let below = BYTE_CLASS_FLOORS.get(at + 1).copied();
-            let held = spanned.iter().filter(|(_, get)| {
-                get.bytes() >= least && below.is_none_or(|below| get.bytes() < below)
+    // Each class holds the GETs from its floor to below the next one's.
+    let classes = |floors: &[u64],
+                   measure: fn(&(u64, &LoggedGet)) -> u64,
+                   bounds: fn(u64, Option<u64>) -> Json| {
+        let classed = |(at, &least): (usize, &u64)| {
+            let below = floors.get(at + 1).copied();
+            let held = spanned.iter().filter(|get| {
+                measure(get) >= least && below.is_none_or(|below| measure(get) < below)
             });
-            class_json(
-                json!({ "min_bytes": least, "below_bytes": below }),
-                held.map(|(_, get)| *get),
-            )
-        })
-        .collect();
+            class_json(bounds(least, below), held.map(|(_, get)| *get))
+        };
+        floors.iter().enumerate().map(classed).collect::<Vec<_>>()
+    };
+    let by_pages = classes(&SPAN_FLOORS, |(count, _)| *count, span_bounds);
+    let by_bytes = classes(
+        &BYTE_CLASS_FLOORS,
+        |(_, get)| get.bytes(),
+        |least, below| json!({ "min_bytes": least, "below_bytes": below }),
+    );
     let one_by_one: Vec<Json> = spanned
         .iter()
         .take(samples)
@@ -4454,6 +4432,12 @@ fn store_gets(log: &GetLog, pages: &PageMap, samples: usize) -> Json {
     })
 }
 
+/// A class of GETs by pages spanned as JSON bounds: its least pages and
+/// its most, both included; `None` has no upper bound.
+fn span_bounds(least: u64, below: Option<u64>) -> Json {
+    json!({ "min_pages": least, "max_pages": below.map(|below| below - 1) })
+}
+
 /// One class of GETs as JSON: its `bounds`, how many `gets` it holds,
 /// their mean bytes, and their latencies to the answer and to the last
 /// byte.
@@ -4475,8 +4459,15 @@ fn class_json<'a>(bounds: Json, gets: impl Iterator<Item = &'a LoggedGet>) -> Js
 
 /// `latencies`' count and percentiles in microseconds.
 fn latency_json(latencies: &Latencies) -> Json {
+    merged(
+        json!({ "count": latencies.len() }),
+        [percentiles_json(latencies)],
+    )
+}
+
+/// `latencies`' percentiles and maximum in microseconds.
+fn percentiles_json(latencies: &Latencies) -> Json {
     json!({
-        "count": latencies.len(),
         "p50_us": micros(latencies.percentile(P50)),
         "p90_us": micros(latencies.percentile(P90)),
         "p99_us": micros(latencies.percentile(P99)),
@@ -4617,12 +4608,11 @@ async fn reference_lookups_in(
         .ok_or("an ordered table has a max_scan_rows")?;
     let lookups = reference_lookups(&selection.scenarios, &selection.rows_tiers, max);
     if let Some(warm) = &warm {
-        let mut primed = BTreeSet::new();
-        for lookup in lookups.iter().filter(|lookup| !lookup.scenario.cold()) {
-            if let Op::Reference { requests, .. } = reference_op(table, keys, lookup, None) {
-                primed.extend(requests.iter().flat_map(|request| request.ids.clone()));
-            }
-        }
+        let primed: BTreeSet<u64> = lookups
+            .iter()
+            .filter(|lookup| !lookup.scenario.cold())
+            .flat_map(|lookup| lookup_ids(keys, lookup).into_iter().flatten())
+            .collect();
         for &id in &primed {
             page_through(&warm.table, &golden::ordered_key(table, id), &VALUE_READS).await?;
         }
@@ -4640,15 +4630,7 @@ async fn reference_lookups_in(
         let op = reference_op(table, keys, &lookup, caches);
         verify_reference(&op, &served.table, table).await?;
         let rounds = count_rounds(served, &op).await?;
-        let ids: Vec<u64> = match &op {
-            Op::Reference { requests, .. } => requests
-                .iter()
-                .flat_map(|request| request.ids.iter().copied())
-                .collect(),
-            Op::Get { .. } | Op::MultiGet { .. } | Op::Scan { .. } | Op::MultiScan { .. } => {
-                Vec::new()
-            }
-        };
+        let ids: Vec<u64> = lookup_ids(keys, &lookup).into_iter().flatten().collect();
         for run in measure_modes(served, &op, rounds, selection.settings).await? {
             let measured = RefMeasured {
                 table,
@@ -4682,7 +4664,7 @@ fn reference_settings(cli: &Cli, warehouse: &str, tables: &[GoldenTable]) -> Jso
         "verified": "every request's answers compared whole with the derivation before it is measured",
         "tier_samples": REFERENCE_TIER_SAMPLES,
         "multi_scan_keys": REFERENCE_MULTI_KEYS,
-        "multi_scan_limits": REFERENCE_MULTI_LIMITS,
+        "multi_scan_limits": reference_multi_limits(),
         "rounds_ops": ROUNDS_OPS,
         "get_log": {
             "slots": GET_LOG_SLOTS,
@@ -4690,7 +4672,11 @@ fn reference_settings(cli: &Cli, warehouse: &str, tables: &[GoldenTable]) -> Jso
             "per_get": "one atomic increment, a hash of the file name, three clock reads, six relaxed stores, and one boxed body stream",
             "samples_per_run": GET_SAMPLES,
         },
-        "span_classes": SPAN_CLASSES.map(|(least, most)| json!({ "min_pages": least, "max_pages": most })),
+        "span_classes": SPAN_FLOORS
+            .iter()
+            .enumerate()
+            .map(|(at, &least)| span_bounds(least, SPAN_FLOORS.get(at + 1).copied()))
+            .collect::<Vec<_>>(),
         "byte_class_floors": BYTE_CLASS_FLOORS,
     })
 }
@@ -4699,7 +4685,7 @@ fn reference_settings(cli: &Cli, warehouse: &str, tables: &[GoldenTable]) -> Jso
 /// reference table in every selected tier, printed as it is measured and
 /// written as JSON under `--out-dir`.
 async fn reference_main(cli: &Cli, warehouse: &str, settings: &RunSettings) -> BenchResult<()> {
-    let tables = or_all(&cli.reference_table, &GoldenTable::REFERENCE);
+    let tables = or_all(&cli.reference_table, &GoldenTable::reference());
     if let Some(table) = tables.iter().find(|table| !table.is_reference()) {
         return Err(format!("{table} is not a reference table").into());
     }
@@ -4915,8 +4901,8 @@ fn report_settings(cli: &Cli, prepared: &[Prepared], compression: &[Json]) -> Js
         "rounds_ops": ROUNDS_OPS,
         "scan_page_rows": SCAN_PAGE_ROWS,
         "multi_scan_keys": MULTI_SCAN_KEYS,
-        "multi_scan_100_keys": MULTI_SCAN_100_KEYS,
-        "multi_scan_1000_keys": MULTI_SCAN_1000_KEYS,
+        "multi_scan_100_keys": SMALL_BATCH_KEYS,
+        "multi_scan_1000_keys": LARGE_BATCH_KEYS,
         "multi_scan_head_rows": MULTI_SCAN_HEAD_ROWS,
         "multi_scan_limit": multi_scan_whole_runs().limit,
         "tables": prepared.iter().map(Prepared::to_json).collect::<Vec<_>>(),
@@ -4937,8 +4923,30 @@ fn run_settings(cli: &Cli) -> RunSettings {
     }
 }
 
+/// Fails on a scenario whose name in the results is not its spelling on
+/// the command line, which `Scenario::traits` and `ReferenceScenario::name`
+/// keep equal to clap's by hand.
+fn check_scenario_names() -> BenchResult<()> {
+    let names = Scenario::value_variants()
+        .iter()
+        .map(|scenario| (scenario.name(), scenario.to_possible_value()))
+        .chain(
+            ReferenceScenario::value_variants()
+                .iter()
+                .map(|scenario| (scenario.name(), scenario.to_possible_value())),
+        );
+    for (name, value) in names {
+        let spelled = value.as_ref().map(clap::builder::PossibleValue::get_name);
+        if spelled != Some(name) {
+            return Err(format!("scenario {name} is {spelled:?} on the command line").into());
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> BenchResult<()> {
+    check_scenario_names()?;
     let cli = Cli::parse();
     set_serving(&cli);
     ROW_GROUP_ROWS

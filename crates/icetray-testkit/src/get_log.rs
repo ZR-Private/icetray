@@ -24,7 +24,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::{BoxStream, Stream, StreamExt as _};
 use icetray_core::approx;
-use icetray_core::time::micros;
+use icetray_core::time::{from_micros, micros};
 use object_store::path::Path;
 use object_store::{
     CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,
@@ -39,7 +39,7 @@ const UNSET: u64 = u64::MAX;
 /// flight.
 #[derive(Debug)]
 struct Slot {
-    /// `GetLog::name_of` the object's file name.
+    /// `GetLog::name_of_location` of the object.
     name: AtomicU64,
     /// The ranges the call asked for: one for a GET, any number for a
     /// ranged read of several.
@@ -91,7 +91,7 @@ impl Slot {
     fn read(&self) -> LoggedGet {
         let latency = |field: &AtomicU64| {
             let value = field.load(Ordering::Relaxed);
-            (value != UNSET).then(|| Duration::from_micros(value))
+            (value != UNSET).then(|| from_micros(value))
         };
         let (start, end) = (
             self.start.load(Ordering::Relaxed),
@@ -110,7 +110,7 @@ impl Slot {
 /// One GET as the log recorded it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LoggedGet {
-    /// `GetLog::name_of` the object's file name.
+    /// `GetLog::name_of_location` of the object.
     pub name: u64,
     /// The ranges the call asked for: one for a GET, more for a ranged
     /// read of several, which the log records as one call.
@@ -162,15 +162,12 @@ impl GetLog {
         }
     }
 
-    /// The GETs the log holds between restarts.
-    pub fn capacity(&self) -> usize {
-        self.slots.len()
-    }
-
-    /// The name a GET of an object whose file name is `file_name`, its
-    /// path's last segment, is logged under: a hash, so the GET allocates
-    /// nothing to name it, the same for every log of the process.
-    pub fn name_of(file_name: &str) -> u64 {
+    /// The name a GET of the object at `location` is logged under: a hash
+    /// of its file name, the last `/` segment, so a store's path and a
+    /// manifest's URI of one file name it alike, the GET allocates nothing
+    /// to name it, and every log of the process names it the same.
+    pub fn name_of_location(location: &str) -> u64 {
+        let file_name = location.rsplit('/').next().unwrap_or_default();
         let mut hasher = DefaultHasher::new();
         file_name.hash(&mut hasher);
         hasher.finish()
@@ -199,10 +196,7 @@ impl GetLog {
     fn claim(&self, location: &Path, parts: usize) -> Option<usize> {
         let at = self.next.fetch_add(1, Ordering::Relaxed);
         let slot = self.slots.get(at)?;
-        slot.claim(
-            Self::name_of(location.filename().unwrap_or_default()),
-            parts,
-        );
+        slot.claim(Self::name_of_location(location.as_ref()), parts);
         Some(at)
     }
 }
@@ -365,7 +359,12 @@ mod tests {
         let records = log.records();
         assert_eq!(records.len(), 1);
         let get = &records[0];
-        assert_eq!(get.name, GetLog::name_of(FILE_NAME));
+        assert_eq!(get.name, GetLog::name_of_location(FILE_NAME));
+        assert_eq!(
+            GetLog::name_of_location(&format!("s3://bucket/{OBJECT}")),
+            get.name,
+            "a URI of the file names it as the store's path does"
+        );
         assert_eq!((get.parts, get.range.clone()), (1, Some(INNER_RANGE)));
         assert_eq!(get.bytes(), INNER_RANGE.end - INNER_RANGE.start);
         let (Some(first), Some(last)) = (get.first_byte, get.last_byte) else {
@@ -406,7 +405,7 @@ mod tests {
         let missing = Path::from("data/absent.parquet");
         assert!(log.get(&missing).await.is_err());
         let refused = &log.records()[0];
-        assert_eq!(refused.name, GetLog::name_of("absent.parquet"));
+        assert_eq!(refused.name, GetLog::name_of_location("absent.parquet"));
         assert_eq!((refused.range.clone(), refused.first_byte), (None, None));
         assert_eq!(refused.bytes(), 0);
     }

@@ -18,9 +18,7 @@ use icetray_core::config::{
     Config, RewriteRule, ServerConfig, SourceConfig, StorageConfig, TableConfig,
 };
 use icetray_core::key::HEX_DIGITS_PER_BYTE;
-use icetray_core::{
-    Generation, Key, KeyType, OrderValue, Residency, ScanRow, Scanned, Storage, next_bound,
-};
+use icetray_core::{Generation, Key, KeyType, OrderValue, Residency, Scanned, Storage};
 use sha2::digest::OutputSizeUser;
 use sha2::digest::typenum::Unsigned as _;
 use sha2::{Digest as _, Sha256};
@@ -28,7 +26,7 @@ use sha2::{Digest as _, Sha256};
 use crate::error::{Precondition, Result, required_var};
 use crate::keys::{key_at, key_at_padded};
 use crate::layout::{KEY_COLUMN, VALUE_COLUMN};
-use crate::ordered::{ORDER_COLUMN, OrderKind, TestScan, scan_model};
+use crate::ordered::{ORDER_COLUMN, OrderKind, TestScan, middle_half, scan_model, scanned_of};
 
 /// The environment variable naming the warehouse the recipe wrote into: an
 /// `s3a://` or `file://` location whose `db/` holds the tables.
@@ -218,8 +216,9 @@ const APPEND_TAIL_DIVISOR: u64 = 5;
 pub const APPEND_BATCHES: u64 = 4;
 
 /// The recipe's `TS_START`: 2026-01-01T00:00:00Z in microseconds, the
-/// earliest instant of a reference table.
-const TS_START: i64 = 1_767_225_600_000_000;
+/// earliest instant of a reference table, where the benchmark's tables of
+/// timestamps start too.
+pub const TS_START: i64 = 1_767_225_600_000_000;
 
 /// The recipe's `TS_STEP`: the microseconds per row index, and the bound
 /// of a row's jitter, so a key's instants strictly increase.
@@ -341,177 +340,211 @@ impl GoldenTable {
         Self::RefLargeFiles,
     ];
 
-    /// Every table the recipe's `ordered` group writes.
-    pub const ORDERED: [Self; 8] = [
-        Self::OrderedCompacted100k,
-        Self::OrderedRolled100k,
-        Self::OrderedAppended100k,
-        Self::OrderedOverlap100k,
-        Self::OrderedMergeV2_100k,
-        Self::OrderedMergeV3_100k,
-        Self::OrderedMergeV3Compacted100k,
-        Self::OrderedString100k,
-    ];
+    /// What the recipe writes the table as: every fact a test reads of it,
+    /// one arm per table.
+    pub const fn spec(self) -> GoldenSpec {
+        use GoldenSpec as Spec;
+        use KeyType::{Binary, Long};
+        let (long, string) = (OrderKind::Long, OrderKind::Str);
+        match self {
+            Self::Long2m => Spec::kv("long_2m", Long, FOUR_BUCKETS, ROWS_2M),
+            Self::Str2m => Spec::kv("str_2m", KeyType::String, FOUR_BUCKETS, ROWS_2M),
+            Self::Bin16_500k => Spec::kv("bin16_500k", Binary, FOUR_BUCKETS, ROWS_500K),
+            Self::LongWide250k => Spec::kv("long_wide_250k", Long, TWO_BUCKETS, ROWS_250K),
+            Self::LongV3_50k => Spec::kv("long_v3_50k", Long, FOUR_BUCKETS, ROWS_50K),
+            Self::DefaultLayout1m => Spec::kv("default_layout_1m", Long, FOUR_BUCKETS, ROWS_1M),
+            Self::Unpartitioned500k => {
+                Spec::kv("unpartitioned_500k", Long, UNPARTITIONED, ROWS_500K)
+            }
+            Self::Overlap250k => Spec::kv("overlap_250k", Long, TWO_BUCKETS, ROWS_250K),
+            Self::LongMorV2_100k => Spec::mor("long_mor_v2_100k"),
+            Self::LongMorV3_100k => Spec::mor("long_mor_v3_100k"),
+            Self::LongMorV2Compacted100k => Spec::mor("long_mor_v2_compacted_100k"),
+            Self::LongMorV3Compacted100k => Spec::mor("long_mor_v3_compacted_100k"),
+            Self::OrderedCompacted100k => Spec::ordered("ordered_compacted_100k", long),
+            Self::OrderedRolled100k => Spec::ordered("ordered_rolled_100k", long),
+            Self::OrderedAppended100k => Spec::ordered("ordered_appended_100k", long).appended(),
+            Self::OrderedOverlap100k => Spec::ordered("ordered_overlap_100k", long).permuted(),
+            Self::OrderedMergeV2_100k => Spec::ordered("ordered_merge_v2_100k", long).merged(),
+            Self::OrderedMergeV3_100k => Spec::ordered("ordered_merge_v3_100k", long).merged(),
+            Self::OrderedMergeV3Compacted100k => {
+                Spec::ordered("ordered_merge_v3_compacted_100k", long).merged()
+            }
+            Self::OrderedString100k => Spec::ordered("ordered_string_100k", string),
+            Self::RefCompacted => Spec::reference("ref_compacted", long),
+            Self::RefAppended => Spec::reference("ref_appended", long),
+            Self::RefString => Spec::reference("ref_string", string),
+            Self::RefLargeFiles => Spec::reference("ref_large_files", long),
+        }
+    }
+
+    /// Every table the recipe's `ordered` group writes: the ordered tables
+    /// outside the `reference` group.
+    pub fn ordered() -> Vec<Self> {
+        Self::ALL
+            .into_iter()
+            .filter(|table| table.spec().order.is_some_and(|order| !order.reference))
+            .collect()
+    }
 
     /// Every table the recipe's `reference` group writes.
-    pub const REFERENCE: [Self; 4] = [
-        Self::RefCompacted,
-        Self::RefAppended,
-        Self::RefString,
-        Self::RefLargeFiles,
-    ];
+    pub fn reference() -> Vec<Self> {
+        Self::ALL
+            .into_iter()
+            .filter(|table| table.is_reference())
+            .collect()
+    }
 
     /// Whether the recipe's `reference` group writes the table.
-    pub fn is_reference(self) -> bool {
-        Self::REFERENCE.contains(&self)
+    pub const fn is_reference(self) -> bool {
+        matches!(
+            self.spec().order,
+            Some(OrderedRecipe {
+                reference: true,
+                ..
+            })
+        )
     }
 
     /// The order column's type, or `None` for a key-value table.
     pub fn order_kind(self) -> Option<OrderKind> {
-        match self {
-            Self::OrderedCompacted100k
-            | Self::OrderedRolled100k
-            | Self::OrderedAppended100k
-            | Self::OrderedOverlap100k
-            | Self::OrderedMergeV2_100k
-            | Self::OrderedMergeV3_100k
-            | Self::OrderedMergeV3Compacted100k
-            | Self::RefCompacted
-            | Self::RefAppended
-            | Self::RefLargeFiles => Some(OrderKind::Long),
-            Self::OrderedString100k | Self::RefString => Some(OrderKind::Str),
-            Self::Long2m
-            | Self::Str2m
-            | Self::Bin16_500k
-            | Self::LongWide250k
-            | Self::LongV3_50k
-            | Self::DefaultLayout1m
-            | Self::Unpartitioned500k
-            | Self::Overlap250k
-            | Self::LongMorV2_100k
-            | Self::LongMorV3_100k
-            | Self::LongMorV2Compacted100k
-            | Self::LongMorV3Compacted100k => None,
-        }
+        self.spec().order.map(|order| order.kind)
     }
 
-    /// The Iceberg type of the table's key column.
-    pub fn key_type(self) -> KeyType {
-        match self {
-            Self::Long2m
-            | Self::LongWide250k
-            | Self::LongV3_50k
-            | Self::DefaultLayout1m
-            | Self::Unpartitioned500k
-            | Self::Overlap250k
-            | Self::LongMorV2_100k
-            | Self::LongMorV3_100k
-            | Self::LongMorV2Compacted100k
-            | Self::LongMorV3Compacted100k
-            | Self::OrderedCompacted100k
-            | Self::OrderedRolled100k
-            | Self::OrderedAppended100k
-            | Self::OrderedOverlap100k
-            | Self::OrderedMergeV2_100k
-            | Self::OrderedMergeV3_100k
-            | Self::OrderedMergeV3Compacted100k
-            | Self::OrderedString100k
-            | Self::RefCompacted
-            | Self::RefAppended
-            | Self::RefString
-            | Self::RefLargeFiles => KeyType::Long,
-            Self::Str2m => KeyType::String,
-            Self::Bin16_500k => KeyType::Binary,
-        }
+    /// The recipe of an ordered table.
+    ///
+    /// Panics on a key-value table.
+    fn recipe(self) -> OrderedRecipe {
+        self.spec()
+            .order
+            .unwrap_or_else(|| panic!("{self} is not an ordered table"))
     }
+}
 
+/// What the recipe writes one golden table as (`GoldenTable::spec`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GoldenSpec {
+    /// The table name the recipe writes it under, its Display.
+    pub name: &'static str,
+    /// The Iceberg type of the key column.
+    pub key_type: KeyType,
     /// The bucket count the table was created with; zero is unpartitioned.
-    pub fn buckets(self) -> u32 {
-        match self {
-            Self::Long2m
-            | Self::Str2m
-            | Self::Bin16_500k
-            | Self::LongV3_50k
-            | Self::DefaultLayout1m
-            | Self::LongMorV2_100k
-            | Self::LongMorV3_100k
-            | Self::LongMorV2Compacted100k
-            | Self::LongMorV3Compacted100k
-            | Self::OrderedCompacted100k
-            | Self::OrderedRolled100k
-            | Self::OrderedAppended100k
-            | Self::OrderedMergeV2_100k
-            | Self::OrderedMergeV3_100k
-            | Self::OrderedMergeV3Compacted100k
-            | Self::OrderedString100k => FOUR_BUCKETS,
-            Self::LongWide250k | Self::Overlap250k | Self::OrderedOverlap100k => TWO_BUCKETS,
-            Self::Unpartitioned500k => UNPARTITIONED,
-            Self::RefCompacted | Self::RefAppended | Self::RefString | Self::RefLargeFiles => {
-                REFERENCE_BUCKETS
-            }
-        }
-    }
-
+    pub buckets: u32,
     /// The rows the recipe filled the table with, before any change; for a
     /// reference table, every row its writes hold at the full size,
     /// `REFERENCE_KEYS`. A reference table written with `--reference-keys`
     /// holds `reference_rows` of the count it records under
     /// `REFERENCE_KEYS_PROPERTY`, which a test reads from the table.
-    pub fn rows(self) -> u64 {
-        match self {
-            Self::Long2m | Self::Str2m => ROWS_2M,
-            Self::DefaultLayout1m => ROWS_1M,
-            Self::Bin16_500k | Self::Unpartitioned500k => ROWS_500K,
-            Self::LongWide250k | Self::Overlap250k => ROWS_250K,
-            Self::LongV3_50k => ROWS_50K,
-            Self::LongMorV2_100k
-            | Self::LongMorV3_100k
-            | Self::LongMorV2Compacted100k
-            | Self::LongMorV3Compacted100k
-            | Self::OrderedCompacted100k
-            | Self::OrderedRolled100k
-            | Self::OrderedAppended100k
-            | Self::OrderedOverlap100k
-            | Self::OrderedMergeV2_100k
-            | Self::OrderedMergeV3_100k
-            | Self::OrderedMergeV3Compacted100k
-            | Self::OrderedString100k => ROWS_100K,
-            Self::RefCompacted | Self::RefAppended | Self::RefString | Self::RefLargeFiles => {
-                REFERENCE_ROWS
-            }
+    pub rows: u64,
+    /// How an ordered table's rows are written; `None` for a key-value
+    /// table.
+    pub order: Option<OrderedRecipe>,
+}
+
+/// How the recipe writes an ordered golden table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OrderedRecipe {
+    /// The order column's type.
+    pub kind: OrderKind,
+    /// The key of each key index.
+    pub key: KeyExpr,
+    /// Whether the recipe ends in a MERGE over `MERGE_KEY_IDS`.
+    pub merged: bool,
+    /// Whether `APPEND_ROWS_PER_KEY` more rows follow every key's first
+    /// fill, at later order values.
+    pub appended: bool,
+    /// Whether the recipe's `reference` group writes the table: its keys'
+    /// rows are `reference_rows_of` rows at `reference_ts`.
+    pub reference: bool,
+}
+
+/// The recipe's key expression of an ordered table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyExpr {
+    /// `LONG_KEY` of the key index (`long_key`).
+    Long,
+    /// `PERMUTED_KEY` of the key index (`permuted_key`).
+    Permuted,
+}
+
+impl GoldenSpec {
+    /// A key-value table.
+    const fn kv(name: &'static str, key_type: KeyType, buckets: u32, rows: u64) -> Self {
+        Self {
+            name,
+            key_type,
+            buckets,
+            rows,
+            order: None,
         }
+    }
+
+    /// A merge-on-read table: `ROWS_100K` rows of long keys in four
+    /// buckets before its changes.
+    const fn mor(name: &'static str) -> Self {
+        Self::kv(name, KeyType::Long, FOUR_BUCKETS, ROWS_100K)
+    }
+
+    /// An ordered table of the `ordered` group: `ROWS_100K` rows of
+    /// `LONG_KEY` keys in four buckets, neither appended nor merged.
+    const fn ordered(name: &'static str, kind: OrderKind) -> Self {
+        Self {
+            order: Some(OrderedRecipe {
+                kind,
+                key: KeyExpr::Long,
+                merged: false,
+                appended: false,
+                reference: false,
+            }),
+            ..Self::kv(name, KeyType::Long, FOUR_BUCKETS, ROWS_100K)
+        }
+    }
+
+    /// A table of the `reference` group, of long keys in
+    /// `REFERENCE_BUCKETS` buckets.
+    const fn reference(name: &'static str, kind: OrderKind) -> Self {
+        Self {
+            order: Some(OrderedRecipe {
+                kind,
+                key: KeyExpr::Long,
+                merged: false,
+                appended: false,
+                reference: true,
+            }),
+            ..Self::kv(name, KeyType::Long, REFERENCE_BUCKETS, REFERENCE_ROWS)
+        }
+    }
+
+    /// This ordered table of `PERMUTED_KEY` keys in two buckets, written
+    /// with skew splitting on.
+    const fn permuted(mut self) -> Self {
+        self.buckets = TWO_BUCKETS;
+        if let Some(order) = &mut self.order {
+            order.key = KeyExpr::Permuted;
+        }
+        self
+    }
+
+    /// This ordered table with `APPEND_ROWS_PER_KEY` rows appended per key.
+    const fn appended(mut self) -> Self {
+        if let Some(order) = &mut self.order {
+            order.appended = true;
+        }
+        self
+    }
+
+    /// This ordered table ending in the recipe's MERGE.
+    const fn merged(mut self) -> Self {
+        if let Some(order) = &mut self.order {
+            order.merged = true;
+        }
+        self
     }
 }
 
 impl fmt::Display for GoldenTable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let name = match self {
-            Self::Long2m => "long_2m",
-            Self::Str2m => "str_2m",
-            Self::Bin16_500k => "bin16_500k",
-            Self::LongWide250k => "long_wide_250k",
-            Self::LongV3_50k => "long_v3_50k",
-            Self::DefaultLayout1m => "default_layout_1m",
-            Self::Unpartitioned500k => "unpartitioned_500k",
-            Self::Overlap250k => "overlap_250k",
-            Self::LongMorV2_100k => "long_mor_v2_100k",
-            Self::LongMorV3_100k => "long_mor_v3_100k",
-            Self::LongMorV2Compacted100k => "long_mor_v2_compacted_100k",
-            Self::LongMorV3Compacted100k => "long_mor_v3_compacted_100k",
-            Self::OrderedCompacted100k => "ordered_compacted_100k",
-            Self::OrderedRolled100k => "ordered_rolled_100k",
-            Self::OrderedAppended100k => "ordered_appended_100k",
-            Self::OrderedOverlap100k => "ordered_overlap_100k",
-            Self::OrderedMergeV2_100k => "ordered_merge_v2_100k",
-            Self::OrderedMergeV3_100k => "ordered_merge_v3_100k",
-            Self::OrderedMergeV3Compacted100k => "ordered_merge_v3_compacted_100k",
-            Self::OrderedString100k => "ordered_string_100k",
-            Self::RefCompacted => "ref_compacted",
-            Self::RefAppended => "ref_appended",
-            Self::RefString => "ref_string",
-            Self::RefLargeFiles => "ref_large_files",
-        };
-        f.write_str(name)
+        f.write_str(self.spec().name)
     }
 }
 
@@ -561,7 +594,7 @@ impl Warehouse {
 /// The rules of `text`, `FROM=TO` rules separated by
 /// `REWRITE_LIST_SEPARATOR`, in order; an empty entry, as a trailing
 /// separator leaves, is skipped.
-pub fn rewrite_rules(text: &str) -> Result<Vec<RewriteRule>> {
+fn rewrite_rules(text: &str) -> Result<Vec<RewriteRule>> {
     text.split(REWRITE_LIST_SEPARATOR)
         .filter(|rule| !rule.is_empty())
         .map(|rule| {
@@ -694,65 +727,13 @@ fn order_at(index: u64) -> i64 {
     ORDER_START + i64::try_from(index).expect("row indexes are small") * ORDER_STEP
 }
 
-/// Whether `table`'s recipe ends in a MERGE over `MERGE_KEY_IDS`.
-fn is_merged(table: GoldenTable) -> bool {
-    match table {
-        GoldenTable::OrderedMergeV2_100k
-        | GoldenTable::OrderedMergeV3_100k
-        | GoldenTable::OrderedMergeV3Compacted100k => true,
-        GoldenTable::Long2m
-        | GoldenTable::Str2m
-        | GoldenTable::Bin16_500k
-        | GoldenTable::LongWide250k
-        | GoldenTable::LongV3_50k
-        | GoldenTable::DefaultLayout1m
-        | GoldenTable::Unpartitioned500k
-        | GoldenTable::Overlap250k
-        | GoldenTable::LongMorV2_100k
-        | GoldenTable::LongMorV3_100k
-        | GoldenTable::LongMorV2Compacted100k
-        | GoldenTable::LongMorV3Compacted100k
-        | GoldenTable::OrderedCompacted100k
-        | GoldenTable::OrderedRolled100k
-        | GoldenTable::OrderedAppended100k
-        | GoldenTable::OrderedOverlap100k
-        | GoldenTable::OrderedString100k
-        | GoldenTable::RefCompacted
-        | GoldenTable::RefAppended
-        | GoldenTable::RefString
-        | GoldenTable::RefLargeFiles => false,
-    }
-}
-
 /// The key of key index `id` in an ordered golden table: the recipe's
 /// `ordered_exprs` key, `LONG_KEY` of the index or, in the overlap table,
 /// `PERMUTED_KEY` of it.
 pub fn ordered_key(table: GoldenTable, id: u64) -> Key {
-    match table {
-        GoldenTable::OrderedOverlap100k => permuted_key(id),
-        GoldenTable::OrderedCompacted100k
-        | GoldenTable::OrderedRolled100k
-        | GoldenTable::OrderedAppended100k
-        | GoldenTable::OrderedMergeV2_100k
-        | GoldenTable::OrderedMergeV3_100k
-        | GoldenTable::OrderedMergeV3Compacted100k
-        | GoldenTable::OrderedString100k
-        | GoldenTable::RefCompacted
-        | GoldenTable::RefAppended
-        | GoldenTable::RefString
-        | GoldenTable::RefLargeFiles => long_key(id),
-        GoldenTable::Long2m
-        | GoldenTable::Str2m
-        | GoldenTable::Bin16_500k
-        | GoldenTable::LongWide250k
-        | GoldenTable::LongV3_50k
-        | GoldenTable::DefaultLayout1m
-        | GoldenTable::Unpartitioned500k
-        | GoldenTable::Overlap250k
-        | GoldenTable::LongMorV2_100k
-        | GoldenTable::LongMorV3_100k
-        | GoldenTable::LongMorV2Compacted100k
-        | GoldenTable::LongMorV3Compacted100k => panic!("{table} is not an ordered table"),
+    match table.recipe().key {
+        KeyExpr::Long => long_key(id),
+        KeyExpr::Permuted => permuted_key(id),
     }
 }
 
@@ -764,7 +745,8 @@ pub fn ordered_key(table: GoldenTable, id: u64) -> Key {
 /// `MERGE_KEY_IDS`, the matched rows at `MOR_UPDATE_VERSION` and the
 /// inserted ones between.
 pub fn ordered_rows(table: GoldenTable, id: u64) -> Vec<OrderedRow> {
-    if table.is_reference() {
+    let recipe = table.recipe();
+    if recipe.reference {
         return (0..reference_rows_of(id))
             .map(|index| OrderedRow {
                 order: reference_ts(id, index),
@@ -772,12 +754,12 @@ pub fn ordered_rows(table: GoldenTable, id: u64) -> Vec<OrderedRow> {
             })
             .collect();
     }
-    let appended = if table == GoldenTable::OrderedAppended100k {
+    let appended = if recipe.appended {
         APPEND_ROWS_PER_KEY
     } else {
         0
     };
-    let merged = is_merged(table) && MERGE_KEY_IDS.contains(&id);
+    let merged = recipe.merged && MERGE_KEY_IDS.contains(&id);
     let mut rows = Vec::new();
     for index in 0..ORDERED_ROWS_PER_KEY + appended {
         let updated = merged && index % MERGE_UPDATE_EVERY == 0;
@@ -952,11 +934,11 @@ pub fn reference_sample(keys: u64, extra: &BTreeSet<u64>) -> BTreeSet<u64> {
 }
 
 /// The bounds of a reference Scan's window over a key holding `rows`,
-/// ascending, as raw order values: from its row a quarter in to past its
-/// row three quarters in, both included, `start` and `before`.
+/// ascending, as raw order values: over the run's `middle_half`, both its
+/// edge rows included, `start` and `before`.
 pub fn reference_window(rows: &[OrderedRow]) -> (i64, i64) {
-    let at = |index: usize| rows[index].order;
-    (at(rows.len() / 4), at(rows.len() * 3 / 4) + 1)
+    let half = middle_half(rows.len());
+    (rows[*half.start()].order, rows[*half.end()].order + 1)
 }
 
 /// What a Scan of key index `id` of `table` answers under `scan`, from the
@@ -970,19 +952,15 @@ pub fn derived_scan(
     scan: &TestScan,
 ) -> (Scanned, Option<i64>) {
     let live = rows.iter().map(|row| (row.order, row.version));
-    let (answer, next) = scan_model(live, scan);
-    let scanned = Scanned {
-        rows: answer
-            .into_iter()
-            .map(|(order, version)| ScanRow {
-                order: ordered_order_value(table, id, order),
-                values: vec![Some(Bytes::from(ordered_value(table, id, order, version)))],
-            })
-            .collect(),
-        next: next
-            .and_then(|last| next_bound(&ordered_order_value(table, id, last), scan.direction)),
-    };
-    (scanned, next)
+    let answer = scan_model(live, scan);
+    let last = answer.1;
+    let scanned = scanned_of(
+        answer,
+        scan,
+        |order| ordered_order_value(table, id, order),
+        |order, version| vec![Some(Bytes::from(ordered_value(table, id, order, version)))],
+    );
+    (scanned, last)
 }
 
 /// The table metadata of the snapshot `generation` serves, read through
@@ -1043,7 +1021,7 @@ pub fn reference_ts(id: u64, index: u64) -> i64 {
 /// The instant `micros` microseconds after the epoch as the recipe's
 /// `ISO_INSTANT`: fixed-width ISO-8601 UTC text, which sorts as the
 /// instants do.
-pub fn iso_instant(micros: i64) -> String {
+fn iso_instant(micros: i64) -> String {
     jiff::Timestamp::from_microsecond(micros)
         .expect("a reference instant is within jiff's range")
         .strftime(ISO_INSTANT)
@@ -1094,44 +1072,7 @@ mod tests {
     use crate::keys::{STRING_KEY_FIXED_BYTES, STRING_PAD};
     use icetray_core::approx::count;
     use icetray_core::config::RewriteTextFault;
-    use icetray_core::{ColumnRead, FILE_PREFIX, FindingLog, Row};
-
-    /// Every table, beside the name the recipe writes it under.
-    const NAMES: [(GoldenTable, &str); 24] = [
-        (GoldenTable::Long2m, "long_2m"),
-        (GoldenTable::Str2m, "str_2m"),
-        (GoldenTable::Bin16_500k, "bin16_500k"),
-        (GoldenTable::LongWide250k, "long_wide_250k"),
-        (GoldenTable::LongV3_50k, "long_v3_50k"),
-        (GoldenTable::DefaultLayout1m, "default_layout_1m"),
-        (GoldenTable::Unpartitioned500k, "unpartitioned_500k"),
-        (GoldenTable::Overlap250k, "overlap_250k"),
-        (GoldenTable::LongMorV2_100k, "long_mor_v2_100k"),
-        (GoldenTable::LongMorV3_100k, "long_mor_v3_100k"),
-        (
-            GoldenTable::LongMorV2Compacted100k,
-            "long_mor_v2_compacted_100k",
-        ),
-        (
-            GoldenTable::LongMorV3Compacted100k,
-            "long_mor_v3_compacted_100k",
-        ),
-        (GoldenTable::OrderedCompacted100k, "ordered_compacted_100k"),
-        (GoldenTable::OrderedRolled100k, "ordered_rolled_100k"),
-        (GoldenTable::OrderedAppended100k, "ordered_appended_100k"),
-        (GoldenTable::OrderedOverlap100k, "ordered_overlap_100k"),
-        (GoldenTable::OrderedMergeV2_100k, "ordered_merge_v2_100k"),
-        (GoldenTable::OrderedMergeV3_100k, "ordered_merge_v3_100k"),
-        (
-            GoldenTable::OrderedMergeV3Compacted100k,
-            "ordered_merge_v3_compacted_100k",
-        ),
-        (GoldenTable::OrderedString100k, "ordered_string_100k"),
-        (GoldenTable::RefCompacted, "ref_compacted"),
-        (GoldenTable::RefAppended, "ref_appended"),
-        (GoldenTable::RefString, "ref_string"),
-        (GoldenTable::RefLargeFiles, "ref_large_files"),
-    ];
+    use icetray_core::{ColumnRead, FILE_PREFIX, FindingLog, Row, ScanRow, next_bound};
 
     /// Ids the permutation is checked over: small next to the modulus, so
     /// the recipe's bijection claim holds.
@@ -1144,11 +1085,30 @@ mod tests {
     const SHA256_OF_ZERO: &str = "5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9";
 
     #[test]
-    fn test_fmt_golden_table_matches_the_recipe() {
-        for (table, name) in NAMES {
-            assert_eq!(table.to_string(), name);
+    fn test_ordered_and_reference_are_the_recipe_s_groups() {
+        let ordered = GoldenTable::ordered();
+        let reference = GoldenTable::reference();
+        assert_eq!(ordered.len(), 8);
+        assert_eq!(reference.len(), 4);
+        assert!(
+            ordered
+                .iter()
+                .all(|table| table.to_string().starts_with("ordered_"))
+        );
+        assert!(
+            reference
+                .iter()
+                .all(|table| table.to_string().starts_with("ref_"))
+        );
+        for table in GoldenTable::ALL {
+            let spec = table.spec();
+            assert_eq!(spec.name, table.to_string());
+            assert_eq!(
+                spec.order.is_some(),
+                ordered.contains(&table) || reference.contains(&table),
+                "{table}"
+            );
         }
-        assert_eq!(NAMES.map(|(table, _)| table), GoldenTable::ALL);
     }
 
     #[test]
@@ -1390,7 +1350,8 @@ mod tests {
     #[test]
     fn test_ordered_rows_are_ascending_and_follow_the_recipe_commands() {
         let rows_per_key = usize::try_from(ORDERED_ROWS_PER_KEY).unwrap();
-        for table in GoldenTable::ORDERED {
+        for table in GoldenTable::ordered() {
+            let recipe = table.recipe();
             for id in [UNMERGED_ID, MERGED_ID] {
                 let rows = ordered_rows(table, id);
                 assert!(
@@ -1399,7 +1360,7 @@ mod tests {
                 );
                 let first = rows.iter().filter(|row| row.version == MOR_FIRST_VERSION);
                 let updated = rows.iter().filter(|row| row.version == MOR_UPDATE_VERSION);
-                let merged = is_merged(table) && id == MERGED_ID;
+                let merged = recipe.merged && id == MERGED_ID;
                 let appended = usize::try_from(APPEND_ROWS_PER_KEY).unwrap();
                 if merged {
                     let matched = rows_per_key / usize::try_from(MERGE_UPDATE_EVERY).unwrap();
@@ -1409,7 +1370,7 @@ mod tests {
                     assert_eq!(rows.len(), rows_per_key + inserted, "{table}");
                 } else {
                     assert_eq!(updated.count(), 0, "{table} {id}");
-                    let expected = if table == GoldenTable::OrderedAppended100k {
+                    let expected = if recipe.appended {
                         rows_per_key + appended
                     } else {
                         rows_per_key
@@ -1468,7 +1429,7 @@ mod tests {
 
     #[test]
     fn test_table_config_names_the_order_column_of_an_ordered_table_only() {
-        for table in GoldenTable::ORDERED {
+        for table in GoldenTable::ordered() {
             let config = table_config("file:///w", table, false);
             assert_eq!(config.order_column.as_deref(), Some(ORDER_COLUMN));
         }
@@ -1552,6 +1513,8 @@ mod tests {
     #[test]
     fn test_iso_instant_is_fixed_width_utc_text_that_sorts_as_the_instants() {
         assert_eq!(iso_instant(TS_START), "2026-01-01T00:00:00.000000Z");
+        let new_year: jiff::Timestamp = "2026-01-01T00:00:00Z".parse().unwrap();
+        assert_eq!(new_year.as_microsecond(), TS_START);
         let pinned = reference_ts(PINNED_ID, PINNED_INDEX);
         assert_eq!(iso_instant(pinned), "2026-01-01T00:00:03.731419Z");
         let id = REFERENCE_HEAVIEST_IDS[0];
@@ -1628,7 +1591,18 @@ mod tests {
             .iter()
             .filter(|&&id| HEAVY_ROWS.contains(&reference_rows_of(id)))
             .count();
-        assert_eq!((sample.len(), heavy), (19, 8));
+        let tier_keys = RowsTier::ALL.len() * REFERENCE_TIER_SAMPLES;
+        let last_key = 1;
+        assert_eq!(
+            sample.len(),
+            tier_keys + REFERENCE_HEAVIEST_IDS.len() + last_key,
+            "each append shape's first key, 4, 1, and 0, is a tier key"
+        );
+        assert_eq!(
+            heavy,
+            REFERENCE_TIER_SAMPLES + REFERENCE_HEAVIEST_IDS.len(),
+            "the heaviest keys are heavy and the last key is not"
+        );
         let edge = BTreeSet::from([REFERENCE_KEYS / 2]);
         let with_edge = reference_sample(REFERENCE_KEYS, &edge);
         assert_eq!(with_edge, &sample | &edge, "the extra keys join the sample");
@@ -1643,7 +1617,11 @@ mod tests {
             .iter()
             .filter(|row| (start..before).contains(&row.order))
             .count();
-        assert_eq!(inside, rows.len() * 3 / 4 - rows.len() / 4 + 1);
+        assert_eq!(
+            (rows.len(), inside),
+            (9_998, 5_000),
+            "rows 2,499 to 7,498 of the heaviest key"
+        );
         let light = ordered_rows(GoldenTable::RefCompacted, PINNED_ID);
         let (start, before) = reference_window(&light[..1]);
         assert_eq!((start, before), (light[0].order, light[0].order + 1));
@@ -1698,7 +1676,7 @@ mod tests {
 
     #[test]
     fn test_ordered_rows_of_a_reference_table_are_its_instants() {
-        for table in GoldenTable::REFERENCE {
+        for table in GoldenTable::reference() {
             let rows = ordered_rows(table, PINNED_ID);
             assert_eq!(count(rows.len()), reference_rows_of(PINNED_ID), "{table}");
             assert_eq!(
@@ -1707,7 +1685,7 @@ mod tests {
             );
             assert!(rows.iter().all(|row| row.version == MOR_FIRST_VERSION));
             assert_eq!(ordered_key(table, PINNED_ID), long_key(PINNED_ID));
-            assert!(table.is_reference() && !GoldenTable::ORDERED.contains(&table));
+            assert!(table.is_reference() && !GoldenTable::ordered().contains(&table));
         }
     }
 }
