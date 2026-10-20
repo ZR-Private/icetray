@@ -14,9 +14,32 @@
 //! or `MultiScan` response is measured as the message that would be sent,
 //! and one above `server.max_scan_bytes` is refused with no rows
 //! (`scan_within_bound`, `multi_scan_within_bound`).
-//! A call of the wrong kind for its table is `INVALID_ARGUMENT`, decided
-//! before the table's readiness and before its request is read
-//! (`table_serving`).
+//!
+//! `Get`, `MultiGet`, `Scan`, and `MultiScan` check a request in one order,
+//! each step as far as it applies to the call, and answer the first fault
+//! found:
+//!
+//! 1. The request on its own, whatever its table: a missing key, an unset
+//!    direction, a bound with no variant, a `start` at or above a `before`
+//!    of its variant, a column named twice, and a field list with a number
+//!    out of range or named twice (`INVALID_ARGUMENT`).
+//! 2. The table's configuration, which needs no generation: a table not
+//!    served (`NOT_FOUND`), a call of the wrong kind, a limit of 0 or above
+//!    `max_scan_rows`, whose fault names that bound, and a `MultiGet`'s or
+//!    `MultiScan`'s values (`INVALID_ARGUMENT`).
+//! 3. An in-flight slot (`RESOURCE_EXHAUSTED`).
+//! 4. The table's readiness (`UNAVAILABLE`).
+//! 5. The serving generation: a key of another variant than the key type,
+//!    a bound of another than the order type's, and a column the table
+//!    does not serve or a field list on one not protobuf
+//!    (`INVALID_ARGUMENT`).
+//!
+//! So a request whose fault needs no generation is refused for it while
+//! the table loads, never `UNAVAILABLE`, which a caller retries, and holds
+//! no slot. Steps 1 and 2 run core's checks (`check_column_reads`,
+//! `check_scan_request`, `Table::check_kind`, `Table::check_scan`,
+//! `Table::check_multi_scan`), the ones its lookups run first, so a request
+//! that passes them here passes them there.
 
 use std::fmt;
 use std::sync::Arc;
@@ -30,7 +53,7 @@ use icetray_core::{
     BoundSide, CacheError, ColumnRead, Direction, Error, Fits, Key, KeyType, MultiScanLookup,
     Opened, OrderType, OrderValue, Oversize, Row, ScanBounds, ScanLookup, ScanReceipt, ScanRow,
     Scanned, Table, TableConfig, TableKind, TableLayout, Tables, ValueFormat, ValueType, approx,
-    next_bound,
+    check_column_reads, check_scan_request, next_bound,
 };
 use icetray_proto::v1;
 use icetray_proto::v1::icetray_server::Icetray;
@@ -148,24 +171,13 @@ fn table<'a>(tables: &'a Tables, name: &str) -> Result<&'a Arc<Table>, Status> {
         .ok_or_else(|| Status::not_found(format!("table {name} is not served")))
 }
 
-/// The table `tables` serves under `name`, as `table` finds it, and of the
-/// kind the call serves: a table of the other kind is `INVALID_ARGUMENT`
-/// whether or not it has loaded, so a call made to the wrong kind of table
-/// is never answered `UNAVAILABLE`, which a caller retries, and is refused
-/// before the call reads its key, direction, or bounds off the wire. The
-/// table's key type is read after that check, so a table that has not
-/// loaded is `UNAVAILABLE` only to a call of its own kind.
-fn table_serving<'a>(
-    tables: &'a Tables,
-    name: &str,
-    served: TableKind,
-) -> Result<(&'a Arc<Table>, KeyType), Status> {
-    let table = table(tables, name)?;
-    table
-        .check_kind(served)
-        .map_err(|error| status_from(&error))?;
-    let key_type = table.key_type().map_err(|error| status_from(&error))?;
-    Ok((table, key_type))
+/// The table's key type, which a call reads its keys off the wire under:
+/// `UNAVAILABLE`, which a caller retries, for a table that has not loaded.
+/// A call reads it only once its request has passed every check that needs
+/// no generation and the call holds a slot, so a request with a fault one
+/// of those checks finds is refused for it, never answered `UNAVAILABLE`.
+fn ready_key_type(table: &Table) -> Result<KeyType, Status> {
+    table.key_type().map_err(|error| status_from(&error))
 }
 
 /// A scan's response as measured against `server.max_scan_bytes`: sent, with
@@ -219,14 +231,17 @@ impl fmt::Display for WireVariant {
     }
 }
 
-/// A key from the wire under the table's key type (RFD 010): the variant
-/// must match the type, and `bin` on a uuid table must be `UUID_BYTES` long.
-/// A missing key or a `Key` with no variant is `Missing`; every other
-/// pairing is `VariantMismatch`.
-pub fn key_from_wire(key: Option<v1::Key>, key_type: KeyType) -> Result<Key, WireKeyFault> {
-    let Some(variant) = key.and_then(|key| key.key) else {
-        return Err(WireKeyFault::Missing);
-    };
+/// The variant a wire key carries: a missing key or a `Key` with no
+/// variant is `WireKeyFault::Missing`, a fault of the request whatever its
+/// table.
+pub fn key_variant(key: Option<v1::Key>) -> Result<v1::key::Key, WireKeyFault> {
+    key.and_then(|key| key.key).ok_or(WireKeyFault::Missing)
+}
+
+/// A key's variant from the wire under the table's key type (RFD 010): the
+/// variant must match the type, and `bin` on a uuid table must be
+/// `UUID_BYTES` long. Every other pairing is `VariantMismatch`.
+pub fn key_from_wire(variant: v1::key::Key, key_type: KeyType) -> Result<Key, WireKeyFault> {
     match (variant, key_type) {
         (v1::key::Key::Long(value), KeyType::Long) => Ok(Key::Long(value)),
         (v1::key::Key::Str(text), KeyType::String) => Ok(Key::Str(text)),
@@ -245,11 +260,21 @@ pub fn key_from_wire(key: Option<v1::Key>, key_type: KeyType) -> Result<Key, Wir
     }
 }
 
+/// A batch's key variants, each as `key_variant` reads one; the first
+/// fault ends the batch.
+fn key_variants(keys: Vec<v1::Key>) -> Result<Vec<v1::key::Key>, WireKeyFault> {
+    keys.into_iter().map(|key| key_variant(Some(key))).collect()
+}
+
 /// A batch's keys from the wire, each as `key_from_wire` reads one; the
 /// first fault ends the batch.
-fn keys_from_wire(keys: Vec<v1::Key>, key_type: KeyType) -> Result<Vec<Key>, WireKeyFault> {
-    keys.into_iter()
-        .map(|key| key_from_wire(Some(key), key_type))
+fn keys_from_wire(
+    variants: Vec<v1::key::Key>,
+    key_type: KeyType,
+) -> Result<Vec<Key>, WireKeyFault> {
+    variants
+        .into_iter()
+        .map(|variant| key_from_wire(variant, key_type))
         .collect()
 }
 
@@ -458,12 +483,11 @@ impl From<CallFault> for Status {
     }
 }
 
-/// The values `request` asks for, its keys times the columns it names, a
-/// presence-only call counting one per key (RFD 022), held to `limit`:
-/// `CallFault::TooManyValues` over it, before any lookup or slot.
-fn check_values(request: &MultiGetRequest, limit: usize) -> Result<(), CallFault> {
-    let keys = request.keys.len();
-    let columns = request.columns.len();
+/// The values a `MultiGet` of `keys` keys naming `columns` columns asks
+/// for, its keys times its columns, a presence-only call counting one per
+/// key (RFD 022), held to `limit`: `CallFault::TooManyValues` over it,
+/// before the call takes a slot.
+fn check_values(keys: usize, columns: usize, limit: usize) -> Result<(), CallFault> {
     if keys.saturating_mul(columns.max(1)) > limit {
         return Err(CallFault::TooManyValues {
             keys,
@@ -664,131 +688,205 @@ fn key_type_wire(key_type: KeyType) -> v1::KeyType {
     }
 }
 
+/// `Get` of `key` reading `columns` from `table`, whose request has been
+/// checked.
+async fn lookup(
+    table: &Table,
+    key: &Key,
+    columns: &[ColumnRead<'_>],
+) -> Result<Response<GetResponse>, Status> {
+    let lookup = table
+        .get(key, columns)
+        .await
+        .map_err(|error| status_from(&error))?;
+    let (presence, values) = row_wire(lookup.row);
+    Ok(Response::new(GetResponse {
+        presence: i32::from(presence),
+        values,
+        snapshot_id: lookup.snapshot_id.0,
+    }))
+}
+
+/// `MultiGet` of `keys` reading `columns` from `table`, whose request has
+/// been checked.
+async fn lookup_batch(
+    table: &Table,
+    keys: &[Key],
+    columns: &[ColumnRead<'_>],
+) -> Result<Response<MultiGetResponse>, Status> {
+    let lookup = table
+        .multi_get(keys, columns)
+        .await
+        .map_err(|error| status_from(&error))?;
+    let results = lookup
+        .rows
+        .into_iter()
+        .map(|row| {
+            let (presence, values) = row_wire(row);
+            Hit {
+                presence: i32::from(presence),
+                values,
+            }
+        })
+        .collect();
+    Ok(Response::new(MultiGetResponse {
+        results,
+        snapshot_id: lookup.snapshot_id.0,
+    }))
+}
+
+/// `Scan` of `key` reading `columns` from `table` under `bounds`, whose
+/// request has been checked.
+async fn scan_rows(
+    table: &Table,
+    key: &Key,
+    columns: &[ColumnRead<'_>],
+    bounds: &ScanBounds,
+) -> Result<Response<ScanResponse>, Status> {
+    let (lookup, receipt) = table
+        .scan_receipt(key, columns, bounds)
+        .await
+        .map_err(|error| status_from(&error))?;
+    settle(
+        receipt,
+        scan_within_bound(lookup, bounds.direction, table.max_scan_bytes()),
+    )
+}
+
+/// `MultiScan` of `keys` reading `columns` from `table` under `bounds`,
+/// whose request has been checked.
+async fn scan_batch(
+    table: &Table,
+    keys: &[Key],
+    columns: &[ColumnRead<'_>],
+    bounds: &ScanBounds,
+) -> Result<Response<MultiScanResponse>, Status> {
+    let (lookup, receipt) = table
+        .multi_scan_receipt(keys, columns, bounds)
+        .await
+        .map_err(|error| status_from(&error))?;
+    settle(
+        receipt,
+        multi_scan_within_bound(lookup, table.max_scan_bytes()),
+    )
+}
+
 impl Service {
-    /// `Get` inside its deadline.
-    async fn lookup(&self, request: GetRequest) -> Result<Response<GetResponse>, Status> {
-        let tables = self.serving();
-        let (table, key_type) = table_serving(&tables, &request.table, TableKind::KeyValue)?;
-        let key = key_from_wire(request.key, key_type)?;
-        let lookup = table
-            .get(&key, &reads(&request.columns))
-            .await
-            .map_err(|error| status_from(&error))?;
-        let (presence, values) = row_wire(lookup.row);
-        Ok(Response::new(GetResponse {
-            presence: i32::from(presence),
-            values,
-            snapshot_id: lookup.snapshot_id.0,
-        }))
-    }
-
-    /// `MultiGet` inside its deadline.
-    async fn lookup_batch(
-        &self,
-        request: MultiGetRequest,
-    ) -> Result<Response<MultiGetResponse>, Status> {
-        let tables = self.serving();
-        let (table, key_type) = table_serving(&tables, &request.table, TableKind::KeyValue)?;
-        let keys = keys_from_wire(request.keys, key_type)?;
-        let lookup = table
-            .multi_get(&keys, &reads(&request.columns))
-            .await
-            .map_err(|error| status_from(&error))?;
-        let results = lookup
-            .rows
-            .into_iter()
-            .map(|row| {
-                let (presence, values) = row_wire(row);
-                Hit {
-                    presence: i32::from(presence),
-                    values,
-                }
-            })
-            .collect();
-        Ok(Response::new(MultiGetResponse {
-            results,
-            snapshot_id: lookup.snapshot_id.0,
-        }))
-    }
-
-    /// `Scan` inside its deadline.
-    async fn scan_rows(&self, request: ScanRequest) -> Result<Response<ScanResponse>, Status> {
-        let tables = self.serving();
-        let (table, key_type) = table_serving(&tables, &request.table, TableKind::Ordered)?;
-        let key = key_from_wire(request.key, key_type)?;
-        let bounds = scan_bounds_from_wire(
-            request.direction,
-            request.limit,
-            request.start,
-            request.before,
-        )?;
-        let (lookup, receipt) = table
-            .scan_receipt(&key, &reads(&request.columns), &bounds)
-            .await
-            .map_err(|error| status_from(&error))?;
-        settle(
-            receipt,
-            scan_within_bound(lookup, bounds.direction, table.max_scan_bytes()),
-        )
-    }
-
-    /// `MultiScan` inside its deadline.
-    async fn scan_batch(
-        &self,
-        request: MultiScanRequest,
-    ) -> Result<Response<MultiScanResponse>, Status> {
-        let tables = self.serving();
-        let (table, key_type) = table_serving(&tables, &request.table, TableKind::Ordered)?;
-        let keys = keys_from_wire(request.keys, key_type)?;
-        let bounds = scan_bounds_from_wire(
-            request.direction,
-            request.limit,
-            request.start,
-            request.before,
-        )?;
-        let (lookup, receipt) = table
-            .multi_scan_receipt(&keys, &reads(&request.columns), &bounds)
-            .await
-            .map_err(|error| status_from(&error))?;
-        settle(
-            receipt,
-            multi_scan_within_bound(lookup, table.max_scan_bytes()),
-        )
-    }
-
-    /// `Get`, admitted and inside its deadline.
+    /// `Get`, checked in the module's order, the checks against the
+    /// generation in `Table::get`, inside its deadline.
     async fn answer_get(&self, request: GetRequest) -> Result<Response<GetResponse>, Status> {
+        let GetRequest {
+            table: name,
+            key,
+            columns,
+        } = request;
+        let key = key_variant(key)?;
+        let columns = reads(&columns);
+        check_column_reads(&name, &columns).map_err(|error| status_from(&error))?;
+        let tables = self.serving();
+        let table = table(&tables, &name)?;
+        table
+            .check_kind(TableKind::KeyValue)
+            .map_err(|error| status_from(&error))?;
         let _slot = self.slots.admit()?;
-        within(self.get_deadline, self.lookup(request)).await
+        let key = key_from_wire(key, ready_key_type(table)?)?;
+        within(self.get_deadline, lookup(table, &key, &columns)).await
     }
 
-    /// `MultiGet`, held to `max_multi_get_values` (`check_values`),
-    /// admitted, and inside its deadline.
+    /// `MultiGet`, checked as `Get` is, every key as `Get`'s, and held to
+    /// `max_multi_get_values` (`check_values`) after its table's kind.
     async fn answer_multi_get(
         &self,
         request: MultiGetRequest,
     ) -> Result<Response<MultiGetResponse>, Status> {
-        check_values(&request, self.max_multi_get_values)?;
+        let MultiGetRequest {
+            table: name,
+            keys,
+            columns,
+        } = request;
+        let keys = key_variants(keys)?;
+        let columns = reads(&columns);
+        check_column_reads(&name, &columns).map_err(|error| status_from(&error))?;
+        let tables = self.serving();
+        let table = table(&tables, &name)?;
+        table
+            .check_kind(TableKind::KeyValue)
+            .map_err(|error| status_from(&error))?;
+        check_values(keys.len(), columns.len(), self.max_multi_get_values)?;
         let _slot = self.slots.admit()?;
-        within(self.multi_get_deadline, self.lookup_batch(request)).await
+        let keys = keys_from_wire(keys, ready_key_type(table)?)?;
+        within(
+            self.multi_get_deadline,
+            lookup_batch(table, &keys, &columns),
+        )
+        .await
     }
 
-    /// `Scan`, admitted and inside its deadline. Its limit, bounds, and
-    /// columns are checked against the table before any read (`Table::scan`).
+    /// `Scan`, checked in the module's order, its direction and bounds off
+    /// the wire and `check_scan_request` before its table, `Table::check_scan`
+    /// before its slot, and the checks against the generation in
+    /// `Table::scan_receipt`, inside its deadline.
     async fn answer_scan(&self, request: ScanRequest) -> Result<Response<ScanResponse>, Status> {
+        let ScanRequest {
+            table: name,
+            key,
+            columns,
+            direction,
+            limit,
+            start,
+            before,
+        } = request;
+        let key = key_variant(key)?;
+        let bounds = scan_bounds_from_wire(direction, limit, start, before)?;
+        let columns = reads(&columns);
+        check_scan_request(&name, &columns, &bounds).map_err(|error| status_from(&error))?;
+        let tables = self.serving();
+        let table = table(&tables, &name)?;
+        table
+            .check_scan(&bounds)
+            .map_err(|error| status_from(&error))?;
         let _slot = self.slots.admit()?;
-        within(self.scan_deadline, self.scan_rows(request)).await
+        let key = key_from_wire(key, ready_key_type(table)?)?;
+        within(
+            self.scan_deadline,
+            scan_rows(table, &key, &columns, &bounds),
+        )
+        .await
     }
 
-    /// `MultiScan`, admitted and inside its deadline. Its keys times its
-    /// limit times its columns plus one are held to `max_multi_scan_values`
-    /// before any key is read (`Table::multi_scan`).
+    /// `MultiScan`, checked as `Scan` is, every key as `Scan`'s, with
+    /// `Table::check_multi_scan`, which holds its keys times its limit times
+    /// its columns plus one to `max_multi_scan_values`, in place of
+    /// `Table::check_scan`.
     async fn answer_multi_scan(
         &self,
         request: MultiScanRequest,
     ) -> Result<Response<MultiScanResponse>, Status> {
+        let MultiScanRequest {
+            table: name,
+            keys,
+            columns,
+            direction,
+            limit,
+            start,
+            before,
+        } = request;
+        let keys = key_variants(keys)?;
+        let bounds = scan_bounds_from_wire(direction, limit, start, before)?;
+        let columns = reads(&columns);
+        check_scan_request(&name, &columns, &bounds).map_err(|error| status_from(&error))?;
+        let tables = self.serving();
+        let table = table(&tables, &name)?;
+        table
+            .check_multi_scan(keys.len(), columns.len(), &bounds)
+            .map_err(|error| status_from(&error))?;
         let _slot = self.slots.admit()?;
-        within(self.multi_scan_deadline, self.scan_batch(request)).await
+        let keys = keys_from_wire(keys, ready_key_type(table)?)?;
+        within(
+            self.multi_scan_deadline,
+            scan_batch(table, &keys, &columns, &bounds),
+        )
+        .await
     }
 
     /// `TableInfo`: the serving generation's description.
@@ -893,42 +991,47 @@ mod tests {
     }
 
     #[test]
-    fn test_key_from_wire_missing_key_or_variant_is_missing_for_every_type() {
-        for key_type in KeyType::ALL {
-            assert_eq!(key_from_wire(None, key_type), Err(WireKeyFault::Missing));
-            assert_eq!(
-                key_from_wire(Some(v1::Key { key: None }), key_type),
-                Err(WireKeyFault::Missing)
-            );
-        }
+    fn test_key_variant_missing_key_or_variant_is_missing() {
+        assert_eq!(key_variant(None), Err(WireKeyFault::Missing));
+        assert_eq!(
+            key_variant(Some(v1::Key { key: None })),
+            Err(WireKeyFault::Missing)
+        );
+        let variant = v1::key::Key::Long(LONG_VALUE);
+        assert_eq!(key_variant(Some(wire(variant.clone()))), Ok(variant));
+    }
+
+    #[test]
+    fn test_key_variants_is_missing_for_any_key_without_a_variant() {
+        let long = v1::key::Key::Long(LONG_VALUE);
+        assert_eq!(
+            key_variants(vec![wire(long.clone()), v1::Key { key: None }]),
+            Err(WireKeyFault::Missing)
+        );
+        assert_eq!(
+            key_variants(vec![wire(long.clone()), wire(long.clone())]),
+            Ok(vec![long.clone(), long])
+        );
     }
 
     #[test]
     fn test_key_from_wire_matching_variant_per_type() {
         assert_eq!(
-            key_from_wire(Some(wire(v1::key::Key::Long(LONG_VALUE))), KeyType::Long).unwrap(),
+            key_from_wire(v1::key::Key::Long(LONG_VALUE), KeyType::Long).unwrap(),
             Key::Long(LONG_VALUE)
         );
         assert_eq!(
-            key_from_wire(
-                Some(wire(v1::key::Key::Str(STR_VALUE.to_string()))),
-                KeyType::String
-            )
-            .unwrap(),
+            key_from_wire(v1::key::Key::Str(STR_VALUE.to_string()), KeyType::String).unwrap(),
             Key::Str(STR_VALUE.to_string())
         );
         let bytes = vec![0u8; SHORT_BIN_LEN];
         assert_eq!(
-            key_from_wire(
-                Some(wire(v1::key::Key::Bin(bytes.clone()))),
-                KeyType::Binary
-            )
-            .unwrap(),
+            key_from_wire(v1::key::Key::Bin(bytes.clone()), KeyType::Binary).unwrap(),
             Key::Bytes(bytes)
         );
         let uuid = [7u8; UUID_BYTES];
         assert_eq!(
-            key_from_wire(Some(wire(v1::key::Key::Bin(uuid.to_vec()))), KeyType::Uuid).unwrap(),
+            key_from_wire(v1::key::Key::Bin(uuid.to_vec()), KeyType::Uuid).unwrap(),
             Key::Uuid(uuid)
         );
     }
@@ -948,7 +1051,7 @@ mod tests {
                         | (v1::key::Key::Str(_), KeyType::String)
                         | (v1::key::Key::Bin(_), KeyType::Binary | KeyType::Uuid)
                 );
-                let result = key_from_wire(Some(wire(variant.clone())), key_type);
+                let result = key_from_wire(variant.clone(), key_type);
                 if matches {
                     assert!(result.is_ok(), "{variant:?} on {key_type}");
                 } else {
@@ -969,7 +1072,7 @@ mod tests {
     fn test_key_from_wire_uuid_needs_exactly_sixteen_bytes() {
         for len in [0, SHORT_BIN_LEN, UUID_BYTES + 1] {
             assert_eq!(
-                key_from_wire(Some(wire(v1::key::Key::Bin(vec![0u8; len]))), KeyType::Uuid),
+                key_from_wire(v1::key::Key::Bin(vec![0u8; len]), KeyType::Uuid),
                 Err(WireKeyFault::UuidLength { bytes: len }),
                 "{len} bytes"
             );
@@ -1366,30 +1469,20 @@ mod tests {
 
     #[test]
     fn test_check_values_counts_keys_times_columns_and_a_presence_only_key_as_one() {
-        let request = |keys: usize, columns: usize| MultiGetRequest {
-            table: TABLE.to_string(),
-            keys: vec![wire(v1::key::Key::Long(LONG_VALUE)); keys],
-            columns: (0..columns)
-                .map(|at| v1::ColumnRead {
-                    name: format!("c{at}"),
-                    fields: vec![1, 2, 3],
-                })
-                .collect(),
-        };
         let columns_named = 2;
         let at_limit = SAMPLE_LIMIT / columns_named;
-        assert!(check_values(&request(at_limit, columns_named), SAMPLE_LIMIT).is_ok());
+        assert!(check_values(at_limit, columns_named, SAMPLE_LIMIT).is_ok());
         assert!(matches!(
-            check_values(&request(at_limit + 1, columns_named), SAMPLE_LIMIT),
+            check_values(at_limit + 1, columns_named, SAMPLE_LIMIT),
             Err(CallFault::TooManyValues {
                 keys,
                 columns: 2,
                 limit: SAMPLE_LIMIT,
             }) if keys == at_limit + 1
         ));
-        assert!(check_values(&request(SAMPLE_LIMIT, 0), SAMPLE_LIMIT).is_ok());
+        assert!(check_values(SAMPLE_LIMIT, 0, SAMPLE_LIMIT).is_ok());
         assert!(matches!(
-            check_values(&request(SAMPLE_LIMIT + 1, 0), SAMPLE_LIMIT),
+            check_values(SAMPLE_LIMIT + 1, 0, SAMPLE_LIMIT),
             Err(CallFault::TooManyValues { columns: 0, .. })
         ));
     }

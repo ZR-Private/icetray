@@ -3417,25 +3417,40 @@ async fn test_get_on_an_ordered_table_is_invalid_argument() -> TestResult {
     Ok(())
 }
 
-/// A call the wire refuses as `INVALID_ARGUMENT` for the table or the
-/// request it carries.
-enum Refused {
-    /// A Scan to send as it is.
+/// A request of any of the four lookup calls, to send as it is.
+#[derive(Clone, Debug)]
+enum Sent {
+    /// A `Get`.
+    Get(GetRequest),
+    /// A `MultiGet`.
+    MultiGet(MultiGetRequest),
+    /// A Scan.
     Scan(ScanRequest),
-    /// A `MultiScan` to send as it is.
+    /// A `MultiScan`.
     MultiScan(MultiScanRequest),
-    /// A `MultiGet` of keys on a table.
-    MultiGet(&'static str, Vec<Key>),
 }
 
 impl Stack {
-    /// The code `call` is answered with.
-    async fn answered(&mut self, call: Refused) -> Code {
-        match call {
-            Refused::Scan(request) => code_of(self.scan(request).await),
-            Refused::MultiScan(request) => code_of(self.multi_scan(request).await),
-            Refused::MultiGet(table, keys) => code_of(self.multi_get(table, &keys).await),
+    /// The code `call` is answered with, `Code::Ok` for a response.
+    async fn answered(&mut self, call: Sent) -> Code {
+        fn code<T>(result: Result<T, Status>) -> Code {
+            result.map_or_else(|status| status.code(), |_| Code::Ok)
         }
+        match call {
+            Sent::Get(request) => code(self.client.get(request).await),
+            Sent::MultiGet(request) => code(self.client.multi_get(request).await),
+            Sent::Scan(request) => code(self.scan(request).await),
+            Sent::MultiScan(request) => code(self.multi_scan(request).await),
+        }
+    }
+}
+
+/// A `MultiGet` of `keys` on `table` naming `VALUE_COLUMN`.
+fn multi_get_of(table: &str, keys: &[Key]) -> MultiGetRequest {
+    MultiGetRequest {
+        table: table.to_string(),
+        keys: keys.iter().map(wire_key).collect(),
+        columns: wire_columns(&[VALUE_COLUMN]),
     }
 }
 
@@ -3457,49 +3472,49 @@ async fn test_scan_and_multi_get_requests_the_table_refuses_are_invalid_argument
     };
     let empty_bound = v1::OrderValue { value: None };
     let cases = vec![
-        Refused::Scan(ScanRequest {
+        Sent::Scan(ScanRequest {
             start: Some(str_bound.clone()),
             ..scan_of(ORDERED_TABLE, &key, PAGE_ROWS)
         }),
-        Refused::Scan(ScanRequest {
+        Sent::Scan(ScanRequest {
             before: Some(str_bound.clone()),
             ..scan_of(ORDERED_TABLE, &key, PAGE_ROWS)
         }),
-        Refused::MultiScan(MultiScanRequest {
+        Sent::MultiScan(MultiScanRequest {
             start: Some(str_bound),
             ..multi_scan_of(ORDERED_TABLE, std::slice::from_ref(&key), PAGE_ROWS)
         }),
-        Refused::Scan(ScanRequest {
+        Sent::Scan(ScanRequest {
             start: Some(empty_bound.clone()),
             ..scan_of(ORDERED_TABLE, &key, PAGE_ROWS)
         }),
-        Refused::Scan(ScanRequest {
+        Sent::Scan(ScanRequest {
             before: Some(empty_bound.clone()),
             ..scan_of(ORDERED_TABLE, &key, PAGE_ROWS)
         }),
-        Refused::MultiScan(MultiScanRequest {
+        Sent::MultiScan(MultiScanRequest {
             before: Some(empty_bound),
             ..multi_scan_of(ORDERED_TABLE, std::slice::from_ref(&key), PAGE_ROWS)
         }),
-        Refused::MultiGet(ORDERED_TABLE, vec![key.clone()]),
-        Refused::MultiScan(multi_scan_of(
+        Sent::MultiGet(multi_get_of(ORDERED_TABLE, std::slice::from_ref(&key))),
+        Sent::MultiScan(multi_scan_of(
             TABLE,
             std::slice::from_ref(&kv_key),
             PAGE_ROWS,
         )),
-        Refused::Scan(ScanRequest {
+        Sent::Scan(ScanRequest {
             columns: wire_columns(&[UNSERVED_COLUMN]),
             ..scan_of(ORDERED_TABLE, &key, PAGE_ROWS)
         }),
-        Refused::Scan(ScanRequest {
+        Sent::Scan(ScanRequest {
             columns: wire_columns(&[VALUE_COLUMN, VALUE_COLUMN]),
             ..scan_of(ORDERED_TABLE, &key, PAGE_ROWS)
         }),
-        Refused::MultiScan(MultiScanRequest {
+        Sent::MultiScan(MultiScanRequest {
             columns: wire_columns(&[UNSERVED_COLUMN]),
             ..multi_scan_of(ORDERED_TABLE, std::slice::from_ref(&key), PAGE_ROWS)
         }),
-        Refused::MultiScan(MultiScanRequest {
+        Sent::MultiScan(MultiScanRequest {
             keys: vec![
                 wire_key(&key),
                 v1::Key {
@@ -3521,86 +3536,375 @@ async fn test_scan_and_multi_get_requests_the_table_refuses_are_invalid_argument
     Ok(())
 }
 
-/// The kind check comes before the readiness check and before the request is
-/// read: while the tables load, a call of the wrong kind is
-/// `INVALID_ARGUMENT`, which a caller does not retry, whatever else its
-/// request holds, and a call of the right kind is still `UNAVAILABLE`.
-#[tokio::test(flavor = "multi_thread")]
-async fn test_a_call_of_the_wrong_kind_is_invalid_argument_while_the_table_loads() -> TestResult {
-    let _serial = SERIAL.lock().await;
-    let mut stack = Stack::start_with(
-        vec![
-            FixtureSpec::small(TABLE, KeyType::Long),
-            ordered_spec(ORDERED_TABLE),
-        ],
-        async |setup| {
-            setup.hold_store = true;
-            Ok(())
-        },
-    )
-    .await?;
-    let key = stack.ordered().key(ORDERED_IDS.start);
-    let kv_key = stack.fixtures[0].key(SAMPLE[0]);
-    assert_eq!(
-        stack.health_status(OVERALL_SERVICE).await?,
-        ServingStatus::NotServing,
-        "the tables are loading"
-    );
+/// The four lookup calls of the validation-order test.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Lookup {
+    Get,
+    MultiGet,
+    Scan,
+    MultiScan,
+}
 
-    let unset_direction = i32::from(v1::Direction::Unspecified);
-    let loading_scan = ScanRequest {
-        direction: unset_direction,
-        key: None,
-        ..scan_of(TABLE, &kv_key, PAGE_ROWS)
-    };
-    let cases = [
-        (
-            Refused::MultiGet(ORDERED_TABLE, vec![key.clone()]),
-            Code::InvalidArgument,
-        ),
-        (Refused::Scan(loading_scan), Code::InvalidArgument),
-        (
-            Refused::MultiScan(MultiScanRequest {
-                direction: unset_direction,
-                ..multi_scan_of(TABLE, std::slice::from_ref(&kv_key), PAGE_ROWS)
-            }),
-            Code::InvalidArgument,
-        ),
-        (
-            Refused::MultiGet(TABLE, vec![kv_key.clone()]),
-            Code::Unavailable,
-        ),
-        (
-            Refused::Scan(scan_of(ORDERED_TABLE, &key, PAGE_ROWS)),
-            Code::Unavailable,
-        ),
-        (
-            Refused::MultiScan(multi_scan_of(
-                ORDERED_TABLE,
-                std::slice::from_ref(&key),
-                PAGE_ROWS,
-            )),
-            Code::Unavailable,
-        ),
-    ];
-    for (at, (call, code)) in cases.into_iter().enumerate() {
-        assert_eq!(stack.answered(call).await, code, "case {at}");
+impl Lookup {
+    const ALL: [Self; 4] = [Self::Get, Self::MultiGet, Self::Scan, Self::MultiScan];
+
+    /// Whether the call carries many keys.
+    fn batch(self) -> bool {
+        matches!(self, Self::MultiGet | Self::MultiScan)
     }
-    assert_eq!(
-        code_of(stack.get(ORDERED_TABLE, None).await),
-        Code::InvalidArgument,
-        "a Get of an ordered table with no key"
-    );
-    assert_eq!(
-        code_of(stack.get(TABLE, Some(wire_key(&kv_key))).await),
-        Code::Unavailable,
-        "a Get of a loading key-value table is retried"
-    );
 
-    stack.s3.release();
-    stack.serving.ready().await;
-    let response = stack.get(TABLE, Some(wire_key(&kv_key))).await?;
-    assert_eq!(response.presence, i32::from(v1::Presence::Present));
+    /// Whether the call reads an ordered table, with a direction, a limit,
+    /// and bounds.
+    fn scans(self) -> bool {
+        matches!(self, Self::Scan | Self::MultiScan)
+    }
+}
+
+/// The state of the table a request of the validation-order test names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Target {
+    /// A name no table is served under.
+    Unknown,
+    /// A served table whose first load has not finished.
+    Loading,
+    /// A served table that has loaded.
+    Served,
+}
+
+/// The step of the service's validation order a request's fault is found
+/// at (`service.rs`): the slot and the readiness steps are the server's
+/// and the table's state, not the request's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Step {
+    /// What the request holds on its own, whatever its table.
+    Request,
+    /// What the table's configuration holds the request to.
+    Configuration,
+    /// What needs the serving generation.
+    Generation,
+}
+
+/// A fault the validation-order test puts in an otherwise good request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fault {
+    /// No fault: the request a served table answers.
+    None,
+    MissingKey,
+    UnsetDirection,
+    BoundWithNoVariant,
+    EmptyWindow,
+    RepeatedColumn,
+    FieldOutOfRange,
+    RepeatedField,
+    WrongKind,
+    LimitZero,
+    LimitAboveMax,
+    TooManyValues,
+    KeyVariant,
+    BoundVariant,
+    UnservedColumn,
+    FieldsOfAnOpaqueColumn,
+}
+
+impl Fault {
+    const ALL: [Self; 16] = [
+        Self::None,
+        Self::MissingKey,
+        Self::UnsetDirection,
+        Self::BoundWithNoVariant,
+        Self::EmptyWindow,
+        Self::RepeatedColumn,
+        Self::FieldOutOfRange,
+        Self::RepeatedField,
+        Self::WrongKind,
+        Self::LimitZero,
+        Self::LimitAboveMax,
+        Self::TooManyValues,
+        Self::KeyVariant,
+        Self::BoundVariant,
+        Self::UnservedColumn,
+        Self::FieldsOfAnOpaqueColumn,
+    ];
+
+    /// The step the fault is found at; `None` for no fault.
+    fn step(self) -> Option<Step> {
+        match self {
+            Self::None => None,
+            Self::MissingKey
+            | Self::UnsetDirection
+            | Self::BoundWithNoVariant
+            | Self::EmptyWindow
+            | Self::RepeatedColumn
+            | Self::FieldOutOfRange
+            | Self::RepeatedField => Some(Step::Request),
+            Self::WrongKind | Self::LimitZero | Self::LimitAboveMax | Self::TooManyValues => {
+                Some(Step::Configuration)
+            }
+            Self::KeyVariant
+            | Self::BoundVariant
+            | Self::UnservedColumn
+            | Self::FieldsOfAnOpaqueColumn => Some(Step::Generation),
+        }
+    }
+
+    /// Whether a request of `kind` can hold the fault.
+    fn applies_to(self, kind: Lookup) -> bool {
+        match self {
+            Self::None
+            | Self::MissingKey
+            | Self::RepeatedColumn
+            | Self::FieldOutOfRange
+            | Self::RepeatedField
+            | Self::WrongKind
+            | Self::KeyVariant
+            | Self::UnservedColumn
+            | Self::FieldsOfAnOpaqueColumn => true,
+            Self::UnsetDirection
+            | Self::BoundWithNoVariant
+            | Self::EmptyWindow
+            | Self::LimitZero
+            | Self::LimitAboveMax
+            | Self::BoundVariant => kind.scans(),
+            Self::TooManyValues => kind.batch(),
+        }
+    }
+
+    /// The code a request holding the fault is answered with when it names
+    /// a table in `target` on a server with a slot free, or with none
+    /// (`slot`): the code of the earliest step that finds a fault, the
+    /// unknown table being the configuration step's, the slot step's
+    /// `RESOURCE_EXHAUSTED`, and the loading table the readiness step's.
+    fn answer(self, target: Target, slot: bool) -> Code {
+        let step = self.step();
+        let steps = [
+            (step == Some(Step::Request), Code::InvalidArgument),
+            (target == Target::Unknown, Code::NotFound),
+            (step == Some(Step::Configuration), Code::InvalidArgument),
+            (!slot, Code::ResourceExhausted),
+            (target == Target::Loading, Code::Unavailable),
+            (step == Some(Step::Generation), Code::InvalidArgument),
+        ];
+        steps
+            .into_iter()
+            .find_map(|(found, code)| found.then_some(code))
+            .unwrap_or(Code::Ok)
+    }
+
+    /// `good`, a request of `kind` that a served table answers, with the
+    /// fault put in; `other` is the table of the other kind.
+    fn put_in(self, good: &Parts, kind: Lookup, other: &str) -> Parts {
+        let mut parts = good.clone();
+        let mut bad_key = |key: v1::Key| {
+            if kind.batch() {
+                parts.keys.push(key);
+            } else {
+                parts.keys = vec![key];
+            }
+        };
+        match self {
+            Self::None => {}
+            Self::MissingKey => bad_key(v1::Key { key: None }),
+            Self::KeyVariant => bad_key(v1::Key {
+                key: Some(v1::key::Key::Str("not a long".to_string())),
+            }),
+            Self::UnsetDirection => parts.direction = i32::from(v1::Direction::Unspecified),
+            Self::BoundWithNoVariant => parts.start = Some(v1::OrderValue { value: None }),
+            Self::EmptyWindow => {
+                parts.start = Some(wire_order(ORDER_START));
+                parts.before = Some(wire_order(ORDER_START));
+            }
+            Self::BoundVariant => {
+                parts.start = Some(v1::OrderValue {
+                    value: Some(v1::order_value::Value::Str("not a long".to_string())),
+                });
+            }
+            Self::RepeatedColumn => parts.columns = wire_columns(&[VALUE_COLUMN, VALUE_COLUMN]),
+            Self::FieldOutOfRange => parts.columns = vec![wire_read(VALUE_COLUMN, &[0])],
+            Self::RepeatedField => parts.columns = vec![wire_read(VALUE_COLUMN, &[1, 1])],
+            Self::UnservedColumn => parts.columns = wire_columns(&[UNSERVED_COLUMN]),
+            Self::FieldsOfAnOpaqueColumn => parts.columns = vec![wire_read(VALUE_COLUMN, &[1])],
+            Self::WrongKind => parts.table = other.to_string(),
+            Self::LimitZero => parts.limit = 0,
+            Self::LimitAboveMax => parts.limit = SCAN_CAP + 1,
+            Self::TooManyValues => {
+                let keys = match kind {
+                    Lookup::MultiGet => BATCH_IDS + 1,
+                    Lookup::Get | Lookup::Scan | Lookup::MultiScan => ORDER_TEST_SCAN_KEYS_OVER,
+                };
+                parts.keys = vec![parts.keys[0].clone(); keys];
+            }
+        }
+        parts
+    }
+}
+
+/// The keys a `MultiScan` of the validation-order test asks for to pass
+/// `MULTI_SCAN_VALUES` at `PAGE_ROWS` rows of one column and the order
+/// value.
+const ORDER_TEST_SCAN_KEYS_OVER: usize = MULTI_SCAN_VALUES / (PAGE_ROWS as usize * 2) + 1;
+
+/// What a request of the validation-order test carries, each call taking
+/// the fields it has: a `Get` or Scan the first key.
+#[derive(Clone, Debug)]
+struct Parts {
+    table: String,
+    keys: Vec<v1::Key>,
+    columns: Vec<v1::ColumnRead>,
+    direction: i32,
+    limit: u32,
+    start: Option<v1::OrderValue>,
+    before: Option<v1::OrderValue>,
+}
+
+impl Parts {
+    /// The parts of a request on `table` for `key` that a served table of
+    /// the call's kind answers: `VALUE_COLUMN`, newest first, `PAGE_ROWS`
+    /// rows, unbounded.
+    fn good(table: &str, key: &Key) -> Self {
+        Self {
+            table: table.to_string(),
+            keys: vec![wire_key(key)],
+            columns: wire_columns(&[VALUE_COLUMN]),
+            direction: i32::from(v1::Direction::NewestFirst),
+            limit: PAGE_ROWS,
+            start: None,
+            before: None,
+        }
+    }
+
+    /// The request of `kind` these parts make.
+    fn request(self, kind: Lookup) -> Sent {
+        let Self {
+            table,
+            keys,
+            columns,
+            direction,
+            limit,
+            start,
+            before,
+        } = self;
+        let key = keys.first().cloned();
+        match kind {
+            Lookup::Get => Sent::Get(GetRequest {
+                table,
+                key,
+                columns,
+            }),
+            Lookup::MultiGet => Sent::MultiGet(MultiGetRequest {
+                table,
+                keys,
+                columns,
+            }),
+            Lookup::Scan => Sent::Scan(ScanRequest {
+                table,
+                key,
+                columns,
+                direction,
+                limit,
+                start,
+                before,
+            }),
+            Lookup::MultiScan => Sent::MultiScan(MultiScanRequest {
+                table,
+                keys,
+                columns,
+                direction,
+                limit,
+                start,
+                before,
+            }),
+        }
+    }
+}
+
+/// `Get`, `MultiGet`, `Scan`, and `MultiScan` check a request in one order
+/// (`service.rs`): its own faults, then its table's configuration (the
+/// unknown table among them), then a slot, then the table's readiness, then
+/// the generation. Every fault of each step, in every call it applies to,
+/// is sent to an unknown table, a loading one, and a served one, on a
+/// server with slots free and on one with none, and each is answered the
+/// code of the earliest step that finds a fault. A server with no slot free
+/// is one configured with a `max_in_flight` of 0, which `Config::parse`
+/// refuses and `Setup` reaches, so no held call has to fill the slots; a
+/// loading table is one whose store is held from the start.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_each_call_checks_its_request_in_the_one_order() -> TestResult {
+    let _serial = SERIAL.lock().await;
+    let mut sent = 0;
+    for (target, slot) in [
+        (Target::Loading, true),
+        (Target::Served, true),
+        (Target::Loading, false),
+        (Target::Served, false),
+    ] {
+        let mut stack = Stack::start_with(
+            vec![
+                FixtureSpec::small(TABLE, KeyType::Long),
+                ordered_spec(ORDERED_TABLE),
+            ],
+            async |setup| {
+                setup.config.tables[1].max_scan_rows = Some(SCAN_CAP);
+                setup.config.server.max_multi_get_values = BATCH_IDS;
+                setup.config.server.max_multi_scan_values = MULTI_SCAN_VALUES;
+                if !slot {
+                    setup.config.server.max_in_flight = 0;
+                }
+                setup.hold_store = target == Target::Loading;
+                Ok(())
+            },
+        )
+        .await?;
+        if target == Target::Served {
+            stack.serving.ready().await;
+        } else {
+            assert_eq!(
+                stack.health_status(OVERALL_SERVICE).await?,
+                ServingStatus::NotServing,
+                "the tables are loading"
+            );
+        }
+        let kv_key = stack.fixtures[0].key(SAMPLE[0]);
+        let ordered_key = stack.ordered().key(ORDERED_IDS.start);
+        for named in [Target::Unknown, target] {
+            for kind in Lookup::ALL {
+                let (own, other, key) = match (named, kind.scans()) {
+                    (Target::Unknown, false) => (NOBODY, NOBODY, &kv_key),
+                    (Target::Unknown, true) => (NOBODY, NOBODY, &ordered_key),
+                    (Target::Loading | Target::Served, false) => (TABLE, ORDERED_TABLE, &kv_key),
+                    (Target::Loading | Target::Served, true) => {
+                        (ORDERED_TABLE, TABLE, &ordered_key)
+                    }
+                };
+                let good = Parts::good(own, key);
+                for fault in Fault::ALL {
+                    if !fault.applies_to(kind) {
+                        continue;
+                    }
+                    let request = fault.put_in(&good, kind, other).request(kind);
+                    assert_eq!(
+                        stack.answered(request.clone()).await,
+                        fault.answer(named, slot),
+                        "{fault:?} to {named:?}, a slot free: {slot}, {request:?}"
+                    );
+                    sent += 1;
+                }
+            }
+        }
+        if target == Target::Loading {
+            stack.s3.release();
+        }
+    }
+    // Counting no fault: 9 for a `Get`, 10 for a `MultiGet`, which can ask
+    // for too many values, 15 for a Scan, which has a direction, a limit,
+    // and bounds, and 16 for a `MultiScan`.
+    let cases_per_target = 9 + 10 + 15 + 16;
+    let servers = 4;
+    let targets_per_server = 2;
+    assert_eq!(
+        sent,
+        servers * targets_per_server * cases_per_target,
+        "every case was sent"
+    );
     Ok(())
 }
 
