@@ -71,9 +71,10 @@ impl Golden {
             &self.current(),
             self.table.config().lookups(),
             &ValueFormat::opaque,
-            self.table
-                .config()
-                .scan_limits(ServerConfig::default().max_scan_bytes),
+            self.table.config().scan_limits(
+                ServerConfig::default().max_scan_bytes,
+                ServerConfig::default().max_multi_scan_values,
+            ),
         )
     }
 }

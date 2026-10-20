@@ -659,6 +659,8 @@ mod tests {
     /// The order facts an ordered table's sample lines carry.
     const LONGEST_RUN: u64 = 7;
     const SCAN_ROWS: u32 = 50;
+    const MULTI_SCAN_VALUES: usize = 400;
+    const SCAN_BYTES: usize = 2048;
     const GETS_PER_SCAN: u64 = 3;
     const FILES_PROBED: usize = 2;
     const DISTINCT_KEYS: [u64; 2] = [3, 4];
@@ -678,6 +680,8 @@ mod tests {
             column: COLUMN.to_string(),
             order_type: OrderType::Binary,
             max_scan_rows: SCAN_ROWS,
+            max_multi_scan_values: MULTI_SCAN_VALUES,
+            max_scan_bytes: SCAN_BYTES,
             longest_run: LONGEST_RUN,
             gets_per_scan: GETS_PER_SCAN,
             files_probed: FILES_PROBED,
@@ -692,6 +696,11 @@ mod tests {
         assert_eq!(line["order"]["column"], Json::String(COLUMN.to_string()));
         assert_eq!(line["order"]["order_type"], Json::String("binary".into()));
         assert_eq!(line["order"]["max_scan_rows"], Json::from(SCAN_ROWS));
+        assert_eq!(
+            line["order"]["max_multi_scan_values"],
+            Json::from(MULTI_SCAN_VALUES)
+        );
+        assert_eq!(line["order"]["max_scan_bytes"], Json::from(SCAN_BYTES));
         assert_eq!(line["order"]["longest_run"], Json::from(LONGEST_RUN));
         assert_eq!(line["order"]["gets_per_scan"], Json::from(GETS_PER_SCAN));
         assert_eq!(line["order"]["files_probed"], Json::from(FILES_PROBED));

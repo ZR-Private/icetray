@@ -2115,7 +2115,7 @@ impl Table {
             generation,
             declared,
             &config.formats(),
-            config.scan_limits(self.max_scan_bytes),
+            config.scan_limits(self.max_scan_bytes, self.max_multi_scan_values),
         );
         let mut counts = FindingCounts::new();
         for finding in &report.findings {
@@ -7481,7 +7481,10 @@ mod tests {
             &generation,
             config.lookups(),
             &ValueFormat::opaque,
-            config.scan_limits(ServerConfig::default().max_scan_bytes),
+            config.scan_limits(
+                ServerConfig::default().max_scan_bytes,
+                ServerConfig::default().max_multi_scan_values,
+            ),
         )
         .summary;
         assert_eq!(

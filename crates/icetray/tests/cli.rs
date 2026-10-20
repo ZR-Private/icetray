@@ -18,7 +18,7 @@ use icetray::reload::ReloadResult;
 use icetray::serve::OVERALL_SERVICE;
 use icetray::{EXIT_BELOW_LEVEL, EXIT_FAILURE, EXIT_OK, EXIT_USAGE};
 use icetray_core::approx;
-use icetray_core::config::DEFAULT_MAX_SCAN_ROWS;
+use icetray_core::config::{DEFAULT_MAX_SCAN_ROWS, ServerConfig};
 use icetray_core::contract::VALUE_PAGE_BYTES;
 use icetray_core::metric::{
     ALLOCATOR_ALLOCATED_BYTES, ALLOCATOR_RESIDENT_BYTES, CONFIG_PENDING, CONFIG_RELOADS_TOTAL,
@@ -603,6 +603,14 @@ const ORDER_STEP: i64 = 10;
 /// and within `server.max_multi_scan_values`.
 const CONFIGURED_SCAN_ROWS: u32 = 50;
 
+/// The `server.max_multi_scan_values` the info test configures: fewer than
+/// the default, and at least twice `CONFIGURED_SCAN_ROWS`.
+const CONFIGURED_MULTI_SCAN_VALUES: usize = 600;
+
+/// The `server.max_scan_bytes` the info test configures: 1 MiB, below the
+/// default.
+const CONFIGURED_SCAN_BYTES: usize = 1024 * 1024;
+
 /// An ordered fixture of `IDS_2K` in `TWO_BUCKETS`, each key with
 /// `ORDER_ROWS_PER_KEY` timestamps `ORDER_STEP` apart from `ORDER_START`,
 /// or all at `ORDER_START` when `step` is zero, which repeats every pair.
@@ -661,6 +669,12 @@ async fn test_doctor_reports_an_ordered_table_s_order_facts() -> TestResult {
     assert_eq!(order["column"], ORDER_COLUMN);
     assert_eq!(order["order_type"], "timestamp");
     assert_eq!(order["max_scan_rows"], Json::from(DEFAULT_MAX_SCAN_ROWS));
+    let server = ServerConfig::default();
+    assert_eq!(
+        order["max_multi_scan_values"],
+        Json::from(server.max_multi_scan_values)
+    );
+    assert_eq!(order["max_scan_bytes"], Json::from(server.max_scan_bytes));
     assert_eq!(order["longest_run"], Json::from(ORDER_ROWS_PER_KEY));
     let files: Vec<&Json> = report
         .iter()
@@ -881,15 +895,22 @@ async fn test_doctor_does_not_warn_of_a_string_order() -> TestResult {
 }
 
 /// `info` reports the order column, its type, the configured
-/// `max_scan_rows`, and the longest run.
+/// `max_scan_rows`, `server.max_multi_scan_values`, and
+/// `server.max_scan_bytes`, as `TableInfo` does, and the longest run.
 #[tokio::test]
 async fn test_info_reports_the_order_column() -> TestResult {
     let dir = tempfile::tempdir()?;
     let fixture = local_fixture(dir.path(), ordered_spec("events_info", ORDER_STEP)).await?;
+    let server = format!(
+        "[server]\nmax_multi_scan_values = {CONFIGURED_MULTI_SCAN_VALUES}\nmax_scan_bytes = {CONFIGURED_SCAN_BYTES}\n"
+    );
     let config = write_file(
         dir.path(),
         "ordered.toml",
-        &toml_ordered_table(TABLE_A, &fixture, Some(CONFIGURED_SCAN_ROWS)),
+        &format!(
+            "{server}{}",
+            toml_ordered_table(TABLE_A, &fixture, Some(CONFIGURED_SCAN_ROWS))
+        ),
     )?;
     let output = run(&["info", "--config", &config], &[]);
     assert_exit(&output, EXIT_OK);
@@ -899,6 +920,11 @@ async fn test_info_reports_the_order_column() -> TestResult {
     assert_eq!(order["column"], ORDER_COLUMN);
     assert_eq!(order["order_type"], "timestamp");
     assert_eq!(order["max_scan_rows"], Json::from(CONFIGURED_SCAN_ROWS));
+    assert_eq!(
+        order["max_multi_scan_values"],
+        Json::from(CONFIGURED_MULTI_SCAN_VALUES)
+    );
+    assert_eq!(order["max_scan_bytes"], Json::from(CONFIGURED_SCAN_BYTES));
     assert_eq!(order["longest_run"], Json::from(ORDER_ROWS_PER_KEY));
     Ok(())
 }

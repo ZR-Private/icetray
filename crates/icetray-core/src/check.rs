@@ -126,13 +126,15 @@ pub mod thresholds {
 
 /// What a Scan of an ordered table is held to (RFD 025, Limits): its rows
 /// and the encoded size of its response, which `large_runs` sizes a file's
-/// runs against.
+/// runs against, and the values one `MultiScan` of it may request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScanLimits {
     /// The table's effective `max_scan_rows` (`TableConfig::scan_rows`).
     pub max_scan_rows: u32,
     /// `server.max_scan_bytes`.
     pub max_scan_bytes: usize,
+    /// `server.max_multi_scan_values`.
+    pub max_multi_scan_values: usize,
 }
 
 /// The GETs a cold lookup spends on a column chunk's dictionary page beside
@@ -873,6 +875,12 @@ pub struct OrderSummary {
     /// The most rows one Scan returns for a key: the table's configured
     /// `max_scan_rows`, or the default.
     pub max_scan_rows: u32,
+    /// The most values one `MultiScan` may request:
+    /// `server.max_multi_scan_values`, as `TableInfo` reports it.
+    pub max_multi_scan_values: usize,
+    /// The encoded size above which a Scan or `MultiScan` response is
+    /// refused: `server.max_scan_bytes`, as `TableInfo` reports it.
+    pub max_scan_bytes: usize,
     /// The rows of the longest run of one key in any one file. A key that
     /// several files hold, as appends between compactions leave it, has
     /// more rows than its longest run, so this is a floor on its history.
@@ -1047,6 +1055,8 @@ pub fn diagnose(
             column: order.name.clone(),
             order_type: order.order_type,
             max_scan_rows: limits.max_scan_rows,
+            max_multi_scan_values: limits.max_multi_scan_values,
+            max_scan_bytes: limits.max_scan_bytes,
             longest_run: longest_run_of(facts.iter().filter_map(|file| file.report.order.as_ref())),
             gets_per_scan,
             files_probed: caps.cost.files_probed,

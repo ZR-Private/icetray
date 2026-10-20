@@ -732,6 +732,8 @@ One per table, from `info` and from `doctor`:
 | `order.column` | The order column's name. |
 | `order.order_type` | The order column's Iceberg type in the snapshot: `int`, `long`, `date`, `timestamp`, `timestamptz`, `timestamp_ns`, `timestamptz_ns`, `string`, `binary`, or `fixed(N)` with its width. |
 | `order.max_scan_rows` | The table's `max_scan_rows`, configured or the default. |
+| `order.max_multi_scan_values` | `server.max_multi_scan_values`, the most values one `MultiScan` may request, as `TableInfo` reports it. |
+| `order.max_scan_bytes` | `server.max_scan_bytes`, the encoded size above which a `Scan` or `MultiScan` response is refused, as `TableInfo` reports it. |
 | `order.longest_run` | The rows of the longest run of one key in any one file. A key that several files hold, as appends between compactions leave it, has more rows than its longest run in one file. |
 | `order.gets_per_scan` | GETs one cold `Scan` at `max_scan_rows` makes at worst in the loaded residency, of a key held in one file and one row group, reading every configured value column, as `icetray_table_gets_per_scan` reports it while the snapshot serves. The figure an owner compares residencies by, in place of `lookup_cost`. A key held in several files costs this in each. |
 | `order.files_probed` | Files one `Scan` reads at worst, as `icetray_table_files_probed_per_lookup` reports it. |

@@ -2151,13 +2151,19 @@ impl TableConfig {
             .map(|_| self.max_scan_rows.unwrap_or(DEFAULT_MAX_SCAN_ROWS))
     }
 
-    /// The limits a Scan of this table is held to, `max_scan_bytes` being
-    /// `server.max_scan_bytes`, on an ordered table; `None` on a key-value
-    /// table, which is never scanned.
-    pub fn scan_limits(&self, max_scan_bytes: usize) -> Option<ScanLimits> {
+    /// The limits a Scan of this table is held to, `max_scan_bytes` and
+    /// `max_multi_scan_values` being the server's settings of those names,
+    /// on an ordered table; `None` on a key-value table, which is never
+    /// scanned.
+    pub fn scan_limits(
+        &self,
+        max_scan_bytes: usize,
+        max_multi_scan_values: usize,
+    ) -> Option<ScanLimits> {
         self.scan_rows().map(|max_scan_rows| ScanLimits {
             max_scan_rows,
             max_scan_bytes,
+            max_multi_scan_values,
         })
     }
 

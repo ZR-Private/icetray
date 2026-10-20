@@ -142,10 +142,10 @@ fn diagnose_scanned(served: &verify::Served) -> TableReport {
         &served.current(),
         served.table.config().lookups(),
         &ValueFormat::opaque,
-        served
-            .table
-            .config()
-            .scan_limits(ServerConfig::default().max_scan_bytes),
+        served.table.config().scan_limits(
+            ServerConfig::default().max_scan_bytes,
+            ServerConfig::default().max_multi_scan_values,
+        ),
     )
 }
 
@@ -1324,6 +1324,7 @@ async fn test_large_runs_is_advice_above_the_scan_byte_bound() -> Result<()> {
             Some(ScanLimits {
                 max_scan_rows,
                 max_scan_bytes,
+                max_multi_scan_values: ServerConfig::default().max_multi_scan_values,
             }),
         );
         let drawn = report

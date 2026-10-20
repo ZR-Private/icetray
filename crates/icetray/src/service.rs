@@ -800,7 +800,7 @@ impl Service {
         let table = table(&tables, &request.table)?;
         let generation = table.serving().map_err(|error| status_from(&error))?;
         let entry = table.config();
-        let limits = entry.scan_limits(table.max_scan_bytes());
+        let limits = entry.scan_limits(table.max_scan_bytes(), table.max_multi_scan_values());
         let order = generation.layout.order.as_ref();
         let (order_type, order_width) = order.map_or((v1::OrderType::Unspecified, 0), |order| {
             order_type_wire(order.order_type)
@@ -822,7 +822,7 @@ impl Service {
             order_width,
             max_scan_rows: limits.map_or(0, |limits| limits.max_scan_rows),
             max_multi_scan_values: limits
-                .map_or(0, |_| approx::count(table.max_multi_scan_values())),
+                .map_or(0, |limits| approx::count(limits.max_multi_scan_values)),
             max_scan_bytes: limits.map_or(0, |limits| approx::count(limits.max_scan_bytes)),
         }))
     }
