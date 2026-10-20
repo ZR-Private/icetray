@@ -2842,23 +2842,14 @@ mod tests {
         left_out: usize,
     }
 
-    impl std::ops::AddAssign for Seen {
-        fn add_assign(&mut self, other: Self) {
-            self.values += other.values;
-            self.rounds += other.rounds;
-            self.beyond += other.beyond;
-            self.exact += other.exact;
-            self.bridged += other.bridged;
-            self.left_out += other.left_out;
-        }
-    }
-
     /// Reads `cost`'s run at every bounded read of its points, every limit
     /// of `COST_LIMITS`, with no row deleted, with `some_deleted`, and with
     /// whole pages deleted by `middle_half_deleted` and
     /// `alternate_pages_deleted`, in every residency, and asserts the rows
     /// and `next` are the model's, every read with more than one GET runs
-    /// them in one round, and the pages read are within RFD 025's Cost:
+    /// them in one round, some read by the fences alone takes the bound's
+    /// page, some Disk read places its bound exactly, and the pages read
+    /// are within RFD 025's Cost:
     /// under Disk, where the order column is local and the bound's page is
     /// placed exactly first, the value pages fetched are those of the rows
     /// taken and the gaps between them the bridge takes (`taken_pages`),
@@ -2932,6 +2923,11 @@ mod tests {
         }
         assert!(seen.values > 0, "some read fetched a value page");
         assert!(seen.rounds > 0, "some read ran more than one GET");
+        assert!(
+            seen.beyond > 0,
+            "some read by the fences alone took the bound's page"
+        );
+        assert!(seen.exact > 0, "some Disk read placed its bound exactly");
         seen
     }
 
@@ -2989,31 +2985,34 @@ mod tests {
         }
     }
 
-    /// Under an integer order column, every bounded read is one round
-    /// within RFD 025's Cost: a run in one row
-    /// group between two neighbouring keys' rows, a run over exactly two
-    /// pages both shared with a neighbouring key, and a run across three
-    /// row groups.
+    /// Under an integer order column, every bounded read of a run in one
+    /// row group between two neighbouring keys' rows is one round within
+    /// RFD 025's Cost, and some fetches a page of deleted rows with its
+    /// spans.
     #[tokio::test]
-    async fn test_read_run_under_integer_orders_reads_one_round_within_the_promise() {
-        let costs = [
-            long_cost(bounded_run(0), 30),
-            long_cost(runs_of(&[(1, 3), (2, 4), (3, 3)], 10), 4),
-            long_cost(runs_of(&[(1, 5), (2, 16), (3, 3)], 8), 16),
-        ];
-        let mut seen = Seen::default();
-        for cost in &costs {
-            seen += assert_reads_within_the_cost_promise(cost).await;
-        }
-        assert!(
-            seen.beyond > 0,
-            "some read by the fences alone took the bound's page"
-        );
-        assert!(seen.exact > 0, "some Disk read placed its bound exactly");
+    async fn test_read_run_keeps_the_cost_promise_under_integer_orders_in_one_row_group() {
+        let seen = assert_reads_within_the_cost_promise(&long_cost(bounded_run(0), 30)).await;
         assert!(
             seen.bridged > 0,
             "some read fetched a page of deleted rows with its spans"
         );
+    }
+
+    /// Under an integer order column, every bounded read of a run over
+    /// exactly two pages, both shared with a neighbouring key, is one round
+    /// within RFD 025's Cost.
+    #[tokio::test]
+    async fn test_read_run_keeps_the_cost_promise_under_integer_orders_over_two_shared_pages() {
+        let run = runs_of(&[(1, 3), (2, 4), (3, 3)], 10);
+        assert_reads_within_the_cost_promise(&long_cost(run, 4)).await;
+    }
+
+    /// Under an integer order column, every bounded read of a run across
+    /// three row groups is one round within RFD 025's Cost.
+    #[tokio::test]
+    async fn test_read_run_keeps_the_cost_promise_under_integer_orders_across_row_groups() {
+        let run = runs_of(&[(1, 5), (2, 16), (3, 3)], 8);
+        assert_reads_within_the_cost_promise(&long_cost(run, 16)).await;
     }
 
     /// The bytes of each value of the cost model's wide run: drawn at
@@ -3042,32 +3041,62 @@ mod tests {
         );
     }
 
-    /// Under a string or binary order column, every bounded read is one
-    /// round within RFD 025's Cost: over a run whose values all share a
-    /// long prefix, one whose two halves have different prefixes, and one
-    /// whose first prefix fills exactly two whole pages.
-    #[tokio::test]
-    async fn test_read_run_under_byte_orders_reads_one_round_within_the_promise() {
-        let mut seen = Seen::default();
-        for order_type in [OrderType::String, OrderType::Binary] {
-            let costs = [
-                byte_cost(order_type, prefixed),
-                byte_cost(order_type, halved),
-                byte_cost(order_type, two_low_pages),
-            ];
-            for cost in &costs {
-                seen += assert_reads_within_the_cost_promise(cost).await;
-            }
-        }
-        assert!(
-            seen.beyond > 0,
-            "some read by the fences alone took the bound's page"
-        );
-        assert!(seen.exact > 0, "some Disk read placed its bound exactly");
+    /// Asserts `assert_reads_within_the_cost_promise` over the run of
+    /// `byte_cost(order_type, value)`, and that some read fetches a page of
+    /// deleted rows with its spans.
+    async fn assert_byte_orders_within_the_promise(
+        order_type: OrderType,
+        value: fn(usize) -> Vec<u8>,
+    ) {
+        let seen = assert_reads_within_the_cost_promise(&byte_cost(order_type, value)).await;
         assert!(
             seen.bridged > 0,
             "some read fetched a page of deleted rows with its spans"
         );
+    }
+
+    /// Under a string order column, every bounded read of a run whose values
+    /// all share a long prefix is one round within RFD 025's Cost.
+    #[tokio::test]
+    async fn test_read_run_keeps_the_cost_promise_under_string_orders_of_one_prefix() {
+        assert_byte_orders_within_the_promise(OrderType::String, prefixed).await;
+    }
+
+    /// Under a string order column, every bounded read of a run whose two
+    /// halves have different prefixes is one round within RFD 025's Cost.
+    #[tokio::test]
+    async fn test_read_run_keeps_the_cost_promise_under_string_orders_of_two_prefixes() {
+        assert_byte_orders_within_the_promise(OrderType::String, halved).await;
+    }
+
+    /// Under a string order column, every bounded read of a run whose first
+    /// prefix fills exactly two whole pages is one round within RFD 025's
+    /// Cost.
+    #[tokio::test]
+    async fn test_read_run_keeps_the_cost_promise_under_string_orders_with_two_low_pages() {
+        assert_byte_orders_within_the_promise(OrderType::String, two_low_pages).await;
+    }
+
+    /// Under a binary order column, every bounded read of a run whose values
+    /// all share a long prefix is one round within RFD 025's Cost.
+    #[tokio::test]
+    async fn test_read_run_keeps_the_cost_promise_under_binary_orders_of_one_prefix() {
+        assert_byte_orders_within_the_promise(OrderType::Binary, prefixed).await;
+    }
+
+    /// Under a binary order column, every bounded read of a run whose two
+    /// halves have different prefixes is one round within RFD 025's Cost.
+    #[tokio::test]
+    async fn test_read_run_keeps_the_cost_promise_under_binary_orders_of_two_prefixes() {
+        assert_byte_orders_within_the_promise(OrderType::Binary, halved).await;
+    }
+
+    /// Under a binary order column, every bounded read of a run whose first
+    /// prefix fills exactly two whole pages is one round within RFD 025's
+    /// Cost.
+    #[tokio::test]
+    async fn test_read_run_keeps_the_cost_promise_under_binary_orders_with_two_low_pages() {
+        assert_byte_orders_within_the_promise(OrderType::Binary, two_low_pages).await;
     }
 
     /// The run position, in `prefixed_run(LONG_PREFIXED_RUN_ROWS)`, of
