@@ -195,12 +195,17 @@ takes longer and its load on object storage stays within that cap.
 An ordered table holds many rows per key, each with an order value, such
 as a time series by key and timestamp or the activity of each user. The
 table's owner configures its order column, and `TableInfo` reports it in
-`order_column`, its type in `order_type`, the most rows one `Scan`
-returns in `max_scan_rows`, the most values one `MultiScan` may ask
-for in `max_multi_scan_values`, and the most bytes one `Scan` or
-`MultiScan` response may encode to in `max_scan_bytes`. A key-value table
-reports an empty `order_column` and a `max_scan_rows`,
-`max_multi_scan_values`, and `max_scan_bytes` of 0. The
+`order_column`, its type in `order_type`, its width, for `fixed`, in
+`order_width`, the most rows one `Scan` returns in `max_scan_rows`, the
+most values one `MultiScan` may ask for in `max_multi_scan_values`, and
+the most bytes one `Scan` or `MultiScan` response may encode to in
+`max_scan_bytes`. A key-value table reports an empty `order_column` and a
+`max_scan_rows`, `max_multi_scan_values`, and `max_scan_bytes` of 0. These
+limits can change while a caller holds them: the owner changes a table's
+`max_scan_rows` in place with a reload, and `max_multi_scan_values` and
+`max_scan_bytes`, which are the server's, with a restart. A caller that keeps them re-reads `TableInfo` when a call it
+sized by them fails as `INVALID_ARGUMENT` for its limit or its values, or
+as `FAILED_PRECONDITION` for its response size. The
 server rejects a `Get` or `MultiGet` of an ordered table, and a `Scan` or
 `MultiScan` of a key-value table, as `INVALID_ARGUMENT`. It decides this
 from the table's configuration before anything else about the call, so it
@@ -309,6 +314,15 @@ own receive limit to match, as grpc-go's `MaxCallRecvMsgSize` does; the
 doctor's `large_runs` advice tells the owner which tables would be
 refused at the full limit.
 
+When no row fits, the first row's values alone are above the bound, and
+a lower `limit` cannot help. The caller requests fewer columns, or trims
+a protobuf column to the fields it uses. To step past that row instead,
+it reads its order value with a `Scan` that lists no columns at a limit
+of 1, and steps past it as [Paging with `next`](#paging-with-next)
+describes for a malformed value. When not even the first key's result of
+a `MultiScan` fits, the caller reads that key with a `Scan`, whose refusal
+counts the rows that fit.
+
 ## Paging with `next`
 
 A caller reads a history longer than one response in pages. Each
@@ -365,11 +379,24 @@ the side the caller has already read appears only to a `Scan` that
 starts over, so a caller that needs every row of one snapshot compares
 the ids and starts over when they differ.
 
-A caller that steps past one row, such as a row whose value is not the
+A caller steps past one row, such as a row whose value is not the
 protobuf its column declares (`FAILED_PRECONDITION`, which names the
-row's order value), builds the bound as `next` is built: `before` set to
-that order value reading newest first, and `start` set to the least
-value above it reading oldest first.
+row's order value), in two reads, since the call that fails returns no
+rows, not even the ones before the bad row. The first read takes those
+rows, between the bound the page started from and the bad row: newest
+first, `start` set to the least value above the bad row's order value
+and `before` kept; oldest first, `before` set to the bad row's order
+value and `start` kept. The second goes on past the bad row, its bound
+built as `next` is built: newest first, `before` set to the bad row's
+order value and `start` kept; oldest first, `start` set to the least
+value above it and `before` kept. The
+least value above an order value is the one `next` would carry: one
+more for an integer or time type, and the value with one zero byte
+appended for a string, binary, or `fixed` type. Neither read returns the
+bad row, and together they return every other row of the window. Either
+read whose `start` would not be below its `before` holds no rows and is
+skipped, and either may carry `next`, which the caller follows as for any
+page.
 
 ## Scanning many keys
 
@@ -389,9 +416,10 @@ than its columns, the one being the order value. A `MultiScan` sets its
 limit per key, as a `Scan` does: a limit of 0 is `INVALID_ARGUMENT`. The
 server rejects a larger call as
 `INVALID_ARGUMENT` before it reads any key. A `MultiScan` at the
-table's full `max_scan_rows` with one column covers a few keys, and one
-with a limit of 20 and one column covers `server.max_multi_scan_values`
-divided by 40. A caller
+table's full `max_scan_rows` with one column covers
+`server.max_multi_scan_values` divided by twice `max_scan_rows` keys, and
+one with a limit of 20 and one column covers
+`server.max_multi_scan_values` divided by 40. A caller
 reading many keys requests a smaller limit and pages each key whose
 result has `next` set with a `Scan` of that key, passing that `next` as
 its bound, and a caller reading one key's full limit over
@@ -422,16 +450,17 @@ backoff, `UNAVAILABLE`, and `DEADLINE_EXCEEDED` when the caller's own
 deadline allows. Every other code recurs until the request, the value,
 or the snapshot changes. `RESOURCE_EXHAUSTED` is the server's overload
 alone: a response too large is never sent, but refused as
-`FAILED_PRECONDITION`. A `RESOURCE_EXHAUSTED` that a client library
-raises on its own for a message above its receive limit is not the server's
-and not worth a retry; the client raises its limit, or the caller lowers
-its `limit`.
+`FAILED_PRECONDITION`. A client library raises an error of its own for a
+response above its receive limit, `RESOURCE_EXHAUSTED` in grpc-go and
+grpc-java and `OUT_OF_RANGE` in tonic; it is not the server's and not
+worth a retry, and the client raises its limit, or the caller lowers its
+`limit`.
 
 | Code | Meaning | Retry |
 |---|---|---|
 | `NOT_FOUND` | The server does not serve a table of that name. | No |
 | `INVALID_ARGUMENT` | The request is invalid: a missing key, a key variant that does not match the table's key type, a uuid key that is not sixteen bytes, a column the table does not serve or one listed twice, a field list for a column that is not protobuf, a field number outside 1 to 536,870,911 or one listed twice, a `MultiGet` or `MultiScan` over its values limit, a `Scan` or `MultiScan` that sets no direction, sets a limit of 0 or one above the table's `max_scan_rows`, or sets a bound of the wrong variant, a bound with no variant, or a `start` at or above `before` (an empty window), or a call of the wrong kind for the table (`Get` or `MultiGet` of an ordered table, `Scan` or `MultiScan` of a key-value table). | No; fix the request |
-| `FAILED_PRECONDITION` | A request listed fields of a value that is not protobuf. The error names the table, column, and key, and for a `Scan` the order value of the row that holds the value, which a caller paging the key's rows steps past. Or a `Scan` or `MultiScan` response would encode to more than `server.max_scan_bytes` ([Response size](#response-size)). | No; it recurs until the writer rewrites the value. Read that column whole, or drop the key. For a response size, lower `limit` or request fewer columns or keys. |
+| `FAILED_PRECONDITION` | A request listed fields of a value that is not protobuf. The error names the table, column, and key, and for a `Scan` the order value of the row that holds the value, which a caller paging the key's rows steps past ([Paging with `next`](#paging-with-next)). Or a `Scan` or `MultiScan` response would encode to more than `server.max_scan_bytes` ([Response size](#response-size)). | No; it recurs until the writer rewrites the value. Read that column whole, or drop the key. For a response size, lower `limit` or request fewer columns or keys, or, when nothing fits, as [Response size](#response-size) describes. |
 | `RESOURCE_EXHAUSTED` | The server is at `server.max_in_flight` calls and refused this one at once. | Yes, with backoff |
 | `UNAVAILABLE` | A read from object storage or local disk failed, the table is not ready yet, or a lookup was canceled. | Yes |
 | `DEADLINE_EXCEEDED` | A `Get`, or a page fetch within any lookup, ran past `server.get_deadline`, a `MultiGet` ran past `server.multi_get_deadline`, a `Scan`, or a GET within any `Scan` or `MultiScan`, of a span of pages or of a key page under `bloom`, ran past `server.scan_deadline`, or a `MultiScan` ran past `server.multi_scan_deadline`. [Configuration](configuration.md#server) gives each deadline. | Yes, if the caller's own deadline allows |
@@ -440,6 +469,17 @@ its `limit`.
 The gRPC layer enforces a deadline the client sends and reports its
 expiry to the client (a tonic client sees `CANCELLED`), and the server
 drops the call at that moment.
+
+The gRPC layer also answers two faults of a request before the server
+reads it, with codes of its own:
+
+- A request message above 4 MiB encoded, the server's receive limit, is
+  `OUT_OF_RANGE`, as a `MultiGet` or `MultiScan` of many long keys can
+  be. The caller splits it into smaller calls.
+- A request whose `Key.str` or `OrderValue.str` is not valid UTF-8 does
+  not decode, and is `INTERNAL`. The fault is the request's, not the
+  table's, so the caller fixes the request rather than waiting for the
+  table to advance.
 
 The server hedges a slow GET to object storage with a second one to cut
 tail latency, under the settings in
