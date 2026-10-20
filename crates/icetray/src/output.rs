@@ -754,8 +754,11 @@ mod tests {
         let past = EXACT_LONG + 1;
         let file = ordered_file(OrderValue::Long(-past), OrderValue::Long(past));
         let text = serde_json::to_string(&FileLine::new(TABLE, &file)).unwrap();
-        assert!(text.contains(&format!("\"min\":{}", -past)), "{text}");
-        assert!(text.contains(&format!("\"max\":{past}")), "{text}");
+        // Parsed back, an integer stays an exact `i64`, and a float or a
+        // string in its place compares unequal to one.
+        let line: Json = serde_json::from_str(&text).unwrap();
+        assert_eq!(line["order"]["min"], Json::from(-past), "{text}");
+        assert_eq!(line["order"]["max"], Json::from(past), "{text}");
     }
 
     #[test]
