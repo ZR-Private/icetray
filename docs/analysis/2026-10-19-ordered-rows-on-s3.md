@@ -50,8 +50,9 @@ them. It also checks every answer against the derivation in
   - `golden` is the icetray-testkit golden test binary.
 - **Tables.** About 20 million rows over 200,000 keys, with 1 to about
   10,000 rows per key (heavy-tailed) and `bucket(64, key)`. The order
-  column is `ts BIGINT`, plus one value column of about 100
-  incompressible bytes. Spark 4.1.3 and Iceberg wrote the files,
+  column is `ts BIGINT`, plus one value column of 128 bytes: two
+  hex SHA-256 digests, which ZSTD compresses about 1.9 times. Spark
+  4.1.3 and Iceberg wrote the files,
   ZSTD-compressed, with key bloom filters at fpp 0.01 and no NDV.
   - `ref_compacted`: 64 files, one row group each; level `optimal`.
   - `ref_appended`: the same rows, uncompacted, giving 320 files (five
@@ -134,9 +135,18 @@ Rounds per Scan were 1.00 to 1.08 under `full` and `disk` and 2.00 to
   Scan takes 0.7 ms, and `ref_appended`'s five files take 0.7 to 1.9 ms.
   A light warm Scan allocates 182 KB to return 1.5 KB from two cached
   pages. The cache holds pages compressed, as the file holds them (RFD
-  006), so each hit decompresses a 68 KiB ZSTD page. This run did not
-  profile the cost; whether decompression accounts for it is RFD 006's
-  open question about a decompressed-page level.
+  006), so each hit decompresses a 68 KiB ZSTD page into about 132 KB.
+  A local profile on an M3 Pro (`/usr/bin/sample`, warm light-key
+  Scans of `ref_compacted` under `full`, 86 µs at p50 there) put 93% of
+  the busy samples in ZSTD decompression, 85% for the value page and 6%
+  for the order page, mostly Huffman decoding of the hex literals. The
+  Scan logic took about 3%, allocation 1.5%, and Parquet decoding 1.7%.
+  The bench's own ordered table, whose random values ZSTD stores raw,
+  takes 16.4 µs for a warm Scan of 100 rows. A decompressed-page
+  level would remove most of a warm Scan on values that compress, at
+  their compression ratio in memory; whether that pays is RFD 006's open
+  question about such a level, which turns on the page cache's hit
+  rate.
 
 ## Span GET latency by size
 
@@ -288,8 +298,9 @@ It does not establish:
   Exercising them needs an overlapping table with several row groups
   per file, for example `ref_large_files` with the append batches left
   uncompacted.
-- **Warm-hit cost.** What a warm hit spends its CPU on. No profiler ran
-  on the host.
+- **Warm-hit cost on the host.** The profile ran on a laptop, not on the
+  Linux host; the host's warm Scan is 2.7 times slower, and the shares
+  there are inferred from the laptop's, not measured.
 - **Generality.** Every number comes from one host, one region, and one
   evening. Latency at other times or from other networks may differ.
 
