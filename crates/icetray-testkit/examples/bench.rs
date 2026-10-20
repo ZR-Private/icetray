@@ -48,15 +48,19 @@
 //! `MultiScan`s of 10 and 100 keys at each key's newest row and a light
 //! key's most rows (`reference_multi_limits`); and first loads with their
 //! Disk restarts, whose rounds of GETs and held bytes show the
-//! uniqueness merge of `ref_appended`'s overlap groups and the read-ahead
-//! over `ref_large_files`' row groups. Every request's answers are first
+//! uniqueness merge of `ref_appended`'s overlap groups, the read-ahead
+//! over `ref_large_files`' row groups, and both at once over
+//! `ref_large_appended`'s files, more than a load of four worker threads
+//! reads at once. Every request's answers are first
 //! compared whole with the derivation (`golden::derived_scan`). Every
 //! request of the warehouse's store goes through a `GetLog` beneath the
 //! rounds count, and each run reports its window's GETs by the data pages
 //! each spans and by its bytes, with each class's latency to the answer
 //! and to the last byte. `--reference-table`, `--reference-scenario`, and
-//! `--rows-tier` narrow it, and its JSON says what it is (`"run":
-//! "reference"`) and, per row, what each figure is of.
+//! `--rows-tier` narrow it, `--reference-max-scan-rows` raises the tables'
+//! `max_scan_rows`, at which the Scans run, so a heavy key's spans hold
+//! more pages, and its JSON says what it is (`"run": "reference"`), the
+//! limits it served at, and, per row, what each figure is of.
 
 use std::alloc::{GlobalAlloc, Layout};
 use std::collections::hash_map::Entry;
@@ -75,8 +79,8 @@ use clap::{Parser, ValueEnum};
 use iceberg::spec::MAIN_BRANCH;
 use icetray_core::ColumnRead;
 use icetray_core::config::{
-    LocalConfig, Residency, RewriteRule, ServerConfig, SourceConfig, StorageConfig, TableConfig,
-    ValueColumnConfig, ValueFormat,
+    Config, LocalConfig, MULTI_SCAN_VALUES_PER_SCAN_ROW, Residency, RewriteRule, ServerConfig,
+    SourceConfig, StorageConfig, TableConfig, ValueColumnConfig, ValueFormat,
 };
 use icetray_core::contract::{TARGET_FILE_BYTES_MAX, VALUE_PAGE_BYTES};
 use icetray_core::{
@@ -743,9 +747,22 @@ struct Cli {
     )]
     reference: Option<String>,
     /// The reference tables to serve: `ref_compacted`, `ref_appended`,
-    /// `ref_string`, `ref_large_files`.
+    /// `ref_string`, `ref_large_files`, `ref_large_appended`.
     #[arg(long, value_delimiter = ',', requires = "reference")]
     reference_table: Vec<GoldenTable>,
+    /// The `max_scan_rows` of every served reference table, in place of
+    /// the default; the Scan scenarios run at it, so a heavy key's Scans
+    /// read longer spans. `server.max_multi_scan_values` rises to the least
+    /// that admits it when its default does not. A value a server would
+    /// refuse to start with is refused, and so is one below the `MultiScan`
+    /// scenarios' limits.
+    #[arg(
+        long,
+        value_name = "ROWS",
+        requires = "reference",
+        value_parser = clap::builder::RangedU64ValueParser::<u32>::new().range(1..),
+    )]
+    reference_max_scan_rows: Option<u32>,
     /// What to measure of each reference table.
     #[arg(long, value_enum, value_delimiter = ',', requires = "reference")]
     reference_scenario: Vec<ReferenceScenario>,
@@ -757,18 +774,26 @@ struct Cli {
 
 /// How every table of the run is served: over the production storage
 /// defaults with the run's `--rewrite-location` rules, under the run's
-/// `--batch-fan-out`.
+/// `--batch-fan-out`, and each reference table at the run's
+/// `--reference-max-scan-rows`, under the `server.max_multi_scan_values`
+/// that admits it.
 #[derive(Clone, Debug)]
 struct Serving {
     storage: StorageConfig,
     batch_fan_out: usize,
+    /// A reference table's `max_scan_rows`; the default when `None`.
+    reference_max_scan_rows: Option<u32>,
+    max_multi_scan_values: usize,
 }
 
 impl Default for Serving {
     fn default() -> Self {
+        let server = ServerConfig::default();
         Self {
             storage: StorageConfig::default(),
-            batch_fan_out: ServerConfig::default().batch_fan_out,
+            batch_fan_out: server.batch_fan_out,
+            reference_max_scan_rows: None,
+            max_multi_scan_values: server.max_multi_scan_values,
         }
     }
 }
@@ -776,9 +801,19 @@ impl Default for Serving {
 /// The run's `Serving`.
 static SERVING: OnceLock<Serving> = OnceLock::new();
 
-/// Sets `SERVING` from `cli`'s `--rewrite-location` rules and
-/// `--batch-fan-out`, once.
+/// Sets `SERVING` from `cli`'s `--rewrite-location` rules,
+/// `--batch-fan-out`, and `--reference-max-scan-rows`, once: under the
+/// last, `server.max_multi_scan_values` is its default or, when that is
+/// lower, the least a table at that `max_scan_rows` is valid under.
 fn set_serving(cli: &Cli) {
+    let defaults = Serving::default();
+    let max_multi_scan_values = match cli.reference_max_scan_rows {
+        Some(rows) => {
+            let admits = approx::length(rows).saturating_mul(MULTI_SCAN_VALUES_PER_SCAN_ROW);
+            defaults.max_multi_scan_values.max(admits)
+        }
+        None => defaults.max_multi_scan_values,
+    };
     SERVING
         .set(Serving {
             storage: StorageConfig {
@@ -786,6 +821,8 @@ fn set_serving(cli: &Cli) {
                 ..StorageConfig::default()
             },
             batch_fan_out: cli.batch_fan_out,
+            reference_max_scan_rows: cli.reference_max_scan_rows,
+            max_multi_scan_values,
         })
         .expect("main sets the serving configuration once");
 }
@@ -1780,9 +1817,10 @@ struct Stack {
 
 /// The handles of a process serving over `storage` in `tier`, as
 /// `open_with` gives a process's tables: a `cache_bytes` page cache and a
-/// `cache_bytes` scan cache, the run's `--batch-fan-out`, the server's
-/// defaults otherwise, and under Disk a local directory with no page-cache
-/// disk level, `reuse`'s when given (`local_for`).
+/// `cache_bytes` scan cache, the run's `--batch-fan-out` and
+/// `server.max_multi_scan_values` (`Serving`), the server's defaults
+/// otherwise, and under Disk a local directory with no page-cache disk
+/// level, `reuse`'s when given (`local_for`).
 async fn stack(
     storage: &Arc<Storage>,
     tier: Tier,
@@ -1798,7 +1836,7 @@ async fn stack(
         findings: FindingLog::Events,
         batch_fan_out: serving().batch_fan_out,
         scan_cache: PageCache::for_scans(cache_bytes),
-        max_multi_scan_values: ServerConfig::default().max_multi_scan_values,
+        max_multi_scan_values: serving().max_multi_scan_values,
         max_scan_bytes: ServerConfig::default().max_scan_bytes,
     };
     Ok(Stack {
@@ -4292,11 +4330,7 @@ async fn serve_reference(
     } = stack(&storage, tier, cache_bytes, reuse).await?;
     let cache = handles.cache.clone();
     let scan_cache = handles.scan_cache.clone();
-    let config = TableConfig {
-        residency: tier.residency(),
-        ..golden::table_config(warehouse, table, false)
-    };
-    let table = table_of(config, handles).await?;
+    let table = table_of(reference_config(warehouse, table, tier), handles).await?;
     Ok(Served {
         table: Arc::new(table),
         beside: None,
@@ -4308,6 +4342,51 @@ async fn serve_reference(
         gets: logged,
         _local: dir,
     })
+}
+
+/// `table` of the reference warehouse `warehouse` as the run serves it in
+/// `tier`: the golden tests' configuration, at the run's
+/// `--reference-max-scan-rows` when given.
+fn reference_config(warehouse: &str, table: GoldenTable, tier: Tier) -> TableConfig {
+    TableConfig {
+        residency: tier.residency(),
+        max_scan_rows: serving().reference_max_scan_rows,
+        ..golden::table_config(warehouse, table, false)
+    }
+}
+
+/// Refuses a run serving `tables` of `warehouse` as a server would refuse
+/// to start serving them: each table's configuration under the run's
+/// server settings, through the validation a configuration file goes
+/// through (`Config::validated`), under the Full tier, whose settings every
+/// tier's share. Refuses as well a `--reference-max-scan-rows` below a
+/// `MultiScan` limit (`reference_multi_limits`), which every `MultiScan`
+/// scenario would be refused at.
+fn validate_reference(warehouse: &str, tables: &[GoldenTable]) -> BenchResult<()> {
+    let serving = serving();
+    if let Some(rows) = serving.reference_max_scan_rows {
+        let limits = reference_multi_limits();
+        if limits.iter().any(|&limit| limit > rows) {
+            return Err(format!(
+                "--reference-max-scan-rows {rows} is below the MultiScan limits {limits:?}"
+            )
+            .into());
+        }
+    }
+    let config = Config {
+        server: ServerConfig {
+            batch_fan_out: serving.batch_fan_out,
+            max_multi_scan_values: serving.max_multi_scan_values,
+            ..ServerConfig::default()
+        },
+        storage: serving.storage,
+        tables: tables
+            .iter()
+            .map(|&table| reference_config(warehouse, table, Tier::Full))
+            .collect(),
+    };
+    config.validated()?;
+    Ok(())
 }
 
 /// The data pages of a generation's files, by `GetLog::name_of_location`
@@ -4671,6 +4750,13 @@ fn reference_settings(cli: &Cli, warehouse: &str, tables: &[GoldenTable]) -> Jso
         "cold": "the page cache and the scan cache emptied before each operation, outside its timing",
         "warm": "every key a warm scenario reads paged through whole before it is measured",
         "verified": "every request's answers compared whole with the derivation before it is measured",
+        "reference_max_scan_rows": cli.reference_max_scan_rows,
+        "max_scan_rows": tables
+            .first()
+            .and_then(|&table| reference_config(warehouse, table, Tier::Full).scan_rows()),
+        "max_multi_scan_values": serving().max_multi_scan_values,
+        "max_scan_bytes": ServerConfig::default().max_scan_bytes,
+        "scan_limit": "every Scan scenario at max_scan_rows, the served tables' limit",
         "tier_samples": REFERENCE_TIER_SAMPLES,
         "multi_scan_keys": REFERENCE_MULTI_KEYS,
         "multi_scan_limits": reference_multi_limits(),
@@ -4694,6 +4780,7 @@ async fn reference_main(cli: &Cli, warehouse: &str, settings: &RunSettings) -> B
     if let Some(table) = tables.iter().find(|table| !table.is_reference()) {
         return Err(format!("{table} is not a reference table").into());
     }
+    validate_reference(warehouse, &tables)?;
     let selection = RefSelection {
         scenarios: or_all(&cli.reference_scenario, ReferenceScenario::value_variants()),
         rows_tiers: or_all(&cli.rows_tier, &RowsTier::ALL),

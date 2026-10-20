@@ -141,7 +141,7 @@ pub const DEFAULT_MAX_SCAN_ROWS: u32 = 1_000;
 /// `max_multi_scan_values` holds: a `MultiScan` of one key at the full
 /// limit and one column counts each row once for its order value and once
 /// for the column (RFD 025), so such a call is always valid.
-const MULTI_SCAN_VALUES_PER_SCAN_ROW: usize = 2;
+pub const MULTI_SCAN_VALUES_PER_SCAN_ROW: usize = 2;
 
 /// GETs one batch (a `MultiGet`, a `Scan`, or a `MultiScan`) holds in
 /// flight at once when the file says nothing: 64 (RFD 013, RFD 022, RFD
