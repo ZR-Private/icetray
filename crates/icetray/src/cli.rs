@@ -109,8 +109,8 @@ fn footer() -> String {
     )
 }
 
-/// Serve get-by-key lookups over Apache Iceberg tables, or inspect and
-/// query them.
+/// Serve lookups by key, and ordered Scans of a key's rows, over Apache
+/// Iceberg tables, or inspect and query them.
 #[derive(Parser, Debug)]
 #[command(name = "icetray", version, after_help = footer())]
 pub struct Cli {

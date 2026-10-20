@@ -1,7 +1,8 @@
-//! Everything from bytes to lookups for serving get-by-key over Apache
-//! Iceberg tables: keys, storage, catalog, manifests, the resident index,
-//! the page cache, generations, the doctor, and configuration. The binary
-//! and the testkit build on this crate; it depends on neither.
+//! Everything from bytes to answers for serving lookups by key, and ordered
+//! Scans of a key's rows, over Apache Iceberg tables: keys, storage,
+//! catalog, manifests, the resident index, the page cache, generations, the
+//! doctor, and configuration. The binary and the testkit build on this
+//! crate; it depends on neither.
 
 pub mod approx;
 mod aws_catalog;
