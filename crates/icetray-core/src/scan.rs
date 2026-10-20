@@ -11,6 +11,7 @@ use bytes::Bytes;
 
 use crate::error::Error;
 use crate::key::Key;
+use crate::manifest::{ColumnRead, check_column_reads};
 use crate::order::{Direction, OrderValue, OrderVariant, ScanBounds};
 use crate::snapshot::SnapshotId;
 
@@ -225,11 +226,43 @@ pub(crate) fn check_limit(bounds: &ScanBounds, max_scan_rows: u32) -> Result<(),
     }
 }
 
+/// The faults a Scan or `MultiScan` request of `table` reading `columns`
+/// under `bounds` holds whatever the table is, checked before the table is
+/// looked up: `Error::ScanRequest` with `ScanRequestFault::EmptyWindow` for
+/// a `start` at or above a `before` of its variant (`check_window`), then
+/// the faults `check_column_reads` names. A key-value table takes no Scan,
+/// so these come before `Error::WrongTableKind` too.
+pub fn check_scan_request(
+    table: &str,
+    columns: &[ColumnRead<'_>],
+    bounds: &ScanBounds,
+) -> crate::error::Result<()> {
+    check_window(bounds).map_err(|fault| Error::ScanRequest {
+        table: table.to_string(),
+        fault,
+    })?;
+    check_column_reads(table, columns)
+}
+
+/// `ScanRequestFault::EmptyWindow` for a `start` at or above `before` when
+/// both are of one variant, which compares the same under every order type
+/// that travels as it. Bounds of two variants are a `BoundVariant` fault
+/// for the one the table's order type does not take
+/// (`check_bound_variants`), so their window is never compared.
+fn check_window(bounds: &ScanBounds) -> Result<(), ScanRequestFault> {
+    if let (Some(start), Some(before)) = (&bounds.start, &bounds.before)
+        && start.variant() == before.variant()
+        && start >= before
+    {
+        return Err(ScanRequestFault::EmptyWindow);
+    }
+    Ok(())
+}
+
 /// `ScanRequestFault::BoundVariant` for a bound of another variant than
-/// `expected`, and `ScanRequestFault::EmptyWindow` for a `start` at or
-/// above `before`. A bound past the range of an `int` or `date` column is
-/// no fault: it admits every row on its side.
-pub(crate) fn check_bounds(
+/// `expected`, `start` first. A bound past the range of an `int` or `date`
+/// column is no fault: it admits every row on its side.
+pub(crate) fn check_bound_variants(
     bounds: &ScanBounds,
     expected: OrderVariant,
 ) -> Result<(), ScanRequestFault> {
@@ -246,11 +279,6 @@ pub(crate) fn check_bounds(
                 got: bound.variant(),
             });
         }
-    }
-    if let (Some(start), Some(before)) = (&bounds.start, &bounds.before)
-        && start >= before
-    {
-        return Err(ScanRequestFault::EmptyWindow);
     }
     Ok(())
 }
@@ -420,14 +448,14 @@ mod tests {
     }
 
     #[test]
-    fn test_check_bounds_refuses_another_variant_and_an_empty_window() {
+    fn test_check_bound_variants_refuses_another_variant_in_either_position() {
         let long = |value| Some(OrderValue::Long(value));
         assert_eq!(
-            check_bounds(&bounds(0, long(1), long(2)), OrderVariant::Long),
+            check_bound_variants(&bounds(0, long(1), long(2)), OrderVariant::Long),
             Ok(())
         );
         assert_eq!(
-            check_bounds(
+            check_bound_variants(
                 &bounds(0, None, Some(OrderValue::Str("a".to_string()))),
                 OrderVariant::Long
             ),
@@ -438,7 +466,7 @@ mod tests {
             })
         );
         assert_eq!(
-            check_bounds(
+            check_bound_variants(
                 &bounds(0, Some(OrderValue::Bytes(vec![1])), None),
                 OrderVariant::Str
             ),
@@ -448,31 +476,71 @@ mod tests {
                 got: OrderVariant::Bin,
             })
         );
+        assert_eq!(
+            check_bound_variants(&bounds(0, long(3), long(2)), OrderVariant::Long),
+            Ok(()),
+            "an empty window is check_window's"
+        );
+    }
+
+    #[test]
+    fn test_check_window_refuses_start_at_or_above_before_of_one_variant() {
+        let long = |value| Some(OrderValue::Long(value));
         for (start, before) in [(2, 2), (3, 2), (i64::MAX, i64::MAX), (i64::MAX, i64::MIN)] {
             assert_eq!(
-                check_bounds(&bounds(0, long(start), long(before)), OrderVariant::Long),
+                check_window(&bounds(0, long(start), long(before))),
                 Err(ScanRequestFault::EmptyWindow),
                 "{start} {before}"
             );
         }
         let text = |value: &str| Some(OrderValue::Str(value.to_string()));
         assert_eq!(
-            check_bounds(&bounds(0, text("a"), text("a")), OrderVariant::Str),
+            check_window(&bounds(0, text("a"), text("a"))),
             Err(ScanRequestFault::EmptyWindow),
             "a window of one string holds nothing: before excludes what start includes"
         );
         assert_eq!(
-            check_bounds(&bounds(0, text("a"), text("a\0")), OrderVariant::Str),
+            check_window(&bounds(0, text("a"), text("a\0"))),
             Ok(()),
             "the least string above \"a\" admits \"a\" alone"
         );
         assert_eq!(
-            check_bounds(
-                &bounds(0, long(i64::MIN), long(i64::MAX)),
-                OrderVariant::Long
-            ),
+            check_window(&bounds(0, long(i64::MIN), long(i64::MAX))),
             Ok(())
         );
+        for (start, before) in [(None, long(0)), (long(0), None), (None, None)] {
+            assert_eq!(check_window(&bounds(0, start, before)), Ok(()));
+        }
+        assert_eq!(
+            check_window(&bounds(0, text("a"), long(0))),
+            Ok(()),
+            "bounds of two variants are never compared"
+        );
+    }
+
+    #[test]
+    fn test_check_scan_request_refuses_an_empty_window_before_a_repeated_column() {
+        let long = |value| Some(OrderValue::Long(value));
+        let repeated = [ColumnRead::whole("a"), ColumnRead::whole("a")];
+        let Err(Error::ScanRequest { table, fault }) =
+            check_scan_request(TABLE, &repeated, &bounds(0, long(2), long(2)))
+        else {
+            panic!("an empty window is refused");
+        };
+        assert_eq!(
+            (table.as_str(), fault),
+            (TABLE, ScanRequestFault::EmptyWindow)
+        );
+        let Err(Error::ColumnRequest { column, fault, .. }) =
+            check_scan_request(TABLE, &repeated, &bounds(0, long(1), long(2)))
+        else {
+            panic!("a repeated column is refused");
+        };
+        assert_eq!(
+            (column.as_str(), fault),
+            ("a", crate::manifest::ColumnRequestFault::Repeated)
+        );
+        assert!(check_scan_request(TABLE, &repeated[..1], &bounds(0, long(1), long(2))).is_ok());
     }
 
     #[test]

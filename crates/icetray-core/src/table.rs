@@ -37,11 +37,11 @@ use crate::index::RunSource;
 use crate::key::{Key, KeyType};
 use crate::level::{Level, PageCacheCondition};
 use crate::local::{LocalDir, ResidentPages, Unobserved};
-use crate::manifest::{ColumnRead, Selection, TableLayout};
+use crate::manifest::{ColumnRead, Selection, TableLayout, check_column_reads};
 use crate::metric::{self, LookupResult, ScanResult, Temperature};
 use crate::order::{OrderValue, ScanBounds};
 use crate::projection;
-use crate::scan::{self, MultiScanLookup, Oversize, ScanLookup, Scanned};
+use crate::scan::{self, MultiScanLookup, Oversize, ScanLookup, ScanRequestFault, Scanned};
 use crate::shard::{self, Line, Sharded};
 use crate::snapshot::{SequenceNumber, SnapshotId};
 use crate::storage::{HedgeWindow, Storage};
@@ -1517,16 +1517,19 @@ impl Table {
     /// One lookup against the serving generation, reading the value
     /// columns `columns` names, answered in that order, each value trimmed
     /// to the fields its read names (RFD 024); none answers presence alone
-    /// (RFD 022). `Error::WrongTableKind` on an ordered table, which `scan`
-    /// serves (RFD 025), whether or not it has loaded; `Error::NotReady`
-    /// with no generation; `Error::KeyType` for
-    /// a key of another type than the table's and `Error::ColumnRequest` for
-    /// a column the generation does not serve, one named twice, or a field
-    /// list the entry's format for it does not take, each before any read
-    /// (`TableLayout::select`); `Error::MalformedValue` for a value that is
+    /// (RFD 022). Refused before any read, in this order: the faults
+    /// `check_column_reads` names, a column named twice or a field list out
+    /// of range or with a number named twice, whatever the table holds;
+    /// `Error::WrongTableKind` on an ordered table, which `scan` serves (RFD
+    /// 025), whether or not it has loaded; `Error::NotReady` with no
+    /// generation; `Error::KeyType` for a key of another type than the
+    /// table's; and `Error::ColumnRequest` for a column the generation does
+    /// not serve or a field list the entry's format for it does not take
+    /// (`TableLayout::select`). `Error::MalformedValue` for a value that is
     /// not the protobuf its column declares, when its read names fields.
     pub async fn get(&self, key: &Key, columns: &[ColumnRead<'_>]) -> Result<Lookup> {
         let _in_flight = self.lookups.enter();
+        check_column_reads(&self.name, columns)?;
         self.check_kind(TableKind::KeyValue)?;
         // A guard held across the lookup's awaits stays correct wherever
         // the task resumes. While held it occupies one of the loading
@@ -1561,13 +1564,13 @@ impl Table {
 
     /// Several lookups against one generation, each reading the value
     /// columns `columns` names, trimmed as `get` trims them, answered in
-    /// key order (RFD 022). The table's kind, every key's type, and the
-    /// columns are checked before any read, as `get` checks them, so a
-    /// mismatch anywhere fails
-    /// the whole call and issues nothing; any failure fails the whole call
-    /// (RFD 010), a malformed value of any key included (RFD 024). While
-    /// fewer `get` and `multi_get` calls than worker threads are in flight
-    /// on the tables sharing this one's `TableHandles::calls`, this one
+    /// key order (RFD 022). The columns, the table's kind, its readiness,
+    /// every key's type, and the columns against the generation are checked
+    /// before any read, in the order `get` checks them, so a mismatch
+    /// anywhere fails the whole call and issues nothing; any failure fails
+    /// the whole call (RFD 010), a malformed value of any key included (RFD
+    /// 024). While fewer `get` and `multi_get` calls than worker threads
+    /// are in flight on the tables sharing this one's `TableHandles::calls`, this one
     /// included, the keys are split, in order and evenly, into one run for
     /// each `MULTI_GET_TASK_KEYS_MIN` keys or part of them, up to one per
     /// worker thread (`shard::workers`), each spawned as a task so a
@@ -1584,6 +1587,7 @@ impl Table {
     /// canceled under a runtime shutdown is `Error::LookupCanceled`.
     pub async fn multi_get(&self, keys: &[Key], columns: &[ColumnRead<'_>]) -> Result<MultiLookup> {
         let _in_flight = self.lookups.enter();
+        check_column_reads(&self.name, columns)?;
         self.check_kind(TableKind::KeyValue)?;
         let generation = self.serving()?;
         for key in keys {
@@ -1620,11 +1624,13 @@ impl Table {
     /// `max_scan_rows`, each its order value and one value per
     /// column of `columns`, trimmed to the fields its read names as `get`
     /// trims them, and the next page's bound, `Scanned::next`, when live
-    /// rows remain inside the bounds past the last returned. Raised before any read:
-    /// `Error::WrongTableKind` on a key-value table, whether or not it has
-    /// loaded, then `Error::NotReady` with no generation, and the faults
-    /// `check_scan` names. Every file holding the
-    /// key is read in one round (`Generation::scan`) through the scan cache,
+    /// rows remain inside the bounds past the last returned. Raised before
+    /// any read, in this order: the faults `scan::check_scan_request` names,
+    /// whatever the table holds; those `check_scan` names, from the table's
+    /// entry, `Error::WrongTableKind` on a key-value table among them,
+    /// whether or not it has loaded; `Error::NotReady` with no generation;
+    /// and the faults `select_scan` names against the generation. Every
+    /// file holding the key is read in one round (`Generation::scan`) through the scan cache,
     /// each fetch ending at `scan_deadline`, its span GETs hedged in the
     /// table's span window, and every GET holding one of
     /// `TableHandles::batch_fan_out` permits while it runs. Counted under
@@ -1666,13 +1672,13 @@ impl Table {
 
     /// Scans of `keys` from one generation, each answered as `scan`
     /// answers it, in key order, a key listed twice at each position (RFD
-    /// 025). Every key's type, the columns, the limit, and the bounds are
-    /// checked before any read, as `scan` checks them, and so is the
-    /// request's size: keys times the limit times one more than
-    /// the columns above `server.max_multi_scan_values` is
-    /// `Error::ScanRequest` with `ScanRequestFault::TooManyValues`. A key
-    /// listed more than once is read once and its answer given at each
-    /// position. While fewer calls than worker threads are in flight on
+    /// 025). The request is checked before any read as `scan` checks it,
+    /// with `check_multi_scan` in place of `check_scan`, which holds its
+    /// size too: keys times the limit times one more than the columns
+    /// above `server.max_multi_scan_values` is `Error::ScanRequest` with
+    /// `ScanRequestFault::TooManyValues`, whether or not the table has
+    /// loaded. A key listed more than once is read once and its answer
+    /// given at each position. While fewer calls than worker threads are in flight on
     /// the tables sharing this one's `TableHandles::calls`, this one
     /// included, the distinct keys are split, in order and evenly, into one
     /// run for each `MULTI_SCAN_TASK_KEYS_MIN` distinct keys or part of
@@ -1769,9 +1775,10 @@ impl Table {
     }
 
     /// A Scan call of `keys` reading `columns` under `bounds` (`multi` for
-    /// a `MultiScan`), ready to read: `Error::WrongTableKind` on a
-    /// key-value table, then `Error::NotReady` with no generation, then the
-    /// faults `check_scan` names, all before any read; otherwise the
+    /// a `MultiScan`), ready to read: the faults `scan::check_scan_request`
+    /// names, then those of `check_scan` or, for a `MultiScan`,
+    /// `check_multi_scan`, then `Error::NotReady` with no generation, then
+    /// the faults `select_scan` names, all before any read; otherwise the
     /// serving generation, the checked request, a fan-out of
     /// `TableHandles::batch_fan_out` permits, and the call's receipt.
     fn scan_call(
@@ -1781,9 +1788,15 @@ impl Table {
         bounds: &ScanBounds,
         multi: bool,
     ) -> Result<ScanCall> {
+        scan::check_scan_request(&self.name, columns, bounds)?;
+        if multi {
+            self.check_multi_scan(keys.len(), columns.len(), bounds)?;
+        } else {
+            self.check_scan(bounds)?;
+        }
         let scans = self.ordered()?;
         let generation = self.serving()?;
-        let selection = self.check_scan(&generation, keys, columns, bounds, multi)?;
+        let selection = self.select_scan(&generation, keys, columns, bounds)?;
         let fan_out = Arc::new(Semaphore::new(self.lookups.batch_fan_out));
         let receipt = ScanReceipt::new(&self.name, &scans.metrics);
         Ok(ScanCall {
@@ -2537,8 +2550,8 @@ impl Table {
 
     /// Which calls the table serves, fixed by its entry's `order_column`
     /// when it is built: known before any generation loads, so a call of
-    /// the wrong kind is refused ahead of the readiness check and of
-    /// reading the request (`check_kind`).
+    /// the wrong kind is refused ahead of the readiness check
+    /// (`check_kind`).
     pub fn kind(&self) -> TableKind {
         match self.scans {
             Some(_) => TableKind::Ordered,
@@ -2548,10 +2561,10 @@ impl Table {
 
     /// `Error::WrongTableKind` for a call that serves tables of the
     /// `served` kind when this table is of the other (RFD 025): the gRPC
-    /// service runs it before it reads a key or a bound off the wire, and
-    /// `get`, `multi_get`, `scan`, and `multi_scan` before they look for a
-    /// generation, so a call that can never be answered is never
-    /// `NotReady`, which a caller retries.
+    /// service runs it before it admits a call, and `get`, `multi_get`,
+    /// `scan`, and `multi_scan` before they look for a generation, each
+    /// after the faults the request holds on its own, so a call that can
+    /// never be answered is never `NotReady`, which a caller retries.
     pub fn check_kind(&self, served: TableKind) -> Result<()> {
         if self.kind() == served {
             Ok(())
@@ -2581,30 +2594,64 @@ impl Table {
         }
     }
 
-    /// A Scan of `keys` reading `columns` under `bounds` checked against
-    /// `generation` and the table's entry before any read (RFD 025, Wire):
-    /// `Error::KeyType` for a key of another type; `Error::ColumnRequest` as
-    /// `get` checks the columns; and `Error::ScanRequest` for a limit of 0
-    /// or above `max_scan_rows`, a bound of another variant than the order
-    /// type's, a `start` at or above `before`, and, for a `MultiScan`
-    /// (`multi`), keys times the limit times one more than the columns above
-    /// `max_multi_scan_values`, in that order. Every position the selection
+    /// `Error::WrongTableKind` on a key-value table, and `Error::ScanRequest`
+    /// for a limit of 0 or above the entry's `max_scan_rows`
+    /// (`scan::check_limit`): what a Scan is held to by the table's
+    /// configuration alone, so the gRPC service checks it before it admits
+    /// the call or reads the table's readiness, and `scan` checks it again
+    /// with the same result.
+    pub fn check_scan(&self, bounds: &ScanBounds) -> Result<()> {
+        self.check_kind(TableKind::Ordered)?;
+        // An ordered table's entry names its order column; one that does
+        // not is not served as ordered.
+        let Some(max_scan_rows) = self.config.load().scan_rows() else {
+            return Err(Error::WrongTableKind {
+                table: self.name.clone(),
+                kind: TableKind::KeyValue,
+            });
+        };
+        scan::check_limit(bounds, max_scan_rows).map_err(|fault| self.scan_refused(fault))
+    }
+
+    /// `check_scan`, then `Error::ScanRequest` with
+    /// `ScanRequestFault::TooManyValues` for `keys` keys at the limit
+    /// reading `columns` columns above `server.max_multi_scan_values`
+    /// (`scan::check_multi_scan_values`): what a `MultiScan` is held to by
+    /// the table's configuration and the server's alone.
+    pub fn check_multi_scan(&self, keys: usize, columns: usize, bounds: &ScanBounds) -> Result<()> {
+        self.check_scan(bounds)?;
+        scan::check_multi_scan_values(keys, bounds.limit, columns, self.max_multi_scan_values)
+            .map_err(|fault| self.scan_refused(fault))
+    }
+
+    /// `Error::ScanRequest` for `fault` on this table.
+    fn scan_refused(&self, fault: ScanRequestFault) -> Error {
+        Error::ScanRequest {
+            table: self.name.clone(),
+            fault,
+        }
+    }
+
+    /// A Scan of `keys` reading `columns` under `bounds`, which
+    /// `scan::check_scan_request` and `check_scan` have passed, checked
+    /// against `generation` before any read (RFD 025, Wire), in this order:
+    /// `Error::KeyType` for a key of another type; `Error::ScanRequest` for
+    /// a bound of another variant than the order type's
+    /// (`scan::check_bound_variants`); and `Error::ColumnRequest` for a
+    /// column the generation does not serve or a field list its format does
+    /// not take, as `get` checks the columns. Every position the selection
     /// holds is one of the generation's columns, which every file's index
     /// holds a slot for.
-    fn check_scan(
+    fn select_scan(
         &self,
         generation: &Generation,
         keys: &[Key],
         columns: &[ColumnRead<'_>],
         bounds: &ScanBounds,
-        multi: bool,
     ) -> Result<Selection> {
-        let config = self.config.load();
-        // An ordered table's generation and entry both name its order
-        // column; one that does not is not served as ordered.
-        let (Some(order), Some(max_scan_rows)) =
-            (generation.layout.order.as_ref(), config.scan_rows())
-        else {
+        // An ordered table's generation names its order column; one that
+        // does not is not served as ordered.
+        let Some(order) = generation.layout.order.as_ref() else {
             return Err(Error::WrongTableKind {
                 table: self.name.clone(),
                 kind: TableKind::KeyValue,
@@ -2613,23 +2660,9 @@ impl Table {
         for key in keys {
             self.check_key_type(generation, key)?;
         }
-        let selection = generation.layout.select(&config, columns)?;
-        let refused = |fault| Error::ScanRequest {
-            table: self.name.clone(),
-            fault,
-        };
-        scan::check_limit(bounds, max_scan_rows).map_err(refused)?;
-        scan::check_bounds(bounds, order.order_type.variant()).map_err(refused)?;
-        if multi {
-            scan::check_multi_scan_values(
-                keys.len(),
-                bounds.limit,
-                selection.positions.len(),
-                self.max_multi_scan_values,
-            )
-            .map_err(refused)?;
-        }
-        Ok(selection)
+        scan::check_bound_variants(bounds, order.order_type.variant())
+            .map_err(|fault| self.scan_refused(fault))?;
+        generation.layout.select(&self.config.load(), columns)
     }
 
     /// `Error::KeyType` for a key of another type than the generation's.
@@ -7316,6 +7349,112 @@ mod tests {
         ));
     }
 
+    /// A Scan or `MultiScan` request holds the faults of its own and of the
+    /// table's entry before the table's readiness, so a table with no
+    /// generation refuses them as a served one does, and is `NotReady` only
+    /// to a request whose faults need the generation: a key of another
+    /// type, a bound of another variant, a column it does not serve.
+    #[tokio::test]
+    async fn test_scan_requests_the_entry_refuses_are_refused_before_the_table_is_ready() {
+        let rows = ordered_rows(&[KEY_STEP], SCAN_ROWS_PER_KEY);
+        let (ordered, _fixture, _gauged) =
+            unloaded_ordered_table_over(&[&rows], WriterLayout::contract(), DEFAULT_BATCH_FAN_OUT)
+                .await;
+        assert!(ordered.current().is_none());
+        let key = Key::Long(KEY_STEP);
+        let keys = std::slice::from_ref(&key);
+        let max = DEFAULT_MAX_SCAN_ROWS;
+        let at = |limit| ScanBounds {
+            limit,
+            ..oldest_first()
+        };
+        let empty = ScanBounds {
+            start: Some(OrderValue::Long(ORDER_START)),
+            before: Some(OrderValue::Long(ORDER_START)),
+            ..oldest_first()
+        };
+        let repeated = [
+            ColumnRead::whole(VALUE_COLUMN),
+            ColumnRead::whole(VALUE_COLUMN),
+        ];
+        let refused = [
+            (at(0), &BOTH_READS[..], ScanRequestFault::LimitZero { max }),
+            (
+                at(max + 1),
+                &BOTH_READS[..],
+                ScanRequestFault::LimitAboveMax {
+                    limit: max + 1,
+                    max,
+                },
+            ),
+            (empty, &BOTH_READS[..], ScanRequestFault::EmptyWindow),
+        ];
+        for (bounds, reads, expected) in refused {
+            for error in [
+                ordered.scan(&key, reads, &bounds).await.unwrap_err(),
+                ordered.multi_scan(keys, reads, &bounds).await.unwrap_err(),
+            ] {
+                assert_eq!(scan_request_fault(error), expected);
+            }
+        }
+        assert_eq!(
+            scan_request_fault(ordered.check_scan(&at(0)).unwrap_err()),
+            ScanRequestFault::LimitZero { max },
+            "the gRPC service's check before admission is the one a Scan runs"
+        );
+        for error in [
+            ordered
+                .scan(&key, &repeated, &oldest_first())
+                .await
+                .unwrap_err(),
+            ordered
+                .multi_scan(keys, &repeated, &oldest_first())
+                .await
+                .unwrap_err(),
+        ] {
+            assert!(
+                matches!(
+                    error,
+                    Error::ColumnRequest {
+                        fault: ColumnRequestFault::Repeated,
+                        ..
+                    }
+                ),
+                "{error:?}"
+            );
+        }
+        let max_values = ServerConfig::default().max_multi_scan_values;
+        let too_many = vec![key.clone(); max_values / (2 * approx::length(max)) + 1];
+        let reads = [ColumnRead::whole(VALUE_COLUMN)];
+        let over = ordered
+            .multi_scan(&too_many, &reads, &oldest_first())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            scan_request_fault(over),
+            ScanRequestFault::TooManyValues { .. }
+        ));
+        let wrong_variant = ScanBounds {
+            start: Some(OrderValue::Str("a".to_string())),
+            ..oldest_first()
+        };
+        let needs_the_generation = [
+            ordered
+                .scan(&Key::Str("a".to_string()), &reads, &oldest_first())
+                .await,
+            ordered.scan(&key, &reads, &wrong_variant).await,
+            ordered
+                .scan(&key, &[ColumnRead::whole("absent")], &oldest_first())
+                .await,
+        ];
+        for outcome in needs_the_generation {
+            assert!(
+                matches!(outcome, Err(Error::NotReady { .. })),
+                "{outcome:?}"
+            );
+        }
+    }
+
     /// The fault of `error`, a refused Scan request of the test table.
     fn scan_request_fault(error: Error) -> ScanRequestFault {
         let Error::ScanRequest { table, fault } = error else {
@@ -7366,8 +7505,9 @@ mod tests {
     }
 
     /// A malformed Scan request is refused before any read, as
-    /// `Error::ScanRequest` for its fault, after the key and the columns
-    /// are checked as `get` checks them (RFD 025, Wire, Limits).
+    /// `Error::ScanRequest` for its fault, and a key or a column the
+    /// generation does not take as `get` refuses it (RFD 025, Wire,
+    /// Limits).
     #[tokio::test]
     async fn test_scan_refuses_a_malformed_request_before_any_read() {
         let rows = ordered_rows(&[KEY_STEP], SCAN_ROWS_PER_KEY);

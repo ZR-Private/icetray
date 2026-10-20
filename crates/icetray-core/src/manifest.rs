@@ -384,8 +384,9 @@ impl TableLayout {
             .position(|column| column.name == name)
     }
 
-    /// The column reads `reads` names checked for a lookup under `entry`,
-    /// the table's entry as it stands (`select_columns`): each column's
+    /// The column reads `reads` names, which `check_column_reads` has
+    /// passed, checked for a lookup under `entry`, the table's entry as it
+    /// stands (`select_columns`): each column's
     /// position here, and its format from `entry`, so a retune of formats
     /// applies to the next lookup. A column `entry` declares protobuf whose
     /// type here is not `binary` is taken as opaque: an entry retuned to
@@ -447,22 +448,43 @@ fn check_format(
     ))
 }
 
-/// The column reads `reads` names, checked in its order for a lookup of
-/// `table`, where `served` gives a served column's position and format: a
-/// name `served` places nowhere, one the table does not serve, is
-/// `Error::ColumnRequest` with `ColumnRequestFault::NotServed`, and a name
-/// given twice the same with `ColumnRequestFault::Repeated`; a field list on
-/// a column not declared protobuf is `ColumnRequestFault::NotProtobuf`, and
-/// on a protobuf column a field number out of range or given twice is
-/// `ColumnRequestFault::FieldOutOfRange` or
-/// `ColumnRequestFault::RepeatedField` (`FieldSet::new`). The first fault in
-/// `reads` is reported.
+/// The faults the column reads `reads` names hold whatever table they are
+/// for, checked in its order for a lookup of `table` before anything about
+/// the table is: a name given twice is `Error::ColumnRequest` with
+/// `ColumnRequestFault::Repeated`, and a field list with a number out of
+/// range or given twice is `ColumnRequestFault::FieldOutOfRange` or
+/// `ColumnRequestFault::RepeatedField` (`FieldSet::new`), whatever format
+/// the column is in. The first fault in `reads` is reported. A table's
+/// value columns have distinct names, so reads that pass name distinct
+/// columns.
+pub fn check_column_reads(table: &str, reads: &[ColumnRead<'_>]) -> Result<()> {
+    let mut seen = HashSet::with_capacity(reads.len());
+    for read in reads {
+        let fault = |fault| Error::ColumnRequest {
+            table: table.to_string(),
+            column: read.name.to_string(),
+            fault,
+        };
+        if !seen.insert(read.name) {
+            return Err(fault(ColumnRequestFault::Repeated));
+        }
+        FieldSet::new(read.fields).map_err(fault)?;
+    }
+    Ok(())
+}
+
+/// The column reads `reads` names, which `check_column_reads` has passed,
+/// checked in its order for a lookup of `table`, where `served` gives a
+/// served column's position and format: a name `served` places nowhere,
+/// one the table does not serve, is `Error::ColumnRequest` with
+/// `ColumnRequestFault::NotServed`, and a field list on a column not
+/// declared protobuf is `ColumnRequestFault::NotProtobuf`. The first fault
+/// in `reads` is reported.
 pub(crate) fn select_columns(
     table: &str,
     reads: &[ColumnRead<'_>],
     served: impl Fn(&str) -> Option<(usize, ValueFormat)>,
 ) -> Result<Selection> {
-    let mut seen = HashSet::with_capacity(reads.len());
     let mut selection = Selection {
         positions: Vec::with_capacity(reads.len()),
         fields: Vec::with_capacity(reads.len()),
@@ -474,9 +496,6 @@ pub(crate) fn select_columns(
             fault,
         };
         let (at, format) = served(read.name).ok_or_else(|| fault(ColumnRequestFault::NotServed))?;
-        if !seen.insert(at) {
-            return Err(fault(ColumnRequestFault::Repeated));
-        }
         let fields = match format {
             ValueFormat::Opaque if read.fields.is_empty() => None,
             ValueFormat::Opaque => return Err(fault(ColumnRequestFault::NotProtobuf)),
@@ -2074,10 +2093,12 @@ mod tests {
     }
 
     #[test]
-    fn test_select_refuses_each_column_request_fault_naming_the_column() {
+    fn test_check_column_reads_refuses_the_request_only_faults_and_select_the_rest() {
         let (layout, config) = select_fixture();
         let one = [1];
         let field = |name, fields| ColumnRead { name, fields };
+        // Each case's reads, the column the fault names, the fault, and
+        // whether the reads alone hold it, whatever the table serves.
         let cases = [
             (
                 vec![
@@ -2086,6 +2107,13 @@ mod tests {
                 ],
                 ABSENT_COLUMN,
                 ColumnRequestFault::NotServed,
+                false,
+            ),
+            (
+                vec![field(VALUE_COLUMN, &one[..])],
+                VALUE_COLUMN,
+                ColumnRequestFault::NotProtobuf,
+                false,
             ),
             (
                 vec![
@@ -2095,21 +2123,28 @@ mod tests {
                 ],
                 VALUE_COLUMN,
                 ColumnRequestFault::Repeated,
+                true,
             ),
             (
-                vec![field(VALUE_COLUMN, &one[..])],
-                VALUE_COLUMN,
-                ColumnRequestFault::NotProtobuf,
+                vec![
+                    ColumnRead::whole(ABSENT_COLUMN),
+                    ColumnRead::whole(ABSENT_COLUMN),
+                ],
+                ABSENT_COLUMN,
+                ColumnRequestFault::Repeated,
+                true,
             ),
             (
                 vec![field(VALUE_COLUMN, &[0][..])],
                 VALUE_COLUMN,
-                ColumnRequestFault::NotProtobuf,
+                ColumnRequestFault::FieldOutOfRange { field: 0 },
+                true,
             ),
             (
                 vec![field(RENAMED_VALUE_COLUMN, &[1, 0][..])],
                 RENAMED_VALUE_COLUMN,
                 ColumnRequestFault::FieldOutOfRange { field: 0 },
+                true,
             ),
             (
                 vec![field(RENAMED_VALUE_COLUMN, &[MAX_FIELD_NUMBER + 1][..])],
@@ -2117,18 +2152,27 @@ mod tests {
                 ColumnRequestFault::FieldOutOfRange {
                     field: MAX_FIELD_NUMBER + 1,
                 },
+                true,
             ),
             (
                 vec![field(RENAMED_VALUE_COLUMN, &[3, 1, 3][..])],
                 RENAMED_VALUE_COLUMN,
                 ColumnRequestFault::RepeatedField { field: 3 },
+                true,
             ),
         ];
-        for (reads, named, expected) in cases {
-            for result in [
-                layout.select(&config, &reads).map(drop),
-                config.check_column_request(&reads),
-            ] {
+        for (reads, named, expected, request_only) in cases {
+            let checked = check_column_reads(TABLE, &reads);
+            let refusals = if request_only {
+                vec![checked, config.check_column_request(&reads)]
+            } else {
+                assert!(checked.is_ok(), "{reads:?} holds no fault of its own");
+                vec![
+                    layout.select(&config, &reads).map(drop),
+                    config.check_column_request(&reads),
+                ]
+            };
+            for result in refusals {
                 let Err(Error::ColumnRequest {
                     table,
                     column,

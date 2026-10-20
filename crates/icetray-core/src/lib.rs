@@ -67,7 +67,7 @@ pub use level::{FALL_PER_MILLE, Level, PAGE_CACHE_SAMPLE_INTERVAL, PER_MILLE, RE
 pub use local::{DataFileIdentity, DiskChunks, DiskLevel, LocalDir, LocalFault};
 pub use manifest::{
     Bucketing, ColumnRead, ColumnRequestFault, DataFileEntry, TableLayout, ValueColumnLayout,
-    ValueType,
+    ValueType, check_column_reads,
 };
 pub use open::{Applied, Opened, Refused, Tables, open};
 pub use order::{
@@ -76,7 +76,7 @@ pub use order::{
 pub use projection::{MAX_FIELD_NUMBER, Malformed, WIRE_TYPE_BITS, WIRE_TYPE_MASK, Wire};
 pub use scan::{
     BoundSide, Fits, MultiScanLookup, Oversize, ScanLookup, ScanRequestFault, ScanRow, Scanned,
-    next_bound,
+    check_scan_request, next_bound,
 };
 pub use snapshot::{SequenceNumber, SnapshotId};
 pub use storage::{FILE_PREFIX, IoStats, LocationError, LocationFault, Storage};

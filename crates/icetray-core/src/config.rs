@@ -2024,11 +2024,13 @@ impl TableConfig {
             .collect()
     }
 
-    /// Checks the column reads `reads` names for a lookup of this table
-    /// against the configured value columns and their formats, as a lookup
-    /// is checked against the serving generation's (`Error::ColumnRequest`),
-    /// so a caller can refuse a request before a load.
+    /// Checks the column reads `reads` names for a lookup of this table,
+    /// first on their own (`manifest::check_column_reads`) and then against
+    /// the configured value columns and their formats, as a lookup checks
+    /// them against the serving generation's (`Error::ColumnRequest`), so a
+    /// caller can refuse a request before a load.
     pub fn check_column_request(&self, reads: &[ColumnRead<'_>]) -> Result<()> {
+        manifest::check_column_reads(&self.name, reads)?;
         let served = self.value_column_names();
         manifest::select_columns(&self.name, reads, |name| {
             served
