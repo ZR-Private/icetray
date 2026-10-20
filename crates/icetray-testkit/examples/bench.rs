@@ -45,8 +45,9 @@
 //! both directions, whole and over a window of each run's middle half, cold
 //! (the page cache and the scan cache emptied before each operation,
 //! outside its timing) and warm (every key paged through first);
-//! `MultiScan`s of 10 and 100 keys at limits of 1 and 20; and first loads
-//! with their Disk restarts, whose rounds of GETs and held bytes show the
+//! `MultiScan`s of 10 and 100 keys at each key's newest row and a light
+//! key's most rows (`reference_multi_limits`); and first loads with their
+//! Disk restarts, whose rounds of GETs and held bytes show the
 //! uniqueness merge of `ref_appended`'s overlap groups and the read-ahead
 //! over `ref_large_files`' row groups. Every request's answers are first
 //! compared whole with the derivation (`golden::derived_scan`). Every
@@ -4018,7 +4019,8 @@ enum ReferenceScenario {
     /// run.
     ScanWarm,
     /// `MultiScan`s of 10 and of 100 keys (`REFERENCE_MULTI_KEYS`) at
-    /// limits of 1 and 20 (`reference_multi_limits`), newest first,
+    /// each key's newest row and a light key's most rows
+    /// (`reference_multi_limits`), newest first,
     /// unbounded, their keys the first of each tier in turn
     /// (`multi_scan_ids`), through the emptied caches.
     MultiScanCold,

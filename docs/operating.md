@@ -666,12 +666,14 @@ through settings, mounted files, and environment variables.
   the merge cuts them back to the limit, so one call holds about the
   files that hold the key times its limit times its requested columns in
   values, and reads all of them before it refuses an oversized response.
-  A `MultiScan` holds that for each of its keys. Up to
-  `server.max_in_flight` such calls run at once. The doctor's
-  `large_runs` advice names each file on which a `Scan` at the full limit
-  would be refused. The owner bounds what a call holds with the table's
-  `max_scan_rows` ([Configuration](configuration.md#tables)), and with
-  compaction, which lowers the files that hold a key.
+  A `MultiScan` holds that for each key it is reading, up to
+  `server.batch_fan_out` keys at once in each of its runs (at most one
+  run per worker thread), and the merged rows of every key until it
+  responds. Up to `server.max_in_flight` such calls run at once. The
+  doctor's `large_runs` advice names each file on which a `Scan` at the
+  full limit would be refused. The owner bounds what a call holds with
+  the table's `max_scan_rows` ([Configuration](configuration.md#tables)),
+  and with compaction, which lowers the files that hold a key.
 - For `disk` tables, raise the limit by their chunk files' size, the
   doctor's `predicted.disk_bytes`. On Linux, the kernel charges the page
   cache of the files a container reads to the container's memory limit,

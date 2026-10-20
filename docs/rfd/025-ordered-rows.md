@@ -288,16 +288,18 @@ direction under a limit and optional bounds on the order value.
   the limit's rows of every requested column before the merge cuts them
   back to the limit, so one call holds about the files that hold the key
   times its limit times its requested columns in values, and reads all
-  of them before it refuses an oversized response, and a MultiScan
-  holds that for each of its keys. The server accepts
-  this rather than merge order values across files before reading any
-  value, which would hold one limit's rows but add a round of GETs to a
-  Scan of a key in several files. `large_runs` (Levels and findings)
-  names each file on which a Scan at the full limit would be refused, and
-  an owner bounds what a call holds with `max_scan_rows`, and with
-  compaction, which lowers the files that hold a key.
-  `server.max_in_flight` counts every Get,
-  MultiGet, Scan, and MultiScan, and TableInfo takes none of its slots.
+  of them before it refuses an oversized response. A MultiScan holds
+  that for each key it is reading, up to `server.batch_fan_out` keys at
+  once in each of its runs (at most one run per worker thread), and the
+  merged rows of every key until it responds. The server accepts this
+  rather than merge order values across files before reading any value,
+  which would hold one limit's rows but add a round of GETs to a Scan of
+  a key in several files. `large_runs` (Levels and findings) names each
+  file on which a Scan at the full limit would be refused, and an owner
+  bounds what a call holds with `max_scan_rows`, and with compaction,
+  which lowers the files that hold a key. `server.max_in_flight` counts
+  every Get, MultiGet, Scan, and MultiScan, and TableInfo takes none of
+  its slots.
 - **Levels and findings.** RFD 020 (Lookup levels) applies, read for a
   Scan of one key. When no two files in a bucket have key ranges that
   intersect, ends included, every Scan reads one file, and the table can

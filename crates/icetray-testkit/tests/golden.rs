@@ -27,7 +27,7 @@ use icetray_testkit::golden::{
 use icetray_testkit::keys::KEY_STEP;
 use icetray_testkit::layout::VALUE_COLUMN;
 use icetray_testkit::verify::{self, SeenPages};
-use icetray_testkit::{Result, TestScan, absent_key_from};
+use icetray_testkit::{OrderKind, Result, TestScan, absent_key_from};
 
 /// Ids looked up on the two-million-row tables: the ends and the middle.
 const IDS_2M: [u64; 5] = [0, 1, 12_345, 999_999, 1_999_999];
@@ -1012,17 +1012,28 @@ fn longest_derived_run(table: GoldenTable) -> u64 {
         .expect("an ordered table has keys")
 }
 
-/// The ordered tables whose order column the recipe writes as a string;
-/// every other ordered table's is a long.
-const STRING_ORDERED: [GoldenTable; 2] = [GoldenTable::OrderedString100k, GoldenTable::RefString];
-
-/// The order type the doctor reads `table`'s order column as, stated as
-/// the recipe writes it, apart from the mapping the doctor reads it through.
+/// The order type the doctor reads `table`'s order column as, stated from
+/// the kind the recipe writes it in (`GoldenTable::spec`), apart from the
+/// mapping the doctor reads it through. A kind no golden table writes has
+/// no expectation here, so a table added in one fails at its arm.
 fn recipe_order_type(table: GoldenTable) -> OrderType {
-    if STRING_ORDERED.contains(&table) {
-        OrderType::String
-    } else {
-        OrderType::Long
+    let kind = table
+        .spec()
+        .order
+        .unwrap_or_else(|| panic!("{table} is not an ordered table"))
+        .kind;
+    match kind {
+        OrderKind::Long => OrderType::Long,
+        OrderKind::Str => OrderType::String,
+        OrderKind::Int
+        | OrderKind::Date
+        | OrderKind::Timestamp
+        | OrderKind::TimestampTz
+        | OrderKind::TimestampNs
+        | OrderKind::TimestampTzNs
+        | OrderKind::PaddedStr(_)
+        | OrderKind::Bin
+        | OrderKind::Fixed(_) => panic!("{table}: no golden table orders by {kind:?}"),
     }
 }
 

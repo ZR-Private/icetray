@@ -206,12 +206,13 @@ limits can change while a caller holds them: the owner changes a table's
 `max_scan_bytes`, which are the server's, with a restart. A caller that
 keeps them re-reads `TableInfo` when a call it sized by them fails as
 `INVALID_ARGUMENT` for its limit or its values, or as
-`FAILED_PRECONDITION` for its response size. The server rejects a `Get` or `MultiGet` of an ordered table, and a `Scan` or
-`MultiScan` of a key-value table, as `INVALID_ARGUMENT`. It decides this
-from the table's configuration before anything else about the call, so it
-answers `INVALID_ARGUMENT` even while the table is still loading, where a
-call of the right kind meets `UNAVAILABLE` until the load completes; a
-caller does not retry it.
+`FAILED_PRECONDITION` for its response size. The server rejects a `Get`
+or `MultiGet` of an ordered table, and a `Scan` or `MultiScan` of a
+key-value table, as `INVALID_ARGUMENT`. It decides this from the table's
+configuration before anything else about the call, so it answers
+`INVALID_ARGUMENT` even while the table is still loading, where a call
+of the right kind meets `UNAVAILABLE` until the load completes; a caller
+does not retry it.
 
 A `Scan` request carries the table, the key, the value columns to read
 as `Get` reads them, a direction, a limit, and optional bounds:
@@ -307,12 +308,12 @@ counted with the `next` a response of that many rows would carry, so a
 `Scan` at that limit is within the bound. A caller that sets a limit of
 100 and pages with `next` (below) reads the same history in pages of at
 most 100 rows, each of which fits when 100 rows of the requested columns
-come to less than the bound. An
-owner whose clients accept larger messages raises `server.max_scan_bytes`
+come to less than the bound. An owner whose clients accept larger
+messages raises `server.max_scan_bytes`
 ([Configuration](configuration.md#server)) and the clients raise their
 own receive limit to match, as grpc-go's `MaxCallRecvMsgSize` does; the
-doctor's `large_runs` advice tells the owner which tables would be
-refused at the full limit.
+doctor's `large_runs` advice tells the owner which files, and so which
+tables, would be refused at the full limit.
 
 When no row fits, the first row's values alone are above the bound, and
 a lower `limit` cannot help. The caller requests fewer columns, or trims
