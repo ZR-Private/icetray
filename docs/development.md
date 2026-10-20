@@ -227,12 +227,16 @@ them.
 ## Releases
 
 A release is a tag. Set `version` under `[workspace.package]` in
-`Cargo.toml`, commit, then tag that commit with the same version and push
-the tag:
+`Cargo.toml` and run `cargo check`, which moves the workspace crates'
+entries in `Cargo.lock` to the new version. Commit `Cargo.toml` and
+`Cargo.lock` together: CI and the release build pass `--locked`, so a
+bump that leaves the lock behind fails both. Then tag that commit with
+the same version and push the tag:
 
 ```sh
-git tag v0.1.0
-git push origin v0.1.0
+version=0.2.0
+git tag "v$version"
+git push origin "v$version"
 ```
 
 The release workflow (`.github/workflows/release.yml`) refuses a tag that
