@@ -44,19 +44,46 @@ thread_local! {
 #[cfg(test)]
 thread_local! {
     /// The pages this thread's `ChunkPages` handed to a column reader, the
-    /// dictionary pages and the data pages: what a test counts a decode's
-    /// pages by.
-    pub(super) static HANDED: std::cell::Cell<Handed> = const {
-        std::cell::Cell::new(Handed { dictionaries: 0, data: 0 })
+    /// dictionary pages and the data pages of each leaf: what a test counts
+    /// a decode's pages by.
+    static HANDED: RefCell<Handed> = const {
+        RefCell::new(Handed { dictionaries: 0, data: std::collections::BTreeMap::new() })
     };
 }
 
-/// Pages handed to a column reader (`HANDED`).
+/// Pages handed to a column reader (`HANDED`): the dictionary pages, and
+/// the data pages by leaf, where a leaf with none has no entry.
 #[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Handed {
     pub(super) dictionaries: usize,
-    pub(super) data: usize,
+    pub(super) data: std::collections::BTreeMap<usize, usize>,
+}
+
+#[cfg(test)]
+impl Handed {
+    /// The pages this thread has handed to a column reader so far.
+    pub(super) fn now() -> Self {
+        HANDED.with_borrow(Self::clone)
+    }
+
+    /// The pages handed since `before`, a count this thread took earlier.
+    pub(super) fn since(&self, before: &Self) -> Self {
+        Self {
+            dictionaries: self.dictionaries - before.dictionaries,
+            data: self
+                .data
+                .iter()
+                .map(|(&leaf, &pages)| (leaf, pages - before.data_of(leaf)))
+                .filter(|&(_, pages)| pages > 0)
+                .collect(),
+        }
+    }
+
+    /// The data pages of leaf `leaf` handed.
+    pub(super) fn data_of(&self, leaf: usize) -> usize {
+        self.data.get(&leaf).copied().unwrap_or(0)
+    }
 }
 
 /// What a `ChunkPages` saw, shared with the `read_column` call that reads
@@ -117,6 +144,9 @@ pub(super) struct ChunkPages {
     first_row: usize,
     decompress: Decompress,
     tally: Arc<Mutex<PageTally>>,
+    /// The chunk's leaf, which `HANDED` counts its data pages under.
+    #[cfg(test)]
+    leaf: usize,
 }
 
 impl ChunkPages {
@@ -172,6 +202,8 @@ impl ChunkPages {
             first_row,
             decompress,
             tally,
+            #[cfg(test)]
+            leaf: chunk.column.leaf,
         })
     }
 
@@ -328,13 +360,9 @@ impl PageReader for ChunkPages {
         };
         self.tally().taken = Some(planned.page);
         #[cfg(test)]
-        HANDED.with(|handed| {
-            let mut count = handed.get();
-            match planned.page {
-                ChunkPage::Dictionary => count.dictionaries += 1,
-                ChunkPage::Data(_) => count.data += 1,
-            }
-            handed.set(count);
+        HANDED.with_borrow_mut(|handed| match planned.page {
+            ChunkPage::Dictionary => handed.dictionaries += 1,
+            ChunkPage::Data(_) => *handed.data.entry(self.leaf).or_default() += 1,
         });
         let page = self.read(&planned)?;
         if page.is_data_page() {

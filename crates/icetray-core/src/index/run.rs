@@ -1292,6 +1292,7 @@ mod tests {
     use crate::deletes::FileDeletes;
     use crate::index::RowPosition;
     use crate::index::order_fences::take_steps;
+    use crate::index::pages::Handed;
     use crate::index::testing::{
         EXTRA_COLUMN, Fixture, ORDER_FIELD_ID, Opened, Orders, long_orders, ordered_layout, store,
         store_gauged, value_for,
@@ -1880,11 +1881,6 @@ mod tests {
             .collect()
     }
 
-    /// The data pages this thread's decodes have taken up so far.
-    fn data_pages_decoded() -> usize {
-        crate::index::pages::HANDED.with(std::cell::Cell::get).data
-    }
-
     /// Key 2's run of `DELETED_RUN_PAGES` pages, file rows 1 on, between one
     /// row of key 1 and one of key 3 in one row group, with values of
     /// `value_bytes` drawn at random, or `runs_of`'s own when `None`.
@@ -1935,10 +1931,10 @@ mod tests {
             let probe = Probe::open(&opened, &gauged, residency, OrderType::Long).await;
             let index = &probe.index;
             testing::take_pages();
-            let decoded_before = data_pages_decoded();
+            let handed = Handed::now();
             let local_before = opened.stats().local_reads();
             let (got, ranges) = probe.read(&newest, &deleted).await;
-            let decoded = data_pages_decoded() - decoded_before;
+            let decoded = Handed::now().since(&handed);
             let local_reads = opened.stats().local_reads() - local_before;
             let walked = testing::take_pages();
             let expected: Vec<_> = [last, BELOW_DELETED_ROW]
@@ -1962,9 +1958,9 @@ mod tests {
             let value_decoded = pages(value_leaf, &value_rows);
             let order_decoded = pages(order_leaf, &order_rows);
             assert_eq!(
-                decoded,
-                value_decoded.len() + order_decoded.len(),
-                "{case}: the pages decoded, those of the rows taken up alone"
+                (decoded.data_of(value_leaf), decoded.data_of(order_leaf)),
+                (value_decoded.len(), order_decoded.len()),
+                "{case}: the value and order pages decoded, those of the rows taken up alone"
             );
             assert_eq!(walked, order_decoded.len(), "{case}: pages walked");
             let (value_pages, value_gets) = if bridged {
@@ -2496,10 +2492,11 @@ mod tests {
     }
 
     /// The run positions of the rows of the run of `RUN_KEY`, `rows`, on
-    /// the order pages `index`'s fences place `scan`'s bounds on, found
-    /// apart from the read: per bound, by a scan of every page of the run,
-    /// the last whose fence is at or below the pair of the key and the
-    /// bound.
+    /// the order pages that hold one of `scan`'s bounds, found apart from
+    /// the read: per bound, by a scan of every page of the run, the last
+    /// whose fence is at or below the pair of the key and the bound, where
+    /// that fence is below the pair. A page whose fence is the pair holds
+    /// no run row below the bound, so its rows lie wholly on one side of it.
     fn bound_rows(index: &FileIndex, rows: &[RowRef], scan: &ScanBounds) -> BTreeSet<usize> {
         let fences = index.order_fences().unwrap();
         let leaf = index.order_leaf().unwrap();
@@ -2514,9 +2511,37 @@ mod tests {
             else {
                 continue;
             };
+            if fences.fence(page.0, page.1) == pair {
+                continue;
+            }
             held.extend((0..rows.len()).filter(|&at| page_of(index, leaf, rows[at]) == page));
         }
         held
+    }
+
+    /// The run positions, in the read's direction, of the rows `read`
+    /// takes up when the fences alone place its bounds (`Walk::rows` with
+    /// nothing known): from the direction's end, each live row inside the
+    /// bounds or on a page that holds a bound (`bound_rows`), until the
+    /// limit's rows off those pages, so known inside, have counted, and one
+    /// live row more.
+    fn placed_rows(read: &ReadOf<'_>) -> Vec<usize> {
+        let limit = usize::try_from(read.scan.limit).unwrap();
+        let bound = bound_rows(read.index, read.rows, read.scan);
+        let mut placed = Vec::new();
+        let mut counted = 0;
+        for at in in_direction(read.rows.len(), read.scan) {
+            let on_bound = bound.contains(&at);
+            if read.deleted.contains(&at) || !(on_bound || inside(read.scan, &read.orders[at])) {
+                continue;
+            }
+            placed.push(at);
+            if counted == limit {
+                break;
+            }
+            counted += usize::from(!on_bound);
+        }
+        placed
     }
 
     /// One read of a run as the cost model sees it: the index, the run's
@@ -2533,16 +2558,16 @@ mod tests {
     impl ReadOf<'_> {
         /// Asserts that this read, under `residency`, of which the model
         /// takes the run positions `taken`, fetched within RFD 025's Cost
-        /// over its GETs' byte ranges `ranges` and decoded `decoded` data
-        /// pages, as `assert_reads_within_the_cost_promise` says, and counts
-        /// what it saw in `seen`; the value pages it fetched, and those of
-        /// the rows taken (`taken_pages`).
+        /// over its GETs' byte ranges `ranges` and decoded the data pages
+        /// `decoded` counts, as `assert_reads_within_the_cost_promise` says,
+        /// and counts what it saw in `seen`; the value pages it fetched, and
+        /// those of the rows taken (`taken_pages`).
         fn assert_pages_within_the_promise(
             &self,
             residency: Residency,
             taken: &[usize],
             ranges: &[Range<u64>],
-            decoded: usize,
+            decoded: &Handed,
             seen: &mut Seen,
             case: &str,
         ) -> (BTreeSet<PageAt>, BTreeSet<PageAt>) {
@@ -2562,16 +2587,27 @@ mod tests {
             let taken_pages = taken_pages(self.index, value_leaf, self.rows, taken);
             let promised_values = promised(self, value_leaf, taken.len(), 0);
             let promised_orders = promised(self, order_leaf, taken.len(), 1);
+            let decoded = (decoded.data_of(value_leaf), decoded.data_of(order_leaf));
             if residency == Residency::Disk {
                 assert_eq!(
                     values, taken_pages,
                     "{case}: the value pages of the rows taken"
                 );
                 assert_eq!(order_pages, BTreeSet::new(), "{case}: no order GET");
-                let promised_live = live_values + live(order_leaf, &promised_orders);
-                assert!(
-                    decoded <= promised_live,
-                    "{case}: {decoded} pages decoded, beyond {promised_live}"
+                let pages = |leaf: usize, at: &[usize]| -> BTreeSet<PageAt> {
+                    at.iter()
+                        .map(|&at| page_of(self.index, leaf, self.rows[at]))
+                        .collect()
+                };
+                let placed = placed_rows(self);
+                assert_eq!(
+                    decoded,
+                    (
+                        pages(value_leaf, taken).len(),
+                        pages(order_leaf, &placed).len()
+                    ),
+                    "{case}: the value pages decoded, those of the rows taken, and the order \
+                     pages, those of the rows the fences alone place"
                 );
                 seen.exact += usize::from(promised_values != taken_pages);
             } else {
@@ -2585,8 +2621,8 @@ mod tests {
                 );
                 assert_eq!(
                     decoded,
-                    live_values + live(order_leaf, &order_pages),
-                    "{case}: the pages decoded, those fetched that hold a live row"
+                    (live_values, live(order_leaf, &order_pages)),
+                    "{case}: the value and order pages decoded, those fetched that hold a live row"
                 );
                 seen.beyond += usize::from(!values.is_subset(&taken_pages));
             }
@@ -2849,17 +2885,18 @@ mod tests {
     /// and `next` are the model's, every read with more than one GET runs
     /// them in one round, some read by the fences alone takes the bound's
     /// page, some Disk read places its bound exactly, and the pages read
-    /// are within RFD 025's Cost:
-    /// under Disk, where the order column is local and the bound's page is
-    /// placed exactly first, the value pages fetched are those of the rows
-    /// taken and the gaps between them the bridge takes (`taken_pages`),
-    /// no order page is fetched, and the pages decoded are those of live
-    /// rows alone, the value pages of the rows taken and order pages
-    /// within `promised`; under Full and Bloom on a cold cache, the value
+    /// are within RFD 025's Cost, each column's decoded data pages counted
+    /// apart: under Disk, where the order column is local and the bound's
+    /// page is placed exactly first, the value pages fetched are those of
+    /// the rows taken and the gaps between them the bridge takes
+    /// (`taken_pages`), no order page is fetched, and the pages decoded are
+    /// exactly the value pages of the rows taken and the order pages of the
+    /// rows the fences alone place (`placed_rows`), which the chunk file
+    /// is read for first; under Full and Bloom on a cold cache, the value
     /// pages lie within `promised`, the order pages within it with the row
-    /// past, and the pages decoded are exactly the pages fetched that hold
-    /// a live row of the run, so no page of deleted rows alone fetched with
-    /// its neighbours is decoded.
+    /// past, and each column's pages decoded are exactly its pages fetched
+    /// that hold a live row of the run, so no page of deleted rows alone
+    /// fetched with its neighbours is decoded.
     async fn assert_reads_within_the_cost_promise(cost: &CostFixture) -> Seen {
         let (opened, gauged) = store_gauged(&cost.fixture).await;
         let mut seen = Seen::default();
@@ -2890,9 +2927,9 @@ mod tests {
                         );
                         let expected =
                             model(index, &rows, &orders, &cost.fixture.values, &deleted, &scan);
-                        let decoded_before = data_pages_decoded();
+                        let handed = Handed::now();
                         let (got, ranges) = probe.read(&scan, &is_deleted).await;
-                        let decoded = data_pages_decoded() - decoded_before;
+                        let decoded = Handed::now().since(&handed);
                         assert_eq!(got.answer.rows, expected.rows, "{case}");
                         assert_eq!(got.answer.beyond, expected.beyond, "{case}");
                         let read = ReadOf {
@@ -2906,7 +2943,7 @@ mod tests {
                             residency,
                             &expected.taken,
                             &ranges,
-                            decoded,
+                            &decoded,
                             &mut seen,
                             &case,
                         );

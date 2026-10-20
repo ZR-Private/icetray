@@ -4510,7 +4510,9 @@ mod tests {
     /// its dictionary page once.
     #[tokio::test]
     async fn test_verify_decodes_each_dictionary_once_per_row_group() {
-        use super::super::pages::{HANDED, Handed};
+        use std::collections::BTreeMap;
+
+        use super::super::pages::Handed;
         const WINDOWS: usize = 3;
         let rows = row_index(DECODE_BATCH_RECORDS) * WINDOWS;
         // Distinct keys, which the key-value rules admit too.
@@ -4546,9 +4548,9 @@ mod tests {
         }
         .group(0);
         assert!(key_chunk.dictionary_range().is_some() && order_chunk.dictionary_range().is_some());
-        let data_pages = key_chunk.page_locations().len() + order_chunk.page_locations().len();
-        let handed = || HANDED.with(std::cell::Cell::get);
-        let before = handed();
+        let key_pages = (column.leaf, key_chunk.page_locations().len());
+        let order_pages = (order.leaf, order_chunk.page_locations().len());
+        let before = Handed::now();
         verify(
             TABLE,
             &column,
@@ -4557,28 +4559,20 @@ mod tests {
             &chunks,
         )
         .unwrap();
-        let after = handed();
         assert_eq!(
-            Handed {
-                dictionaries: after.dictionaries - before.dictionaries,
-                data: after.data - before.data,
-            },
+            Handed::now().since(&before),
             Handed {
                 dictionaries: 2,
-                data: data_pages,
+                data: BTreeMap::from([key_pages, order_pages]),
             }
         );
-        let before = handed();
+        let before = Handed::now();
         verify(TABLE, &column, KeyShape::Long, Rules::of(None), &chunks).unwrap();
-        let after = handed();
         assert_eq!(
-            Handed {
-                dictionaries: after.dictionaries - before.dictionaries,
-                data: after.data - before.data,
-            },
+            Handed::now().since(&before),
             Handed {
                 dictionaries: 1,
-                data: key_chunk.page_locations().len(),
+                data: BTreeMap::from([key_pages]),
             },
             "the key-value rules read the key column alone, once"
         );
