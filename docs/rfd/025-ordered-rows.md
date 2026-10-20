@@ -5,6 +5,10 @@
 > them, are answered before the in-flight bound and the table's
 > readiness, in the order RFD 010 (Transport and client contract) gives.
 
+> Updated 2026-10-20: a failing MultiScan answers the error of its first
+> failing key in request order, whether its keys are spread over worker
+> threads or read on one task.
+
 ## Problem
 
 icetray serves tables with at most one row per key, and that remains its
@@ -277,8 +281,12 @@ direction under a limit and optional bounds on the order value.
   bound. A MultiScan of no more distinct keys than that count, or one
   that arrives while as many calls as worker threads are in flight,
   reads its keys on one task. Its answers, their order, its counts, and
-  the response bound are the same either way. Spreading cuts a lone
-  MultiScan's latency for more CPU per key, spent only while cores would
+  the response bound are the same either way, and so is the error of a
+  failing MultiScan: that of its first failing key in request order,
+  whichever key failed first. A run's failure is held until every run
+  before it has ended, and the runs after it are stopped, so the error a
+  caller sees, and whether it retries, does not depend on scheduling.
+  Spreading cuts a lone MultiScan's latency for more CPU per key, spent only while cores would
   otherwise sit idle. `server.max_multi_scan_values` bounds a
   MultiScan's keys times its limit times one more than its requested
   columns, and the server rejects a larger call before it reads any

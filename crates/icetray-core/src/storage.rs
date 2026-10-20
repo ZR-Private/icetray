@@ -1356,7 +1356,7 @@ pub(crate) mod testing {
     /// GET passes: a caller that runs `n` reads together is seen to on any
     /// machine, however slow, and one that runs fewer never gets past. It
     /// keeps the byte range of every GET, so a test sees what a read
-    /// fetched.
+    /// fetched, and counts the GETs the inner store failed.
     #[derive(Debug)]
     pub(crate) struct Gauged {
         inner: Arc<dyn ObjectStore>,
@@ -1369,6 +1369,11 @@ pub(crate) mod testing {
         /// Whether GETs pass: false from `fill_to` until `fill` GETs are in
         /// flight together.
         open: watch::Sender<bool>,
+        /// The name of the one file whose GETs the gate holds, from
+        /// `hold_file`; `None` while the gate holds every GET.
+        held_file: Mutex<Option<String>>,
+        /// The GETs the inner store answered with an error.
+        failed: AtomicUsize,
     }
 
     impl Gauged {
@@ -1381,6 +1386,8 @@ pub(crate) mod testing {
                 ranges: Mutex::new(Vec::new()),
                 fill: AtomicUsize::new(0),
                 open: watch::Sender::new(true),
+                held_file: Mutex::new(None),
+                failed: AtomicUsize::new(0),
             }
         }
 
@@ -1398,6 +1405,7 @@ pub(crate) mod testing {
         /// Starts the high-water mark again from the GETs in flight now and
         /// holds every GET until `fill` of them are in flight at once.
         pub(crate) fn fill_to(&self, fill: usize) {
+            *self.held_file.lock().unwrap() = None;
             self.high_water
                 .store(self.in_flight.load(Ordering::SeqCst), Ordering::SeqCst);
             self.fill.store(fill, Ordering::SeqCst);
@@ -1410,9 +1418,21 @@ pub(crate) mod testing {
             self.fill_to(usize::MAX);
         }
 
-        /// Lets the GETs `hold` holds pass.
+        /// `hold` for the GETs of the file named `name` (its last path
+        /// segment) alone: every other file's GETs pass.
+        pub(crate) fn hold_file(&self, name: &str) {
+            self.hold();
+            *self.held_file.lock().unwrap() = Some(name.to_string());
+        }
+
+        /// Lets the GETs `hold` or `hold_file` holds pass.
         pub(crate) fn release(&self) {
             self.open.send_replace(true);
+        }
+
+        /// The GETs the inner store has answered with an error.
+        pub(crate) fn failed(&self) -> usize {
+            self.failed.load(Ordering::SeqCst)
         }
 
         /// The byte ranges the GETs since the last call asked for, in the
@@ -1494,12 +1514,24 @@ pub(crate) mod testing {
                 if now >= self.fill.load(Ordering::SeqCst) {
                     self.open.send_replace(true);
                 }
-                self.open
-                    .subscribe()
-                    .wait_for(|open| *open)
-                    .await
-                    .expect("the store holds the sender");
-                self.inner.get_opts(location, options).await
+                let gated = self
+                    .held_file
+                    .lock()
+                    .unwrap()
+                    .as_deref()
+                    .is_none_or(|held| location.filename() == Some(held));
+                if gated {
+                    self.open
+                        .subscribe()
+                        .wait_for(|open| *open)
+                        .await
+                        .expect("the store holds the sender");
+                }
+                let answer = self.inner.get_opts(location, options).await;
+                if answer.is_err() {
+                    self.failed.fetch_add(1, Ordering::SeqCst);
+                }
+                answer
             })
         }
 

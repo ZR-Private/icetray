@@ -29,6 +29,10 @@
 > in-flight bound and the table's readiness, so those faults are
 > answered while the table loads.
 
+> Updated 2026-10-20: a failing MultiGet or MultiScan answers the error
+> of its first failing key in request order, however the server
+> schedules its reads.
+
 ## Problem
 
 icetray answers get-by-key lookups for programs written in more than one
@@ -100,7 +104,9 @@ every key in the batch from one generation, so a batch is consistent with
 itself. It carries one snapshot id for the whole batch, and its results
 come back in the order the keys were sent, each with only the outcome and
 the values. When any key in a MultiGet cannot be answered, the whole call
-fails and the caller retries it, unless the failure is
+fails with the error of its first failing key in request order, however
+the server schedules the reads, so one request's code does not depend on
+which key's read ended first. The caller retries it, unless the failure is
 `FAILED_PRECONDITION`: a value a read trims that is not the protobuf its
 column declares fails the same way on every attempt, so the caller stops
 naming fields of that column or waits for the table to be rewritten

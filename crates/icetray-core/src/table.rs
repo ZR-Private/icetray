@@ -22,7 +22,7 @@ use futures::{StreamExt as _, TryStreamExt as _, stream};
 use iceberg::spec::Snapshot;
 use metrics::{Counter, Histogram};
 use tokio::sync::{MutexGuard, Semaphore};
-use tokio::task::JoinSet;
+use tokio::task::{self, AbortHandle, JoinSet};
 
 use crate::approx;
 use crate::blocking::on_blocking_pool;
@@ -650,8 +650,9 @@ impl Lookups {
     /// lookup issues holds one permit of `fan_out`, the batch's bound
     /// (`TableHandles::batch_fan_out`), while it runs, so the batch's
     /// tasks together hold at most that many GETs in flight; this task
-    /// waits on at most that many lookups itself. The first failure ends
-    /// the run.
+    /// waits on at most that many lookups itself. A failing run fails with
+    /// its first failing key's failure in key order, once every key before
+    /// it has passed, and ends there.
     async fn run(
         &self,
         generation: &Generation,
@@ -962,10 +963,13 @@ struct ScanTally {
 /// key as an error, not as the rows it read. `sent` counts every key read
 /// as answered, `refused` as an error, and the size goes into
 /// `scan_response_bytes` either way. A receipt dropped unsettled, as when
-/// a later key's read fails, the call's deadline passes, or its client
-/// cancels, counts the keys that finished as answered, as a failed
-/// `MultiGet` counts the keys it completed; a key that failed counted as an
-/// error when it did. Whichever settles the receipt first ends its count,
+/// a key's read fails, the call's deadline passes, or its client cancels,
+/// counts the keys that finished as answered, as a failed `MultiGet`
+/// counts the keys it completed; a key that failed counted as an error
+/// when it did. A failing call returns only once every key before its
+/// first failing one has finished, spread or not, so those keys count as
+/// answered; a key after it counts only if it ended before the call
+/// returned. Whichever settles the receipt first ends its count,
 /// so a key of a spread `multi_scan` that finishes or fails on another
 /// task after the call ended counts nowhere, as it would had the call read
 /// it on its own task.
@@ -1151,8 +1155,9 @@ impl ScanThrough<'_> {
 
     /// Scans of `keys`, answered in their order, at most
     /// `TableHandles::batch_fan_out` read at once on this task, every GET
-    /// holding a permit of the call's fan-out. The first failure ends the
-    /// run.
+    /// holding a permit of the call's fan-out. A failing run fails as
+    /// `Lookups::run` fails: with its first failing key's failure in key
+    /// order.
     async fn keys(self, keys: &[&Key]) -> Result<Vec<Scanned>> {
         // Built before the stream, unpolled, as `Lookups::run` builds its
         // lookups, so the returned future stays provably `Send`.
@@ -1569,12 +1574,14 @@ impl Table {
     /// before any read, in the order `get` checks them, so a mismatch
     /// anywhere fails the whole call and issues nothing; any failure fails
     /// the whole call (RFD 010), a malformed value of any key included (RFD
-    /// 024). While fewer `get` and `multi_get` calls than worker threads
-    /// are in flight on the tables sharing this one's `TableHandles::calls`, this one
-    /// included, the keys are split, in order and evenly, into one run for
-    /// each `MULTI_GET_TASK_KEYS_MIN` keys or part of them, up to one per
-    /// worker thread (`shard::workers`), each spawned as a task so a
-    /// batch's decodes run on several cores (`Lookups::runs`). A batch that makes
+    /// 024), and the call answers its first failing key's failure in key
+    /// order, however the keys are read (`spawned`). While fewer `get` and
+    /// `multi_get` calls than worker threads are in flight on the tables
+    /// sharing this one's `TableHandles::calls`, this one included, the
+    /// keys are split, in order and evenly, into one run for each
+    /// `MULTI_GET_TASK_KEYS_MIN` keys or part of them, up to one per worker
+    /// thread (`shard::workers`), each spawned as a task so a batch's
+    /// decodes run on several cores (`Lookups::runs`). A batch that makes
     /// one run, as a batch does once that many calls are in flight, is
     /// looked up here, unspawned. `open_with` gives every table of a
     /// process one count, so calls to any of them count toward holding a
@@ -1687,10 +1694,12 @@ impl Table {
     /// that make one run are read here, unspawned. Each run reads at most
     /// `TableHandles::batch_fan_out` keys at once, and the runs share one
     /// bound of that many GETs in flight; any failure fails the whole call
-    /// (RFD 010). Dropping the returned future aborts the runs still
-    /// going, and a key one of them finishes after that counts nowhere
-    /// (`ScanReceipt`). A run's panic is resumed here; a run canceled
-    /// under a runtime shutdown is `Error::LookupCanceled`.
+    /// (RFD 010), and the call answers its first failing key's failure in
+    /// key order, however the keys are read (`spawned`). Dropping the
+    /// returned future aborts the runs still going, and a key one of them
+    /// finishes after that counts nowhere (`ScanReceipt`). A run's panic is
+    /// resumed here; a run canceled under a runtime shutdown is
+    /// `Error::LookupCanceled`.
     pub async fn multi_scan(
         &self,
         keys: &[Key],
@@ -1816,9 +1825,14 @@ impl Table {
     /// `keys` split in order into `runs` runs of nearly equal length, each
     /// run spawned on its own task as the future `run` builds over it,
     /// which owns what it reads, and the answers put back in key order.
-    /// The tasks live in a `JoinSet`, so returning early on a failure, or
+    /// A failing call answers the failure of its first failing run in key
+    /// order, which is its first failing key, as a call read on its own
+    /// task answers: a run's failure is held until every run before it has
+    /// passed, and a run that fails before it takes its place. The runs
+    /// after the first failure known are stopped, since none of them can
+    /// change the answer. The tasks live in a `JoinSet`, so returning, or
     /// being dropped, aborts the rest. A run's panic is resumed here; a run
-    /// canceled under a runtime shutdown is `Error::LookupCanceled`.
+    /// canceled under a runtime shutdown fails as `Error::LookupCanceled`.
     async fn spawned<K, T, F>(
         &self,
         keys: &[K],
@@ -1831,23 +1845,59 @@ impl Table {
     {
         let per_run = keys.len().div_ceil(runs);
         let mut tasks = JoinSet::new();
-        for (index, part) in keys.chunks(per_run).enumerate() {
-            let answers = run(part);
-            tasks.spawn(async move { (index, answers.await) });
+        let handles: Vec<AbortHandle> = keys
+            .chunks(per_run)
+            .map(|part| tasks.spawn(run(part)))
+            .collect();
+        let run_of = |id: task::Id| {
+            handles
+                .iter()
+                .position(|handle| handle.id() == id)
+                .expect("every task joined is a run spawned here")
+        };
+        let mut answered: Vec<Option<Vec<T>>> = std::iter::repeat_with(|| None)
+            .take(handles.len())
+            .collect();
+        let mut failed: Option<(usize, Error)> = None;
+        while let Some(joined) = tasks.join_next_with_id().await {
+            let (index, values) = match joined {
+                Ok((id, values)) => (run_of(id), values),
+                Err(error) => {
+                    let index = run_of(error.id());
+                    match error.try_into_panic() {
+                        Ok(payload) => std::panic::resume_unwind(payload),
+                        Err(canceled) => (
+                            index,
+                            Err(Error::LookupCanceled {
+                                table: self.name.clone(),
+                                source: canceled,
+                            }),
+                        ),
+                    }
+                }
+            };
+            match values {
+                Ok(values) => answered[index] = Some(values),
+                Err(error) => {
+                    if failed.as_ref().is_none_or(|(first, _)| index < *first) {
+                        for later in &handles[index + 1..] {
+                            later.abort();
+                        }
+                        failed = Some((index, error));
+                    }
+                }
+            }
+            if let Some((first, _)) = &failed
+                && answered[..*first].iter().all(Option::is_some)
+            {
+                let (_, error) = failed.take().expect("a failure is held");
+                return Err(error);
+            }
         }
-        let mut answered: Vec<Vec<T>> =
-            std::iter::repeat_with(Vec::new).take(tasks.len()).collect();
-        while let Some(joined) = tasks.join_next().await {
-            let (index, values) = joined.map_err(|error| match error.try_into_panic() {
-                Ok(payload) => std::panic::resume_unwind(payload),
-                Err(canceled) => Error::LookupCanceled {
-                    table: self.name.clone(),
-                    source: canceled,
-                },
-            })?;
-            answered[index] = values?;
-        }
-        Ok(answered.into_iter().flatten().collect())
+        Ok(answered
+            .into_iter()
+            .flat_map(|values| values.expect("every run passed, or the call has failed"))
+            .collect())
     }
 
     /// Holds the table's load and refresh lock, so no load is in flight
@@ -4176,6 +4226,161 @@ mod tests {
             runs_spawned_beside_another_table(others_filling_the_workers).await,
             0
         );
+    }
+
+    /// The file a failing-batch test lays its first key out in, alone.
+    const FIRST_KEY_FILE: &str = "f0";
+    /// The file a failing-batch test lays its last key out in, alone; the
+    /// keys between are in a file of their own between the two.
+    const LAST_KEY_FILE: &str = "f2";
+
+    /// `keys` split as the failing-batch tests lay them out: the first, the
+    /// ones between, and the last.
+    fn first_between_last(keys: &[i64]) -> [&[i64]; 3] {
+        let last = keys.len() - 1;
+        [&keys[..1], &keys[1..last], &keys[last..]]
+    }
+
+    /// Holds every GET of `FIRST_KEY_FILE` and removes it, and empties
+    /// `LAST_KEY_FILE`, both after the load read them: the first key's
+    /// read waits on the store and, once released, fails with its file
+    /// gone, while the store fails the last key's read at once, its range
+    /// past the end of an empty file.
+    fn first_key_slow_last_key_fast(fixture: &Fixture, gauged: &Gauged) {
+        gauged.hold_file(&format!("{FIRST_KEY_FILE}.parquet"));
+        let on_disk = |name| {
+            fixture
+                .path_of(name)
+                .strip_prefix(FILE_PREFIX)
+                .unwrap()
+                .to_string()
+        };
+        std::fs::remove_file(on_disk(FIRST_KEY_FILE)).unwrap();
+        std::fs::write(on_disk(LAST_KEY_FILE), []).unwrap();
+    }
+
+    /// Whether `error` is the page fetch of a file that is gone, as the
+    /// first key's read fails after `first_key_slow_last_key_fast`; the
+    /// last key's fails as an `object_store::Error::Generic`, the range
+    /// refused.
+    fn file_gone(error: &Error) -> bool {
+        let Error::Cache(CacheError::Fetch(failed)) = error else {
+            return false;
+        };
+        matches!(
+            **failed,
+            Error::ObjectStore(object_store::Error::NotFound { .. })
+        )
+    }
+
+    /// Drives `call`, a batch over a table broken by
+    /// `first_key_slow_last_key_fast`, until the store has failed the last
+    /// key's read and every run but the first key's has ended, then
+    /// releases the first key's read: the error the call answers, and the
+    /// runs alive at the release, the first key's alone when the call
+    /// spread and none when it read on its own task. A call that answers
+    /// before the release answered the last key's failure.
+    async fn first_key_fails_after_the_last<T: fmt::Debug>(
+        table: &Table,
+        gauged: &Gauged,
+        call: impl Future<Output = Result<T>>,
+    ) -> (Error, usize) {
+        let mut call = std::pin::pin!(call);
+        let spread_runs_left = 1;
+        let last_failed = async {
+            tokio::time::timeout(DEADLINE_GUARD, async {
+                while gauged.failed() == 0 || runs_alive(table) > spread_runs_left {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the last key fails while the first waits on the store");
+            runs_alive(table)
+        };
+        let (early, runs) = tokio::select! {
+            biased;
+            answered = call.as_mut() => (Some(answered), None),
+            runs = last_failed => (None, Some(runs)),
+        };
+        gauged.release();
+        let answered = match early {
+            Some(answered) => answered,
+            None => call.await,
+        };
+        let error = answered.expect_err("the first and the last key fail");
+        let runs =
+            runs.unwrap_or_else(|| panic!("answered before its first key failed: {error:?}"));
+        (error, runs)
+    }
+
+    /// A loaded key-value table of `keys` laid out in three files of the
+    /// one bucket as `first_between_last` splits them, and the store its
+    /// storage reads through.
+    async fn first_and_last_key_on_their_own(keys: &[i64]) -> (Table, Fixture, Arc<Gauged>) {
+        let mut fixture = Fixture::bucketed(1);
+        let names = [FIRST_KEY_FILE, "f1", LAST_KEY_FILE];
+        for (name, part) in names.into_iter().zip(first_between_last(keys)) {
+            fixture
+                .add_file(FileSpec {
+                    name,
+                    keys: &long_keys(part),
+                    values: values_of(part),
+                    partition: Partition::Bucket(0),
+                    bounds: Bounds::Exact,
+                    layout: WriterLayout::contract(),
+                })
+                .await;
+        }
+        fixture
+            .commit(FIRST_SNAPSHOT, None, FIRST_SEQUENCE, FIRST_VERSION)
+            .await;
+        let gauged = Arc::new(Gauged::new(Arc::new(LocalFileSystem::new())));
+        fixture
+            .storage
+            .register(FILE_PREFIX, Arc::<Gauged>::clone(&gauged));
+        let table = table_over(&fixture, lenient(&fixture)).await;
+        table.load().await.unwrap();
+        (table, fixture, gauged)
+    }
+
+    /// The error a `MultiGet` answers whose first key fails after its last
+    /// one, as `first_key_fails_after_the_last` drives it, while `others`
+    /// calls are counted in flight, and the runs alive once the first
+    /// key's read alone was left. Enough keys for a run on every worker of
+    /// the split runtime, and few enough for one run's fan-out to read
+    /// them all at once.
+    async fn multi_get_failing_first_and_last(others: usize) -> (Error, usize) {
+        let keys = keys_from(
+            0,
+            i64::try_from(MULTI_GET_TASK_KEYS_MIN * SPLIT_WORKERS).unwrap(),
+        );
+        assert!(
+            keys.len() <= DEFAULT_BATCH_FAN_OUT,
+            "one run reads every key at once"
+        );
+        let (table, fixture, gauged) = first_and_last_key_on_their_own(&keys).await;
+        let _others: Vec<InFlight<'_>> = (0..others).map(|_| table.lookups.enter()).collect();
+        first_key_slow_last_key_fast(&fixture, &gauged);
+        let asked = long_keys(&keys);
+        let value = [ColumnRead::whole(VALUE_COLUMN)];
+        first_key_fails_after_the_last(&table, &gauged, table.multi_get(&asked, &value)).await
+    }
+
+    /// A failing `MultiGet` answers the failure of its first failing key in
+    /// key order, spread over idle workers as on its own task, though a
+    /// later key in another run failed first: the first key's read is held
+    /// until the last key has failed and every other run has ended.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_multi_get_answers_its_first_failing_key_spread_or_inline() {
+        assert_eq!(shard::workers(), SPLIT_WORKERS);
+        let idle = 0;
+        let (error, runs) = multi_get_failing_first_and_last(idle).await;
+        assert_eq!(runs, 1, "the first key read on a spawned run");
+        assert!(file_gone(&error), "the first key's failure: {error:?}");
+        let others_filling_the_workers = SPLIT_WORKERS - 1;
+        let (error, runs) = multi_get_failing_first_and_last(others_filling_the_workers).await;
+        assert_eq!(runs, 0, "the first key read on the call's task");
+        assert!(file_gone(&error), "the first key's failure: {error:?}");
     }
 
     /// The runs a batch of `DEFAULT_BATCH_FAN_OUT` cold hits on one table
@@ -8133,6 +8338,48 @@ mod tests {
         let (inline, runs) = dropped_call_counts(others_filling_the_workers);
         assert_eq!(runs, 0, "the cold key read on the call's task");
         assert_eq!(inline, spread);
+    }
+
+    /// The error a `MultiScan` answers whose first key fails after its last
+    /// one, as `first_key_fails_after_the_last` drives it, while `others`
+    /// calls are counted in flight, and the runs alive once the first
+    /// key's read alone was left: enough keys for two runs on the split
+    /// runtime, and few enough for one run's fan-out to read them all at
+    /// once.
+    async fn multi_scan_failing_first_and_last(others: usize) -> (Error, usize) {
+        let runs = 2;
+        let keys = keys_from(0, i64::try_from(MULTI_SCAN_TASK_KEYS_MIN * runs).unwrap());
+        assert!(
+            keys.len() <= DEFAULT_BATCH_FAN_OUT,
+            "one run reads every key at once"
+        );
+        let files = first_between_last(&keys).map(|part| ordered_rows(part, SCAN_ROWS_PER_KEY));
+        let files: Vec<&[(i64, i64)]> = files.iter().map(Vec::as_slice).collect();
+        let (table, fixture, gauged) =
+            ordered_table_over(&files, WriterLayout::contract(), DEFAULT_BATCH_FAN_OUT).await;
+        let _others: Vec<InFlight<'_>> = (0..others).map(|_| table.lookups.enter()).collect();
+        first_key_slow_last_key_fast(&fixture, &gauged);
+        let asked = long_keys(&keys);
+        let bounds = spread_bounds();
+        let call = table.multi_scan(&asked, &BOTH_READS, &bounds);
+        first_key_fails_after_the_last(&table, &gauged, call).await
+    }
+
+    /// A failing `MultiScan` answers the failure of its first failing key
+    /// in key order, spread over idle workers as on its own task, though a
+    /// later key in another run failed first: the first key's read is held
+    /// until the last key has failed and every other run has ended.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_multi_scan_answers_its_first_failing_key_spread_or_inline() {
+        assert_eq!(shard::workers(), SPLIT_WORKERS);
+        let idle = 0;
+        let (error, runs) = multi_scan_failing_first_and_last(idle).await;
+        assert_eq!(runs, 1, "the first key read on a spawned run");
+        assert!(file_gone(&error), "the first key's failure: {error:?}");
+        let others_filling_the_workers = SPLIT_WORKERS - 1;
+        let (error, runs) = multi_scan_failing_first_and_last(others_filling_the_workers).await;
+        assert_eq!(runs, 0, "the first key read on the call's task");
+        assert!(file_gone(&error), "the first key's failure: {error:?}");
     }
 
     /// A Scan that ends after its call's receipt settled, as a run of a

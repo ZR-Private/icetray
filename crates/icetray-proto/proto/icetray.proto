@@ -48,7 +48,8 @@ service Icetray {
   // Look up many keys in one table. The response returns the results in
   // request order, all read from one snapshot. When the lookup of any key
   // fails, the whole call fails, so a response always covers every key of
-  // the request. A caller that retries resends the whole batch; a
+  // the request, and the error is that of the first failing key in request
+  // order. A caller that retries resends the whole batch; a
   // FAILED_PRECONDITION error recurs on every retry.
   rpc MultiGet(MultiGetRequest) returns (MultiGetResponse);
   // Read the rows of one key in one ordered table, in order-value order,
@@ -64,8 +65,9 @@ service Icetray {
   // them, all from one snapshot. The response returns one result per key in
   // request order, a key listed twice answered at each position. When the
   // read of any key fails, the whole call fails, so a response always
-  // covers every key of the request. A caller that retries resends the
-  // whole call; a FAILED_PRECONDITION error recurs on every retry. As for
+  // covers every key of the request, and the error is that of the first
+  // failing key in request order. A caller that retries resends the whole
+  // call; a FAILED_PRECONDITION error recurs on every retry. As for
   // Scan, a response above TableInfoResponse.max_scan_bytes is a
   // FAILED_PRECONDITION error; its message names how many leading
   // keys' results would have fit, and the caller lists fewer keys, sets a

@@ -175,7 +175,9 @@ A `MultiGet` request carries a list of keys and one list of columns,
 applied to every key. The server reads every key from one snapshot and
 returns the results in request order, with one snapshot id for the
 batch, so the results are consistent with each other. When the lookup of
-any key fails, the whole call fails, so every response covers every key.
+any key fails, the whole call fails, so every response covers every key,
+and the error is that of the first failing key in request order
+([Errors and retries](#errors-and-retries)).
 The caller then retries the whole batch when the error's row in
 [Errors and retries](#errors-and-retries) says to. On
 `FAILED_PRECONDITION`, the caller drops the key the error names or reads
@@ -494,6 +496,12 @@ while it loads included, and never cost an in-flight slot. A request
 with a fault of step 5 is `UNAVAILABLE` while the table loads and
 `INVALID_ARGUMENT` once it serves, so a caller that retries
 `UNAVAILABLE` sees the fault after the load.
+
+A `MultiGet` or `MultiScan` that passes these checks and then fails a
+read answers the error of its first failing key in request order,
+whichever key's read failed first. The code a caller decides its retry
+on does not depend on how the server scheduled the reads, and a
+`FAILED_PRECONDITION` names the first such key in request order.
 
 The gRPC layer enforces a deadline the client sends and reports its
 expiry to the client (a tonic client sees `CANCELLED`), and the server

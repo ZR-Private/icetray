@@ -138,7 +138,9 @@ A `MultiScan` of 32 distinct keys or fewer, and any `MultiScan` that
 arrives while as many calls as worker threads are in flight, reads its
 keys on one task. The runs share the call's `server.batch_fan_out`
 slots, and the answer, the response bound, and the metrics are the same
-either way.
+either way. So is the error of a failing call, a `MultiGet` or a
+`MultiScan`: that of its first failing key in request order, though a
+key of a later run failed first.
 
 Spreading trades CPU for latency. Measured warm under `full` on local
 files, at a limit of 1, a lone `MultiScan` took a median of 0.32 ms at
