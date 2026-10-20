@@ -690,12 +690,13 @@ fn every_row(max_scan_rows: u32) -> TestScan {
 ///
 /// Panics on a next that is not a long.
 fn model_next(scan: &TestScan, last: Option<i64>) -> Option<v1::OrderValue> {
-    last.map(|last| match scan.next_after(OrderKind::Long, last) {
-        icetray_core::OrderValue::Long(next) => wire_order(next),
-        other @ (icetray_core::OrderValue::Str(_) | icetray_core::OrderValue::Bytes(_)) => {
-            panic!("a long next: {other:?}")
-        }
-    })
+    last.and_then(|last| scan.next_after(OrderKind::Long, last))
+        .map(|next| match next {
+            icetray_core::OrderValue::Long(next) => wire_order(next),
+            other @ (icetray_core::OrderValue::Str(_) | icetray_core::OrderValue::Bytes(_)) => {
+                panic!("a long next: {other:?}")
+            }
+        })
 }
 
 /// The `requests_total` count of `call` answering `code` in `exposition`:

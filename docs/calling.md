@@ -435,7 +435,7 @@ its `limit`.
 | `RESOURCE_EXHAUSTED` | The server is at `server.max_in_flight` calls and refused this one at once. | Yes, with backoff |
 | `UNAVAILABLE` | A read from object storage or local disk failed, the table is not ready yet, or a lookup was canceled. | Yes |
 | `DEADLINE_EXCEEDED` | A `Get`, or a page fetch within any lookup, ran past `server.get_deadline`, a `MultiGet` ran past `server.multi_get_deadline`, a `Scan`, or a GET within any `Scan` or `MultiScan`, of a span of pages or of a key page under `bloom`, ran past `server.scan_deadline`, or a `MultiScan` ran past `server.multi_scan_deadline`. [Configuration](configuration.md#server) gives each deadline. | Yes, if the caller's own deadline allows |
-| `INTERNAL` | The table's data is faulty, such as a malformed file. | Only after the table advances to another snapshot |
+| `INTERNAL` | The table's data is faulty, such as a malformed file, or two live rows of a key at one order value, which a load refuses. | Only after the table advances to another snapshot |
 
 The gRPC layer enforces a deadline the client sends and reports its
 expiry to the client (a tonic client sees `CANCELLED`), and the server

@@ -979,7 +979,8 @@ pub fn derived_scan(
                 values: vec![Some(Bytes::from(ordered_value(table, id, order, version)))],
             })
             .collect(),
-        next: next.map(|last| next_bound(&ordered_order_value(table, id, last), scan.direction)),
+        next: next
+            .and_then(|last| next_bound(&ordered_order_value(table, id, last), scan.direction)),
     };
     (scanned, next)
 }
@@ -1683,10 +1684,10 @@ mod tests {
         assert_eq!(last, Some(newest.order));
         assert_eq!(
             scanned.next,
-            Some(next_bound(
+            next_bound(
                 &ordered_order_value(table, PINNED_ID, newest.order),
                 one.direction
-            ))
+            )
         );
         assert!(scanned.rows.iter().all(|row| {
             row.values[0]

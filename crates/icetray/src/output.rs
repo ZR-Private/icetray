@@ -191,6 +191,7 @@ impl RefusalCode {
             | ErrorKind::ResponseTooLarge
             | ErrorKind::WrongTableKind
             | ErrorKind::MalformedValue
+            | ErrorKind::NoNextBound
             | ErrorKind::Table
             | ErrorKind::File
             | ErrorKind::NotReady

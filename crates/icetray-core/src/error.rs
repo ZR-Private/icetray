@@ -146,6 +146,24 @@ pub enum Error {
         /// Where the walk stopped.
         fault: Malformed,
     },
+    /// A Scan of an ordered table met a live row of `key` past a row at
+    /// `order`, past which no order value lies in the direction read, so no
+    /// bound names the next page (RFD 025, Paging): the two rows repeat a
+    /// pair, which the load refuses as `duplicate_rows` (RFD 025,
+    /// Uniqueness). Only table data the load's check missed reaches it, and
+    /// the same Scan meets it again over the same snapshot.
+    #[error(
+        "table {table}: key {key} has a live row past order value {order}, which no order value follows"
+    )]
+    NoNextBound {
+        /// The table's configured name.
+        table: String,
+        /// The key whose rows repeat. Boxed with `order`, as
+        /// `MalformedValue`'s are.
+        key: Box<Key>,
+        /// The order value the two rows share.
+        order: Box<OrderValue>,
+    },
     /// The table's metadata makes it unusable before any data file is read;
     /// the fault set is closed.
     #[error("table {table}: {fault}")]
@@ -297,6 +315,7 @@ impl Error {
             | Self::ResponseTooLarge { .. }
             | Self::WrongTableKind { .. }
             | Self::MalformedValue { .. }
+            | Self::NoNextBound { .. }
             | Self::Table { .. }
             | Self::File { .. }
             | Self::NotReady { .. }
@@ -337,6 +356,7 @@ impl Error {
             Self::ResponseTooLarge { .. } => ErrorKind::ResponseTooLarge,
             Self::WrongTableKind { .. } => ErrorKind::WrongTableKind,
             Self::MalformedValue { .. } => ErrorKind::MalformedValue,
+            Self::NoNextBound { .. } => ErrorKind::NoNextBound,
             Self::Table { .. } => ErrorKind::Table,
             Self::File { .. } => ErrorKind::File,
             Self::NotReady { .. } => ErrorKind::NotReady,
@@ -388,6 +408,8 @@ pub enum ErrorKind {
     WrongTableKind,
     /// `Error::MalformedValue`.
     MalformedValue,
+    /// `Error::NoNextBound`.
+    NoNextBound,
     /// `Error::Table`.
     Table,
     /// `Error::File`.
@@ -450,8 +472,10 @@ impl Recurs for Error {
             Self::Local { fault, .. } => fault.recurrence(),
             Self::Cache(error) => error.recurrence(),
             // A data file's bytes, which are immutable, walked under the
-            // column's declared format: the same value fails the same way.
-            Self::MalformedValue { .. } => Recurrence::Deterministic,
+            // column's declared format: the same value fails the same way;
+            // and the rows of a snapshot's data files, which repeat a pair
+            // on every read.
+            Self::MalformedValue { .. } | Self::NoNextBound { .. } => Recurrence::Deterministic,
             // A library's error does not say whether it met malformed
             // bytes or a read that failed under it.
             Self::Iceberg(_)
@@ -501,6 +525,7 @@ impl fmt::Display for ErrorKind {
             Self::ResponseTooLarge => "response_too_large",
             Self::WrongTableKind => "wrong_table_kind",
             Self::MalformedValue => "malformed_value",
+            Self::NoNextBound => "no_next_bound",
             Self::Table => "table",
             Self::File => "file",
             Self::NotReady => "not_ready",
@@ -1692,13 +1717,15 @@ mod tests {
             },
             Recurrence::Deterministic,
         ));
+        cases.push((no_next_bound(), Recurrence::Deterministic));
         let classified_above = |error: &Error| match error {
             Error::Refused { .. }
             | Error::Table { .. }
             | Error::File { .. }
             | Error::Local { .. }
             | Error::Cache(_)
-            | Error::MalformedValue { .. } => true,
+            | Error::MalformedValue { .. }
+            | Error::NoNextBound { .. } => true,
             Error::Iceberg(_)
             | Error::Parquet(_)
             | Error::ObjectStore(_)
@@ -1952,7 +1979,18 @@ mod tests {
                 },
                 "malformed_value",
             ),
+            (no_next_bound(), "no_next_bound"),
         ]
+    }
+
+    /// A Scan's live row past the greatest long, as a repeated pair the
+    /// load missed leaves it.
+    fn no_next_bound() -> Error {
+        Error::NoNextBound {
+            table: TABLE.to_string(),
+            key: Box::new(Key::Long(1)),
+            order: Box::new(OrderValue::Long(i64::MAX)),
+        }
     }
 
     /// The outcome of a task aborted before it ran: the `JoinError` a

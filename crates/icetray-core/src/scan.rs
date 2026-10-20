@@ -9,6 +9,8 @@ use std::fmt;
 
 use bytes::Bytes;
 
+use crate::error::Error;
+use crate::key::Key;
 use crate::order::{Direction, OrderValue, OrderVariant, ScanBounds};
 use crate::snapshot::SnapshotId;
 
@@ -315,7 +317,15 @@ pub(crate) struct FileAnswer {
 /// are unique across files (RFD 025, Uniqueness), so no row is dropped as a
 /// repeat. One file's rows, as a compacted table's key answers, are already
 /// in the direction and at most the limit, so they are the answer as given.
-pub(crate) fn merge(mut files: Vec<FileAnswer>, bounds: &ScanBounds) -> Scanned {
+/// A row past which no bound lies, with a live row after it in the answer
+/// or past it, is `Error::NoNextBound` for `key` of `table`: the two rows
+/// repeat a pair, and a page that ends on the first has no `next` to give.
+pub(crate) fn merge(
+    mut files: Vec<FileAnswer>,
+    bounds: &ScanBounds,
+    table: &str,
+    key: &Key,
+) -> crate::error::Result<Scanned> {
     let (rows, beyond) = if files.len() == 1
         && let Some(file) = files.pop()
     {
@@ -336,11 +346,25 @@ pub(crate) fn merge(mut files: Vec<FileAnswer>, bounds: &ScanBounds) -> Scanned 
         rows.truncate(limit);
         (rows, cut || beyond_a_file)
     };
-    let next = rows
-        .last()
-        .filter(|_| beyond)
-        .map(|last| next_bound(&last.order, bounds.direction));
-    Scanned { rows, next }
+    // The last row a live row follows, in the answer or past it. The rows
+    // are in the direction, and every row after one with no bound past it
+    // is at its order value, so when any row a live row follows has no
+    // bound past it, this one has none.
+    let followed = rows.len().checked_sub(if beyond { 1 } else { 2 });
+    let bound = followed
+        .map(|at| {
+            let order = &rows[at].order;
+            next_bound(order, bounds.direction).ok_or_else(|| Error::NoNextBound {
+                table: table.to_string(),
+                key: Box::new(key.clone()),
+                order: Box::new(order.clone()),
+            })
+        })
+        .transpose()?;
+    Ok(Scanned {
+        rows,
+        next: bound.filter(|_| beyond),
+    })
 }
 
 /// The next page's bound after a page whose last row is at `last`, read in
@@ -348,22 +372,20 @@ pub(crate) fn merge(mut files: Vec<FileAnswer>, bounds: &ScanBounds) -> Scanned 
 /// itself, the next page's exclusive `before`; oldest first its successor,
 /// the next page's inclusive `start`, so a row a later snapshot adds
 /// between `last` and the next row the page did not return is read.
-///
-/// Panics oldest first on a `last` of `i64::MAX`, which no live row lies
-/// past.
+/// `None` oldest first at a `last` of `i64::MAX`: no order value lies past
+/// it, so no live row does where pairs are unique (RFD 025, Uniqueness).
 #[must_use]
-pub fn next_bound(last: &OrderValue, direction: Direction) -> OrderValue {
+pub fn next_bound(last: &OrderValue, direction: Direction) -> Option<OrderValue> {
     match direction {
-        Direction::NewestFirst => last.clone(),
-        Direction::OldestFirst => last
-            .successor()
-            .expect("a live row lies above the last row returned, so it has a successor"),
+        Direction::NewestFirst => Some(last.clone()),
+        Direction::OldestFirst => last.successor(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::generation::testing::TABLE;
 
     /// A table's `max_scan_rows` in these tests.
     const MAX: u32 = 10;
@@ -527,6 +549,15 @@ mod tests {
             .collect()
     }
 
+    /// The key the merge tests read.
+    const KEY: Key = Key::Long(1);
+
+    /// `merge` of `files` under `bounds` for `KEY`, which these files'
+    /// unique rows always answer.
+    fn merge_unique(files: Vec<FileAnswer>, bounds: &ScanBounds) -> Scanned {
+        merge(files, bounds, TABLE, &KEY).unwrap()
+    }
+
     /// The bounds of a merge read in `direction` at `limit`.
     fn reading(direction: Direction, limit: u32) -> ScanBounds {
         ScanBounds {
@@ -552,10 +583,10 @@ mod tests {
             if direction == Direction::OldestFirst {
                 merged.reverse();
             }
-            let all = merge(two_files(direction), &reading(direction, MAX));
+            let all = merge_unique(two_files(direction), &reading(direction, MAX));
             assert_eq!(orders(&all), merged, "{direction:?}");
             assert_eq!(all.next, None, "{direction:?}");
-            let cut = merge(two_files(direction), &reading(direction, UNDER));
+            let cut = merge_unique(two_files(direction), &reading(direction, UNDER));
             assert_eq!(orders(&cut), merged[..under], "{direction:?}");
             assert_eq!(
                 cut.next,
@@ -565,7 +596,7 @@ mod tests {
             for beyond_at in 0..2 {
                 let mut files = two_files(direction);
                 files[beyond_at].beyond = true;
-                let past = merge(files, &reading(direction, MAX));
+                let past = merge_unique(files, &reading(direction, MAX));
                 assert_eq!(orders(&past), merged, "{direction:?}");
                 assert_eq!(
                     past.next,
@@ -574,7 +605,7 @@ mod tests {
                 );
             }
         }
-        let none = merge(Vec::new(), &reading(Direction::OldestFirst, MAX));
+        let none = merge_unique(Vec::new(), &reading(Direction::OldestFirst, MAX));
         assert!(none.rows.is_empty() && none.next.is_none());
     }
 
@@ -585,10 +616,10 @@ mod tests {
                 rows: FIRST_FILE.into_iter().map(row).collect(),
                 beyond,
             };
-            let alone = merge(vec![file(false)], &reading(direction, MAX));
+            let alone = merge_unique(vec![file(false)], &reading(direction, MAX));
             assert_eq!(orders(&alone), FIRST_FILE);
             assert_eq!(alone.next, None);
-            let beyond = merge(vec![file(true)], &reading(direction, MAX));
+            let beyond = merge_unique(vec![file(true)], &reading(direction, MAX));
             assert_eq!(orders(&beyond), FIRST_FILE);
             assert_eq!(
                 beyond.next,
@@ -619,8 +650,69 @@ mod tests {
                 }],
                 beyond: true,
             };
-            let oldest = merge(vec![file], &reading(Direction::OldestFirst, 1));
+            let oldest = merge_unique(vec![file], &reading(Direction::OldestFirst, 1));
             assert_eq!(oldest.next, Some(next), "{last}");
         }
+    }
+
+    #[test]
+    fn test_next_bound_oldest_first_past_the_greatest_long_is_none() {
+        let greatest = OrderValue::Long(i64::MAX);
+        assert_eq!(next_bound(&greatest, Direction::OldestFirst), None);
+        assert_eq!(
+            next_bound(&greatest, Direction::NewestFirst),
+            Some(greatest.clone())
+        );
+        assert_eq!(
+            next_bound(&OrderValue::Long(i64::MAX - 1), Direction::OldestFirst),
+            Some(greatest)
+        );
+    }
+
+    /// Oldest first, a live row after one at the greatest long repeats its
+    /// pair, which no correct load serves: whether the merge cut it, a file
+    /// holds it past its rows, or it is in the answer, the merge refuses
+    /// the Scan naming the key and the order value, rather than answer a
+    /// page with no `next`. At the greatest long with nothing after it, the
+    /// answer is as any other.
+    #[test]
+    fn test_merge_refuses_a_live_row_past_the_greatest_long() {
+        let greatest = i64::MAX;
+        let file = |orders: &[i64], beyond| FileAnswer {
+            rows: orders.iter().copied().map(row).collect(),
+            beyond,
+        };
+        let repeated = [
+            (vec![file(&[greatest], false), file(&[greatest], false)], 1),
+            (vec![file(&[greatest], false), file(&[greatest], false)], 2),
+            (vec![file(&[greatest - 1, greatest], true)], 2),
+            (
+                vec![file(&[greatest], true), file(&[greatest - 1], false)],
+                2,
+            ),
+        ];
+        for (at, (files, limit)) in repeated.into_iter().enumerate() {
+            let refused = merge(files, &reading(Direction::OldestFirst, limit), TABLE, &KEY);
+            let Err(Error::NoNextBound { table, key, order }) = refused else {
+                panic!("case {at}: expected no_next_bound, got {refused:?}");
+            };
+            assert_eq!(
+                (table.as_str(), *key, *order),
+                (TABLE, KEY, OrderValue::Long(greatest)),
+                "case {at}"
+            );
+        }
+        let last = merge_unique(
+            vec![file(&[greatest - 1, greatest], false)],
+            &reading(Direction::OldestFirst, 2),
+        );
+        assert_eq!(orders(&last), [greatest - 1, greatest]);
+        assert_eq!(last.next, None);
+        let newest = merge_unique(
+            vec![file(&[greatest], false), file(&[greatest - 1], false)],
+            &reading(Direction::NewestFirst, 1),
+        );
+        assert_eq!(orders(&newest), [greatest]);
+        assert_eq!(newest.next, Some(OrderValue::Long(greatest)));
     }
 }

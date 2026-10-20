@@ -857,7 +857,7 @@ impl Fixture {
                         .collect(),
                 })
                 .collect(),
-            next: next.map(|last| scan.next_after(kind, last)),
+            next: next.and_then(|last| scan.next_after(kind, last)),
         }
     }
 

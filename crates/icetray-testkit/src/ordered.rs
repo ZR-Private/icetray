@@ -413,8 +413,9 @@ impl TestScan {
 
     /// The `next` a Scan of this request answers after a page whose last
     /// row is at raw order value `last`, in the encoding of `kind`
-    /// (`next_bound`).
-    pub fn next_after(&self, kind: OrderKind, last: i64) -> OrderValue {
+    /// (`next_bound`): `None` where no bound follows it, past which no
+    /// unique row lies.
+    pub fn next_after(&self, kind: OrderKind, last: i64) -> Option<OrderValue> {
         next_bound(&order_value(kind, last), self.direction)
     }
 }

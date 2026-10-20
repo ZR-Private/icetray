@@ -624,9 +624,11 @@ impl Generation {
     /// `source.fan_out`, goes through `source.cache`, and counts in its
     /// column's counter. The files' rows are merged by order value, live
     /// pairs being unique across files (RFD 025, Uniqueness), and cut to
-    /// the limit (`scan::merge`). A file written before a column was added
-    /// answers that column's default (RFD 023). A key no file holds
-    /// answers no rows and no `next`, with no read beyond finding that.
+    /// the limit (`scan::merge`); a row past which no bound lies, followed
+    /// by a live row, is `Error::NoNextBound`. A file written before a
+    /// column was added answers that column's default (RFD 023). A key no
+    /// file holds answers no rows and no `next`, with no read beyond
+    /// finding that.
     pub(crate) async fn scan(
         &self,
         key: &Key,
@@ -666,7 +668,8 @@ impl Generation {
             answers.push(rows.answer);
         }
         let files = answers.len();
-        Ok((scan::merge(answers, bounds), ScanRead { files, from_store }))
+        let scanned = scan::merge(answers, bounds, &self.table, key)?;
+        Ok((scanned, ScanRead { files, from_store }))
     }
 
     /// `lookup` naming the layout's first value column, alone and

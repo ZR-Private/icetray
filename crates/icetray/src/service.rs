@@ -342,23 +342,29 @@ fn scan_within_bound(
     // A Scan at a limit of `taken` rows, fewer than the response's,
     // answers them with the `next` that follows the last of them
     // (`next_bound`), since a row lies past it. At all of the response's
-    // rows it answers the response's own.
+    // rows it answers the response's own. A prefix ending on a row past
+    // which no bound lies has no `next` to give, and never counts as
+    // fitting; core refuses a response holding such a row with one after
+    // it (`Error::NoNextBound`), so none reaches here.
     let rows = &response.rows;
     let next_of = |taken: usize| {
         if taken == rows.len() {
-            return response
-                .next
-                .as_ref()
-                .map_or(0, |next| message::encoded_len(NEXT_FIELD_TAG, next));
+            return Some(
+                response
+                    .next
+                    .as_ref()
+                    .map_or(0, |next| message::encoded_len(NEXT_FIELD_TAG, next)),
+            );
         }
-        taken
+        let Some(last) = taken
             .checked_sub(1)
             .and_then(|last| rows[last].order.as_ref())
             .and_then(|order| order_of_wire(order.value.clone()))
-            .map_or(0, |last| {
-                let next = order_value_wire(next_bound(&last, direction));
-                message::encoded_len(NEXT_FIELD_TAG, &next)
-            })
+        else {
+            return Some(0);
+        };
+        let next = order_value_wire(next_bound(&last, direction)?);
+        Some(message::encoded_len(NEXT_FIELD_TAG, &next))
     };
     Err(Oversize {
         bytes,
@@ -393,19 +399,20 @@ fn multi_scan_within_bound(
             &response.results,
             fixed.encoded_len(),
             bound,
-            |_| 0,
+            |_| Some(0),
         )),
     })
 }
 
 /// How many of `items`, the repeated field of a response whose other
 /// fields encode to `fixed` bytes, fit in `bound` bytes, taken in order,
-/// a response of the first `n` of them carrying `tail(n)` bytes more.
+/// a response of the first `n` of them carrying `tail(n)` bytes more; a
+/// prefix whose tail is `None` does not fit.
 fn fitting_prefix<M: Message>(
     items: &[M],
     fixed: usize,
     bound: usize,
-    tail: impl Fn(usize) -> usize,
+    tail: impl Fn(usize) -> Option<usize>,
 ) -> usize {
     let mut size = fixed;
     items
@@ -413,7 +420,7 @@ fn fitting_prefix<M: Message>(
         .enumerate()
         .take_while(|(at, item)| {
             size += message::encoded_len(REPEATED_FIELD_TAG, *item);
-            size + tail(at + 1) <= bound
+            tail(at + 1).is_some_and(|tail| size + tail <= bound)
         })
         .count()
 }
@@ -525,6 +532,7 @@ pub fn status_from(error: &Error) -> Status {
         | Error::Config(_)
         | Error::Location { .. }
         | Error::Refused { .. }
+        | Error::NoNextBound { .. }
         | Error::Table { .. }
         | Error::File { .. } => Status::internal(message),
     }
@@ -1213,6 +1221,14 @@ mod tests {
                 )
             }),
         )
+        .chain([(
+            Error::NoNextBound {
+                table: TABLE.to_string(),
+                key: Box::new(Key::Long(LONG_VALUE)),
+                order: Box::new(OrderValue::Long(i64::MAX)),
+            },
+            Code::Internal,
+        )])
         .collect()
     }
 

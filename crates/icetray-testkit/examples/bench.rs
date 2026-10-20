@@ -2179,7 +2179,7 @@ impl ScanCase {
                 .into_iter()
                 .map(|(order, ())| order_value(ordered.kind, order))
                 .collect(),
-            next: next.map(|last| test.next_after(ordered.kind, last)),
+            next: next.and_then(|last| test.next_after(ordered.kind, last)),
             test,
         })
     }
@@ -2256,7 +2256,7 @@ fn modeled_scan(
                 values: vec![Some(value.into())],
             })
             .collect(),
-        next: next.map(|last| test.next_after(ordered.kind, last)),
+        next: next.and_then(|last| test.next_after(ordered.kind, last)),
     })
 }
 
