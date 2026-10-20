@@ -676,8 +676,18 @@ type RowGroupRead = BoxFuture<'static, Landed>;
 /// state with why the step stopped, or the pool's refusal to run it.
 type Stepped = (
     usize,
-    std::result::Result<(MergeState, Result<Progress>), JoinError>,
+    std::result::Result<(MergeState, Result<Progress>), LostStep>,
 );
+
+/// A step the blocking pool dropped unstarted as the runtime shut down,
+/// and with it the state it owned, which no retire hands back.
+struct LostStep {
+    /// The pool's refusal.
+    canceled: JoinError,
+    /// The bytes the state owned with the row groups handed to it
+    /// (`MergeState::owned`), known when the step was spawned.
+    owned: u64,
+}
 
 /// Merges the chosen pages each of `merges` names of `files`, one merge
 /// per overlap group, in group order (`MergeState::resume`), the rows
@@ -808,12 +818,14 @@ impl Merges {
                     break;
                 };
                 let batch = std::mem::take(&mut ahead.landed[merge]);
+                let owned = state.owned(&batch);
                 self.steps.push(Box::pin(async move {
                     let stepped = blocking::on_blocking_pool(move || {
                         let progress = state.resume(batch, room);
                         (state, progress)
                     })
-                    .await;
+                    .await
+                    .map_err(|canceled| LostStep { canceled, owned });
                     (merge, stepped)
                 }));
             }
@@ -892,16 +904,18 @@ impl Merges {
 
     /// Takes a step of `merge` as it returned: the merge waits for its
     /// next step, passes, or fails. A merge that ended while it stepped
-    /// drops what it holds.
+    /// drops what it holds, and a lost step hands back what its state
+    /// owned.
     fn stepped(
         &mut self,
         merge: usize,
-        stepped: std::result::Result<(MergeState, Result<Progress>), JoinError>,
+        stepped: std::result::Result<(MergeState, Result<Progress>), LostStep>,
         ahead: &mut ReadAhead,
     ) {
         let (state, progress) = match stepped {
             Ok(stepped) => stepped,
-            Err(canceled) => {
+            Err(LostStep { canceled, owned }) => {
+                ahead.release(owned);
                 if !self.ended[merge] {
                     let error = Error::verify_canceled(&self.firsts[merge], canceled);
                     self.fail(merge, error, ahead);
@@ -1505,22 +1519,51 @@ impl MergeState {
             .sum()
     }
 
+    /// The bytes it owns with `arrived` handed to it: those of the row
+    /// groups its cursors hold, of those it dropped and `ReadAhead` has not
+    /// yet taken, and of `arrived`. A step that returns, failed or not,
+    /// holds or has dropped every one of them.
+    fn owned(&self, arrived: &[Arrival]) -> u64 {
+        self.dropped
+            + self.held()
+            + arrived
+                .iter()
+                .map(|(_, _, chunks)| chunks.read_bytes())
+                .sum::<u64>()
+    }
+
     /// Hands each row group of `arrived` to its cursor, then merges until a
     /// cursor waits, until it has dropped `room` bytes when `room` is set,
-    /// or until the merge ends.
+    /// or until the merge ends. A row group that fails to decode fails the
+    /// step, and those after it, never handed to a cursor, count as
+    /// dropped.
     fn resume(&mut self, arrived: Vec<Arrival>, room: Option<u64>) -> Result<Progress> {
-        for (cursor, place, chunks) in arrived {
-            let waiting = &mut self.heads.cursors[cursor];
-            if waiting.waits && waiting.next == place {
-                waiting.waits = false;
-                self.waiting -= 1;
-                let head = waiting.resume(chunks, &self.deletes)?;
-                self.place(cursor, head)?;
-            } else {
-                waiting.ahead[place] = Some(chunks);
+        let mut arrived = arrived.into_iter();
+        while let Some((cursor, place, chunks)) = arrived.next() {
+            if let Err(error) = self.arrive(cursor, place, chunks) {
+                self.dropped += arrived
+                    .map(|(_, _, chunks)| chunks.read_bytes())
+                    .sum::<u64>();
+                return Err(error);
             }
         }
         self.merge(room)
+    }
+
+    /// Hands `chunks`, row group `place` of `cursor`, to the cursor: moves
+    /// the cursor onto it where the cursor waits on it, and holds it ahead
+    /// otherwise.
+    fn arrive(&mut self, cursor: usize, place: usize, chunks: PairChunks) -> Result<()> {
+        let waiting = &mut self.heads.cursors[cursor];
+        if waiting.waits && waiting.next == place {
+            waiting.waits = false;
+            self.waiting -= 1;
+            let head = waiting.resume(chunks, &self.deletes)?;
+            self.place(cursor, head)
+        } else {
+            waiting.ahead[place] = Some(chunks);
+            Ok(())
+        }
     }
 
     /// Drops the row group `cursor` holds current.
@@ -3006,6 +3049,90 @@ mod tests {
         merge.stop.store(true, atomic::Ordering::Relaxed);
         assert_eq!(merge.resume(arrived, None).unwrap(), Progress::Stopped);
         assert_eq!(merge.held(), bytes);
+    }
+
+    /// A row group that fails to decode fails its merge's step, and every
+    /// byte the step owned is held or counted dropped, the failing row
+    /// group's and that of the one after it, never handed to its cursor,
+    /// among them: the merge hands all of it back as it retires.
+    #[tokio::test]
+    async fn test_merge_failing_to_decode_hands_back_every_byte_it_owned() {
+        let built = sharing_a_pair("d", 0).await;
+        let files: Vec<Arc<LoadedFile>> = built.iter().map(|one| Arc::clone(&one.file)).collect();
+        let mut cursors = Vec::new();
+        let mut arrived = Vec::new();
+        for (at, file) in files.iter().enumerate() {
+            let group = every_page(file, 0, 0);
+            let read = file.index.pair_read(group.row_group, &group.pages);
+            cursors.push(PairCursor::new(at, true, Arc::clone(file), 1));
+            let chunks = file.index.pair_chunks(read).await.unwrap();
+            let chunks = if at == 0 {
+                chunks.without_bytes()
+            } else {
+                chunks
+            };
+            arrived.push((at, 0, chunks));
+        }
+        assert!(
+            arrived[1].2.read_bytes() > 0,
+            "the row group after the failing one holds bytes"
+        );
+        let deletes: Arc<[Option<Arc<FileDeletes>>]> = vec![None; files.len()].into();
+        let mut merge = MergeState::new(TABLE, cursors, deletes);
+        let owned = merge.owned(&arrived);
+        let failed = merge.resume(arrived, None);
+        assert!(failed.is_err(), "{failed:?}");
+        assert_eq!(merge.dropped + merge.held(), owned);
+    }
+
+    /// A step the blocking pool drops unstarted takes its state with it:
+    /// the merge hands back the bytes the state owned with the row groups
+    /// handed to it, as `drive` counted them at the spawn, and fails as
+    /// canceled.
+    #[tokio::test]
+    async fn test_a_lost_step_hands_back_what_its_state_owned() {
+        let built = sharing_a_pair("l", 0).await;
+        let reused = vec![false; built.len()];
+        let none = vec![Vec::new(); built.len()];
+        let generation = Checked::of(&built, &reused, &reused, &none);
+        let GroupMerges {
+            checked, merges, ..
+        } = GroupMerges::of(&generation.members, &generation.files, &generation.groups);
+        let mut ahead = ReadAhead::new(
+            &generation.files,
+            &merges,
+            MERGE_READ_AHEAD_BYTES,
+            load_concurrency(),
+        );
+        let mut run = Merges::new(
+            TABLE,
+            &generation.files,
+            &checked,
+            merges,
+            &generation.deletes,
+        );
+        run.hand_over(&mut ahead);
+        ahead.start();
+        while let Some(one) = ahead.in_flight.next().await {
+            run.land(one, &mut ahead);
+        }
+        let (merge, state) = run.next_step(&ahead).expect("the merge's reads landed");
+        let batch = std::mem::take(&mut ahead.landed[merge]);
+        let owned = state.owned(&batch);
+        assert!(
+            owned > 0 && ahead.taken == owned,
+            "the step owns what was read"
+        );
+        drop((state, batch));
+        let task = tokio::spawn(std::future::pending::<()>());
+        task.abort();
+        let canceled = task.await.unwrap_err();
+        run.stepped(merge, Err(LostStep { canceled, owned }), &mut ahead);
+        assert_eq!(ahead.taken, 0);
+        assert!(
+            matches!(run.settled(), Some(Err(Error::VerifyCanceled { .. }))),
+            "the lost step fails its merge as canceled"
+        );
     }
 
     /// The merges of a load share its slots: with five slots and two merges

@@ -73,6 +73,18 @@ impl PairChunks {
     }
 }
 
+#[cfg(test)]
+impl PairChunks {
+    /// The same runs, counting the same bytes read, with none of the bytes
+    /// held: every decode of them reads outside what is held and fails.
+    pub(crate) fn without_bytes(self) -> Self {
+        Self {
+            chunks: Arc::new(Segments::new(Vec::new(), 0)),
+            ..self
+        }
+    }
+}
+
 /// The pairs of one span of rows, in file order, with the position in the
 /// file of the first.
 pub(crate) struct Pairs {
