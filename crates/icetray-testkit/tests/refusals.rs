@@ -1357,9 +1357,7 @@ async fn test_duplicate_rows_are_refused() -> Result<()> {
     let (_dir, catalog) = local_catalog().await?;
     let fixture = two_row_fixture(&catalog, "ord_duprows", 0).await?;
     let refused = refused_through_catalog(&fixture, &catalog, ordered_config(&fixture)).await?;
-    let RefusalReason::DuplicateRows { path, key, order } = &refused.reason else {
-        panic!("{:?}", refused.reason);
-    };
+    let (path, key, order) = verify::duplicate_rows(&refused.reason);
     assert!(
         fixture.files().iter().any(|file| file.file_path() == path),
         "{path} is one of the fixture's files"
@@ -1369,7 +1367,7 @@ async fn test_duplicate_rows_are_refused() -> Result<()> {
         fixture.key(IDS_2K.start),
         "the file's first key repeats first"
     );
-    assert_eq!(**order, OrderValue::Long(0));
+    assert_eq!(*order, OrderValue::Long(0));
     Ok(())
 }
 
@@ -1445,12 +1443,10 @@ async fn test_duplicate_rows_across_files_are_refused_naming_the_later_file() ->
         .find(|path| *path != written)
         .expect("the append adds a file");
     let refused = refused_through_catalog(&fixture, &catalog, ordered_config(&fixture)).await?;
-    let RefusalReason::DuplicateRows { path, key, order } = &refused.reason else {
-        panic!("{:?}", refused.reason);
-    };
-    assert_eq!(*path, appended);
+    let (path, key, order) = verify::duplicate_rows(&refused.reason);
+    assert_eq!(path, appended);
     assert_eq!(*key, fixture.key(REPEATED_ID));
-    assert_eq!(**order, OrderValue::Long(SECOND_ORDER));
+    assert_eq!(*order, OrderValue::Long(SECOND_ORDER));
     Ok(())
 }
 
@@ -1508,15 +1504,9 @@ async fn test_refresh_refuses_a_pair_revived_by_dropped_deletes() -> Result<()> 
 
         fixture.move_ref(without_vector).await?;
         let error = served.table.refresh().await.unwrap_err();
-        let Error::Refused {
-            reason: RefusalReason::DuplicateRows { path, key, order },
-            ..
-        } = error
-        else {
-            panic!("{residency:?}: expected duplicate_rows, got {error:?}");
-        };
+        let (path, key, order) = verify::refused_duplicate_rows(&error);
         assert_eq!(path, later, "{residency:?}");
-        assert_eq!(key, fixture.key(REPEATED_ID));
+        assert_eq!(*key, fixture.key(REPEATED_ID));
         assert_eq!(*order, OrderValue::Long(SECOND_ORDER));
         assert_eq!(served.current().snapshot_id, generation.snapshot_id);
     }

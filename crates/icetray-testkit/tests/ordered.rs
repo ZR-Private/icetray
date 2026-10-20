@@ -16,7 +16,7 @@ use iceberg::spec::{FormatVersion, Literal, PrimitiveType};
 use icetray_core::approx::count;
 use icetray_core::config::{Residency, TableConfig};
 use icetray_core::{
-    ColumnRead, Direction, Error, Key, KeyType, LoadedFile, OrderValue, Pair, ScanBounds, ScanRow,
+    ColumnRead, Direction, Error, Key, KeyType, LoadedFile, OrderValue, Pair, ScanBounds,
     TableKind, bucket,
 };
 use icetray_testkit::fixture::{
@@ -849,33 +849,24 @@ async fn test_paging_by_next_returns_every_live_row_once() -> Result<()> {
                 "the history spans row groups"
             );
             for (residency, served) in tiers.all() {
-                let mut scan = TestScan {
+                let first = TestScan {
                     direction,
                     limit: PAGE_LIMIT,
                     ..TestScan::default()
                 };
-                let mut bounds = scan.bounds(kind);
-                let mut read: Vec<ScanRow> = Vec::new();
-                loop {
-                    let page = served
-                        .table
-                        .scan(&key, &reads(&columns), &bounds)
-                        .await?
-                        .scanned;
-                    let want = fixture.expected_scanned(&key, &columns, &scan);
-                    assert_eq!(page, want, "{kind:?} {residency} {scan:?}");
-                    read.extend(page.rows);
-                    let Some(next) = page.next else { break };
-                    let last = fixture
-                        .expected_scan(&key, &[], &scan)
-                        .1
-                        .expect("a page with a next ends at a row");
-                    scan = scan.after_page(last);
-                    match direction {
-                        Direction::NewestFirst => bounds.before = Some(next),
-                        Direction::OldestFirst => bounds.start = Some(next),
-                    }
-                }
+                let model = |scan: &TestScan| {
+                    let last = fixture.expected_scan(&key, &[], scan).1;
+                    (fixture.expected_scanned(&key, &columns, scan), last)
+                };
+                let (read, _) = verify::page_scans(
+                    &served.table,
+                    &key,
+                    &reads(&columns),
+                    (first, first.bounds(kind)),
+                    model,
+                    &format!("{kind:?} {residency}"),
+                )
+                .await?;
                 assert_eq!(read, whole.rows, "{kind:?} {residency} {direction:?}");
             }
         }
@@ -1420,14 +1411,9 @@ async fn test_scan_answers_a_column_added_after_a_file_with_its_default() -> Res
             .await?;
         assert_eq!(got.scanned, want, "{residency}");
         let read_columns = 1;
-        let gets = match residency {
-            Residency::Full => read_columns + ORDER_SPAN,
-            Residency::Disk => read_columns,
-            Residency::Bloom => KEY_PAGES_OF_A_MIDDLE_RUN + read_columns + ORDER_SPAN,
-        };
         assert_eq!(
             stats.gets() - before,
-            gets,
+            cold_scan_gets(*residency, read_columns),
             "{residency}: no GET of the added column"
         );
     }

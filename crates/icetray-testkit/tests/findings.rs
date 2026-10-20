@@ -869,12 +869,7 @@ fn ordered_spec(name: &str, kind: OrderKind) -> FixtureSpec {
         ..FixtureSpec::ordered(
             name,
             KeyType::Long,
-            Ordered {
-                kind,
-                rows_per_key: RowsPerKey::Each(ROWS_PER_KEY),
-                start: ORDER_START,
-                step: ORDER_STEP,
-            },
+            Ordered::each(kind, ROWS_PER_KEY, ORDER_START, ORDER_STEP),
         )
     }
 }

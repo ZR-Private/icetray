@@ -33,7 +33,7 @@ use icetray_testkit::verify::{
 };
 use icetray_testkit::{
     CountingStore, DeleteForm, Fixture, FixtureSpec, HandSnapshot, Layout, MergeOracle, OrderKind,
-    Ordered, Result, RowsPerKey, Statistics, TestkitError, write_fixture,
+    Ordered, Result, Statistics, TestkitError, write_fixture,
 };
 use object_store::ObjectStore;
 use roaring::RoaringTreemap;
@@ -597,20 +597,24 @@ const AN_ID: u64 = 17;
 /// page of the run but those a late row can fall among.
 const LONG_RUN_ROWS: u64 = 40;
 
-/// The raw order value of a key's `index`-th row.
+/// The raw order value of a key's `index`-th row, of whatever fixture
+/// `ordered_spec` writes.
 fn order_of(index: u64) -> i64 {
-    ORDER_START + ORDER_STEP * i64::try_from(index).expect("a row index fits i64")
+    ordered(ORDERED_ROWS_PER_KEY)
+        .order_at(index)
+        .expect("a row index's order value fits a long")
+}
+
+/// `rows_per_key` long order values per key, `ORDER_STEP` apart from
+/// `ORDER_START`.
+fn ordered(rows_per_key: u64) -> Ordered {
+    Ordered::each(OrderKind::Long, rows_per_key, ORDER_START, ORDER_STEP)
 }
 
 /// `ORDERED_IDS` over two buckets, `rows_per_key` long order values per
 /// key, in pages of `ORDERED_PAGE_ROWS` rows.
 fn ordered_spec(name: &str, rows_per_key: u64) -> FixtureSpec {
-    let ordered = Ordered {
-        kind: OrderKind::Long,
-        rows_per_key: RowsPerKey::Each(rows_per_key),
-        start: ORDER_START,
-        step: ORDER_STEP,
-    };
+    let ordered = ordered(rows_per_key);
     FixtureSpec {
         ids: ORDERED_IDS,
         buckets: TWO_BUCKETS,
@@ -942,18 +946,12 @@ async fn test_new_files_of_one_refresh_are_checked_against_each_other() -> Resul
             })
             .await?;
         let error = served.table.refresh().await.unwrap_err();
-        let Error::Refused {
-            reason: RefusalReason::DuplicateRows { path, key, order },
-            ..
-        } = error
-        else {
-            panic!("{residency:?}: expected duplicate_rows, got {error:?}");
-        };
+        let (path, key, order) = verify::refused_duplicate_rows(&error);
         assert_eq!(
             path, later,
             "{residency:?}: both start at the key, so by path"
         );
-        assert_eq!(key, fixture.key(id));
+        assert_eq!(*key, fixture.key(id));
         assert_eq!(*order, OrderValue::Long(order_of(0)));
         assert_eq!(
             served.current().snapshot_id,
@@ -1052,15 +1050,9 @@ async fn test_a_pair_whose_new_copy_is_deleted_is_served() -> Result<()> {
             .commit_by_hand(HandSnapshot { data, deletes })
             .await?;
         let error = served.table.refresh().await.unwrap_err();
-        let Error::Refused {
-            reason: RefusalReason::DuplicateRows { path, key, order },
-            ..
-        } = error
-        else {
-            panic!("{residency:?}: expected duplicate_rows, got {error:?}");
-        };
+        let (path, key, order) = verify::refused_duplicate_rows(&error);
         assert_eq!(path, new_file, "{residency:?}");
-        assert_eq!(key, fixture.key(AN_ID));
+        assert_eq!(*key, fixture.key(AN_ID));
         assert_eq!(*order, OrderValue::Long(order_of(0)));
         assert_eq!(
             served.current().snapshot_id,

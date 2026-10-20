@@ -36,8 +36,8 @@ use icetray_testkit::layout::{Layout, VALUE_COLUMN};
 use icetray_testkit::protobuf;
 use icetray_testkit::verify::{data_files, remove_data_files, series_value, zero_column_chunks};
 use icetray_testkit::{
-    DeleteForm, Fixture, FixtureSpec, Nulls, ORDER_COLUMN, Order, OrderKind, Ordered, RowsPerKey,
-    ValueKind, memory_catalog_local, write_fixture,
+    DeleteForm, Fixture, FixtureSpec, Nulls, ORDER_COLUMN, Order, OrderKind, Ordered, ValueKind,
+    memory_catalog_local, write_fixture,
 };
 use serde_json::Value as Json;
 use tonic::transport::Channel;
@@ -618,12 +618,7 @@ fn ordered_spec_of(name: &str, kind: OrderKind, start: i64, step: i64) -> Fixtur
         ..FixtureSpec::ordered(
             name,
             KeyType::Long,
-            Ordered {
-                kind,
-                rows_per_key: RowsPerKey::Each(ORDER_ROWS_PER_KEY),
-                start,
-                step,
-            },
+            Ordered::each(kind, ORDER_ROWS_PER_KEY, start, step),
         )
     }
 }

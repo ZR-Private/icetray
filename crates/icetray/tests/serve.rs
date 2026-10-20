@@ -39,7 +39,7 @@ use icetray_testkit::protobuf;
 use icetray_testkit::verify::{expected_cold_gets, series_sum, series_value};
 use icetray_testkit::{
     DeleteForm, Dictionary, Fixture, FixtureSpec, Layout, MemoryCatalog, Nulls, OrderKind, Ordered,
-    RowsPerKey, S3Fixture, ScanRows, TestScan, ValueKind, memory_catalog_s3, write_fixture,
+    S3Fixture, ScanRows, TestScan, ValueKind, memory_catalog_s3, write_fixture,
 };
 use prost::Message;
 use tokio::task::JoinHandle;
@@ -594,24 +594,22 @@ fn ordered_spec(name: &str) -> FixtureSpec {
     FixtureSpec {
         ids: ORDERED_IDS,
         buckets: ONE_BUCKET,
-        ..FixtureSpec::ordered(
-            name,
-            KeyType::Long,
-            Ordered {
-                kind: OrderKind::Long,
-                rows_per_key: RowsPerKey::Each(
-                    u64::try_from(ROWS_PER_KEY).expect("a row count fits u64"),
-                ),
-                start: ORDER_START,
-                step: ORDER_STEP,
-            },
-        )
+        ..FixtureSpec::ordered(name, KeyType::Long, ordered())
     }
 }
 
+/// The order column of `ordered_spec`: `ROWS_PER_KEY` long order values
+/// per key, `ORDER_STEP` apart from `ORDER_START`.
+fn ordered() -> Ordered {
+    let rows = u64::try_from(ROWS_PER_KEY).expect("a row count fits u64");
+    Ordered::each(OrderKind::Long, rows, ORDER_START, ORDER_STEP)
+}
+
 /// The raw order value of a key's `index`-th row, oldest first.
-fn order_at(index: i64) -> i64 {
-    ORDER_START + ORDER_STEP * index
+fn order_at(index: u64) -> i64 {
+    ordered()
+        .order_at(index)
+        .expect("a row index's order value fits a long")
 }
 
 /// A raw long order value as the wire carries it.
