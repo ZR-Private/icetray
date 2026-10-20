@@ -666,8 +666,9 @@ through settings, mounted files, and environment variables.
   the merge cuts them back to the limit, so one call holds about the
   files that hold the key times its limit times its requested columns in
   values, and reads all of them before it refuses an oversized response.
-  Up to `server.max_in_flight` such calls run at once. The doctor's
-  `large_runs` advice names a table on which a `Scan` at the full limit
+  A `MultiScan` holds that for each of its keys. Up to
+  `server.max_in_flight` such calls run at once. The doctor's
+  `large_runs` advice names each file on which a `Scan` at the full limit
   would be refused. The owner bounds what a call holds with the table's
   `max_scan_rows` ([Configuration](configuration.md#tables)), and with
   compaction, which lowers the files that hold a key.

@@ -203,10 +203,10 @@ the most bytes one `Scan` or `MultiScan` response may encode to in
 `max_scan_rows`, `max_multi_scan_values`, and `max_scan_bytes` of 0. These
 limits can change while a caller holds them: the owner changes a table's
 `max_scan_rows` in place with a reload, and `max_multi_scan_values` and
-`max_scan_bytes`, which are the server's, with a restart. A caller that keeps them re-reads `TableInfo` when a call it
-sized by them fails as `INVALID_ARGUMENT` for its limit or its values, or
-as `FAILED_PRECONDITION` for its response size. The
-server rejects a `Get` or `MultiGet` of an ordered table, and a `Scan` or
+`max_scan_bytes`, which are the server's, with a restart. A caller that
+keeps them re-reads `TableInfo` when a call it sized by them fails as
+`INVALID_ARGUMENT` for its limit or its values, or as
+`FAILED_PRECONDITION` for its response size. The server rejects a `Get` or `MultiGet` of an ordered table, and a `Scan` or
 `MultiScan` of a key-value table, as `INVALID_ARGUMENT`. It decides this
 from the table's configuration before anything else about the call, so it
 answers `INVALID_ARGUMENT` even while the table is still loading, where a
@@ -389,14 +389,15 @@ and `before` kept; oldest first, `before` set to the bad row's order
 value and `start` kept. The second goes on past the bad row, its bound
 built as `next` is built: newest first, `before` set to the bad row's
 order value and `start` kept; oldest first, `start` set to the least
-value above it and `before` kept. The
-least value above an order value is the one `next` would carry: one
-more for an integer or time type, and the value with one zero byte
-appended for a string, binary, or `fixed` type. Neither read returns the
-bad row, and together they return every other row of the window. Either
-read whose `start` would not be below its `before` holds no rows and is
-skipped, and either may carry `next`, which the caller follows as for any
-page.
+value above it and `before` kept. The least value above an order value
+is the one `next` would carry: one more for an integer or time type, and
+the value with one zero byte appended for a string, binary, or `fixed`
+type. An integer or time value at its type's greatest has none, and no
+row lies above it, so the read that would start there is skipped.
+Neither read returns the bad row, and together they return every other
+row of the window. Either read whose `start` would not be below its
+`before` holds no rows and is skipped, and either may carry `next`,
+which the caller follows as for any page.
 
 ## Scanning many keys
 

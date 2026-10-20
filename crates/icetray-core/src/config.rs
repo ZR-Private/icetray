@@ -118,10 +118,10 @@ const DEFAULT_GET_DEADLINE: Duration = Duration::from_secs(5);
 const DEFAULT_MULTI_GET_DEADLINE: Duration = Duration::from_secs(15);
 
 /// Requests (`Get`, `MultiGet`, `Scan`, and `MultiScan` together) in flight
-/// at once when the file says nothing: 1024. A request that finds every slot taken is refused at
-/// once rather than queued, so a wedged store cannot pile up requests until
-/// the process runs out of memory. A single-pod guess, to revisit with
-/// measurement (RFD 013).
+/// at once when the file says nothing: 1024. A request that finds every
+/// slot taken is refused at once rather than queued, so a wedged store
+/// cannot pile up requests until the process runs out of memory. A
+/// single-pod guess, to revisit with measurement (RFD 013).
 const DEFAULT_MAX_IN_FLIGHT: usize = 1024;
 
 /// Values one `MultiGet` may ask for when the file says nothing: 1000, its
@@ -1380,10 +1380,10 @@ pub struct ServerConfig {
     /// GETs one `MultiGet`, `Scan`, or `MultiScan` holds in flight at once,
     /// across every task the batch runs on: each GET a lookup issues, a key
     /// page under `bloom`, a value page, or a dictionary page, and each span
-    /// GET of a Scan, holds one until it ends (RFD 013, RFD 022, RFD 025). Like `max_in_flight`, it
-    /// is set for the process: every table is built under it at start, so a
-    /// reload that changes it is refused and a restart applies it (RFD
-    /// 018).
+    /// GET of a Scan, holds one until it ends (RFD 013, RFD 022, RFD 025).
+    /// Like `max_in_flight`, it is set for the process: every table is built
+    /// under it at start, so a reload that changes it is refused and a
+    /// restart applies it (RFD 018).
     pub batch_fan_out: usize,
     /// Values one `MultiScan` may ask for: its keys times its limit times
     /// one more than its requested columns; more is `INVALID_ARGUMENT`

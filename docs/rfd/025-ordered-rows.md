@@ -288,11 +288,12 @@ direction under a limit and optional bounds on the order value.
   the limit's rows of every requested column before the merge cuts them
   back to the limit, so one call holds about the files that hold the key
   times its limit times its requested columns in values, and reads all
-  of them before it refuses an oversized response. The server accepts
+  of them before it refuses an oversized response, and a MultiScan
+  holds that for each of its keys. The server accepts
   this rather than merge order values across files before reading any
   value, which would hold one limit's rows but add a round of GETs to a
   Scan of a key in several files. `large_runs` (Levels and findings)
-  names a table on which a Scan at the full limit would be refused, and
+  names each file on which a Scan at the full limit would be refused, and
   an owner bounds what a call holds with `max_scan_rows`, and with
   compaction, which lowers the files that hold a key.
   `server.max_in_flight` counts every Get,
