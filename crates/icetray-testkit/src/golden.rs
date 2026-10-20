@@ -1100,15 +1100,19 @@ mod tests {
                 .iter()
                 .all(|table| table.to_string().starts_with("ref_"))
         );
-        for table in GoldenTable::ALL {
-            let spec = table.spec();
-            assert_eq!(spec.name, table.to_string());
-            assert_eq!(
-                spec.order.is_some(),
-                ordered.contains(&table) || reference.contains(&table),
-                "{table}"
-            );
-        }
+        assert_eq!(
+            reference
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            [
+                "ref_compacted",
+                "ref_appended",
+                "ref_string",
+                "ref_large_files"
+            ],
+            "the names `dev/golden-tables.py --only reference` writes"
+        );
     }
 
     #[test]

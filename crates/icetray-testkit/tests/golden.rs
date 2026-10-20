@@ -1011,11 +1011,18 @@ fn longest_derived_run(table: GoldenTable) -> u64 {
         .expect("an ordered table has keys")
 }
 
-/// The order type the doctor reads `table`'s order column as: the type of
-/// the recipe's order column.
-fn recipe_order_type(table: GoldenTable) -> Option<OrderType> {
-    let recipe = table.spec().order.expect("an ordered table has a recipe");
-    OrderType::from_iceberg(&recipe.kind.primitive())
+/// The ordered tables whose order column the recipe writes as a string;
+/// every other ordered table's is a long.
+const STRING_ORDERED: [GoldenTable; 2] = [GoldenTable::OrderedString100k, GoldenTable::RefString];
+
+/// The order type the doctor reads `table`'s order column as, stated as
+/// the recipe writes it, apart from the mapping the doctor reads it through.
+fn recipe_order_type(table: GoldenTable) -> OrderType {
+    if STRING_ORDERED.contains(&table) {
+        OrderType::String
+    } else {
+        OrderType::Long
+    }
 }
 
 /// The GETs a cold Scan of a key in one file of a golden ordered table
@@ -1026,9 +1033,13 @@ const FULL_SCAN_GETS: u64 = 2;
 
 /// What the doctor reports of every ordered table: it is read as an ordered
 /// table of the order column's type, and its longest run is a run the
-/// recipe wrote, whole in one file once compacted, and where an append or a
-/// MERGE wrote a second file over the key's range, the first fill's
-/// `ORDERED_ROWS_PER_KEY`, the MERGE's deleted rows still counted.
+/// recipe wrote. Once compacted it is the longest key's whole run, and where
+/// an append or a MERGE wrote a second file over the key's range, the first
+/// fill's `ORDERED_ROWS_PER_KEY`, the MERGE's deleted rows still counted.
+/// The rolled and overlap tables are only bounded: where Spark cuts a
+/// rolled bucket's files by size, and the tasks of the overlap table's
+/// skew-split write, decides how much of a key's run one file holds, which
+/// the recipe does not fix.
 #[tokio::test]
 #[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
 async fn test_golden_ordered_doctor_reads_the_order_column_and_runs() -> Result<()> {
@@ -1038,12 +1049,16 @@ async fn test_golden_ordered_doctor_reads_the_order_column_and_runs() -> Result<
         let order = summary
             .order
             .expect("an ordered table reports its order column");
-        assert_eq!(Some(order.order_type), recipe_order_type(table), "{table}");
+        assert_eq!(order.order_type, recipe_order_type(table), "{table}");
         assert_eq!(order.max_scan_rows, DEFAULT_MAX_SCAN_ROWS, "{table}");
+        let derived = longest_derived_run(table);
         if ORDERED_COMPACTED.contains(&table) {
-            assert_eq!(order.longest_run, longest_derived_run(table), "{table}");
-        } else {
+            assert_eq!(order.longest_run, derived, "{table}");
+        } else if ORDERED_OVERLAPPING.contains(&table) {
             assert_eq!(order.longest_run, ORDERED_ROWS_PER_KEY, "{table}");
+        } else {
+            assert!(order.longest_run > 0, "{table}");
+            assert!(order.longest_run <= derived, "{table}");
         }
         let advice = advice_codes(&golden);
         assert!(
@@ -1657,7 +1672,7 @@ async fn test_golden_reference_layouts_earn_their_level_and_findings() -> Result
             );
         }
         let order = report.summary.order.as_ref().expect("an ordered table");
-        assert_eq!(Some(order.order_type), recipe_order_type(table), "{table}");
+        assert_eq!(order.order_type, recipe_order_type(table), "{table}");
         assert_eq!(order.files_probed, files_per_bucket, "{table}");
         assert_eq!(
             order.longest_run,

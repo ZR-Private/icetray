@@ -3704,7 +3704,7 @@ mod tests {
 
     /// The work of a warm read of `scan` of a run of `pages` order pages,
     /// given the run's rows, in Full: the read once to warm the cache, then
-    /// counted.
+    /// counted. `scan` asks `WORK_LIMIT` rows, which the read must return.
     async fn warm_work(pages: usize, scan: impl Fn(usize) -> ScanBounds) -> Work {
         let rows = pages * PAGE;
         let opened = store(&runs_of(&[(1, 1), (2, rows), (3, 1)], rows + 2)).await;

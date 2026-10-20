@@ -2443,34 +2443,40 @@ impl Op {
                 Ok(ValueBytes::of(reads.read_bytes(at, returned), returned))
             }
             Self::Scan {
-                cases, value_bytes, ..
+                keys,
+                cases,
+                value_bytes,
             } => {
-                let asked = self.scan_request(i).expect("a Scan op asks a Scan");
-                let cases = std::iter::once(Self::case(cases, i));
-                checked_scan(table, asked, cases, *value_bytes, i).await
+                let case = Self::case(cases, i);
+                let asked = (&keys[at], false, &case.bounds);
+                checked_scan(table, asked, std::iter::once(case), *value_bytes, i).await
             }
             Self::MultiScan {
-                cases, value_bytes, ..
+                keys,
+                cases,
+                value_bytes,
+                ..
             } => {
-                let asked = self.scan_request(i).expect("a MultiScan op asks a Scan");
-                let cases = std::iter::repeat_n(Self::case(cases, i), at.len());
-                checked_scan(table, asked, cases, *value_bytes, i).await
+                let case = Self::case(cases, i);
+                let repeated = std::iter::repeat_n(case, at.len());
+                let asked = (&keys[at], true, &case.bounds);
+                checked_scan(table, asked, repeated, *value_bytes, i).await
             }
             Self::Reference {
                 requests,
                 value_bytes,
                 ..
             } => {
-                let asked = self.scan_request(i).expect("a reference op asks a Scan");
-                let cases = requests[at.start].cases.iter();
-                checked_scan(table, asked, cases, *value_bytes, i).await
+                let request = &requests[at.start];
+                let asked = (request.keys.as_slice(), request.multi, request.bounds());
+                checked_scan(table, asked, request.cases.iter(), *value_bytes, i).await
             }
         }
     }
 
-    /// What operation `i` of a Scan op asks: its keys, whether as one
-    /// `MultiScan`, and the bounds every key is read under; `None` for a
-    /// `Get` or `MultiGet` op.
+    /// What operation `i` of a Scan op asks, for its verification
+    /// (`verify_answers`): its keys, whether as one `MultiScan`, and the
+    /// bounds every key is read under; `None` for a `Get` or `MultiGet` op.
     fn scan_request(&self, i: usize) -> Option<(&[Key], bool, &ScanBounds)> {
         let at = self.pool_range(i);
         match self {
@@ -2491,10 +2497,10 @@ impl Op {
 
 /// The first `ops` operations of a Scan, `MultiScan`, or reference op,
 /// each key's answer compared whole, every value's bytes included, with
-/// `want` of the operation and the key's place in it, the key's index and
-/// its model answer, before the scenario is measured: `Op::run` checks the
-/// order values and value lengths alone, so this is what fails a run whose
-/// Scans return wrong bytes. Each operation is read as one `MultiScan` and
+/// `want(i, at)`, which gives the key index and model answer of the `at`th
+/// key of operation `i`, before the scenario is measured: `Op::run` checks
+/// the order values and value lengths alone, so this is what fails a run
+/// whose Scans return wrong bytes. Each operation is read as one `MultiScan` and
 /// its first key as a Scan too, after the op's `before`, and the two must
 /// agree. A `Get` or `MultiGet` op is checked by `Op::run` alone.
 async fn verify_answers(
@@ -4071,10 +4077,10 @@ const GET_LOG_SLOTS: usize = 1 << 16;
 /// the classes every GET of the window counts in (`store_gets`).
 const GET_SAMPLES: usize = 4_096;
 
-/// The least data pages of each class of GETs by the pages each spans,
-/// ascending, each class below the next one's least: one page, a few, up
-/// to sixteen, and more.
-const SPAN_FLOORS: [u64; 4] = [1, 2, 5, 17];
+/// The classes of GETs by the data pages each spans, least and most, both
+/// included; `None` has no upper bound.
+const SPAN_CLASSES: [(u64, Option<u64>); 4] =
+    [(1, Some(1)), (2, Some(4)), (5, Some(16)), (17, None)];
 
 /// The least bytes of each class of GETs by bytes, ascending, each class
 /// below the next one's least: from nothing through 4 KiB, a small page,
@@ -4094,10 +4100,10 @@ const BYTE_CLASS_FLOORS: [u64; 7] = [
 const REFERENCE_MULTI_KEYS: [usize; 2] = [MULTI_SCAN_KEYS, SMALL_BATCH_KEYS];
 
 /// Rows per key of the reference `MultiScan`s: each key's newest row, and
-/// a short history, twenty, a fiftieth of the default `max_scan_rows`, the
-/// most a light key of a reference table holds (`golden::LIGHT_ROWS`). A
-/// hundred keys at the longer limit, one column beside the order value,
-/// is `server.max_multi_scan_values` at its default.
+/// a short history, the most rows a light key of a reference table holds
+/// (`golden::LIGHT_ROWS`). A hundred keys at the longer limit, one column
+/// beside the order value, must fit `server.max_multi_scan_values` at its
+/// default.
 fn reference_multi_limits() -> [u32; 2] {
     let short = u32::try_from(*golden::LIGHT_ROWS.end()).expect("a light key's rows fit a limit");
     [MULTI_SCAN_HEAD_ROWS, short]
@@ -4366,7 +4372,7 @@ fn page_range(page: &PageLocation) -> Range<u64> {
 }
 
 /// The GETs `log` holds as JSON: by the data pages of `pages` each spans
-/// (`SPAN_FLOORS`) and by its bytes (`BYTE_CLASS_FLOORS`), for each class
+/// (`SPAN_CLASSES`) and by its bytes (`BYTE_CLASS_FLOORS`), for each class
 /// how many, their mean bytes, and the percentiles of their latency to the
 /// store's answer and to their body's last byte; beside them the GETs no
 /// class holds (never answered, a ranged read of several, or outside every
@@ -4387,25 +4393,32 @@ fn store_gets(log: &GetLog, pages: &PageMap, samples: usize) -> Json {
             },
         }
     }
-    // Each class holds the GETs from its floor to below the next one's.
-    let classes = |floors: &[u64],
-                   measure: fn(&(u64, &LoggedGet)) -> u64,
-                   bounds: fn(u64, Option<u64>) -> Json| {
-        let classed = |(at, &least): (usize, &u64)| {
-            let below = floors.get(at + 1).copied();
-            let held = spanned.iter().filter(|get| {
-                measure(get) >= least && below.is_none_or(|below| measure(get) < below)
+    let by_pages: Vec<Json> = SPAN_CLASSES
+        .iter()
+        .map(|&(least, most)| {
+            let held = spanned
+                .iter()
+                .filter(|(count, _)| *count >= least && most.is_none_or(|most| *count <= most));
+            class_json(
+                json!({ "min_pages": least, "max_pages": most }),
+                held.map(|(_, get)| *get),
+            )
+        })
+        .collect();
+    let by_bytes: Vec<Json> = BYTE_CLASS_FLOORS
+        .iter()
+        .enumerate()
+        .map(|(at, &least)| {
+            let below = BYTE_CLASS_FLOORS.get(at + 1).copied();
+            let held = spanned.iter().filter(|(_, get)| {
+                get.bytes() >= least && below.is_none_or(|below| get.bytes() < below)
             });
-            class_json(bounds(least, below), held.map(|(_, get)| *get))
-        };
-        floors.iter().enumerate().map(classed).collect::<Vec<_>>()
-    };
-    let by_pages = classes(&SPAN_FLOORS, |(count, _)| *count, span_bounds);
-    let by_bytes = classes(
-        &BYTE_CLASS_FLOORS,
-        |(_, get)| get.bytes(),
-        |least, below| json!({ "min_bytes": least, "below_bytes": below }),
-    );
+            class_json(
+                json!({ "min_bytes": least, "below_bytes": below }),
+                held.map(|(_, get)| *get),
+            )
+        })
+        .collect();
     let one_by_one: Vec<Json> = spanned
         .iter()
         .take(samples)
@@ -4430,12 +4443,6 @@ fn store_gets(log: &GetLog, pages: &PageMap, samples: usize) -> Json {
         "by_bytes": by_bytes,
         "samples": one_by_one,
     })
-}
-
-/// A class of GETs by pages spanned as JSON bounds: its least pages and
-/// its most, both included; `None` has no upper bound.
-fn span_bounds(least: u64, below: Option<u64>) -> Json {
-    json!({ "min_pages": least, "max_pages": below.map(|below| below - 1) })
 }
 
 /// One class of GETs as JSON: its `bounds`, how many `gets` it holds,
@@ -4672,11 +4679,7 @@ fn reference_settings(cli: &Cli, warehouse: &str, tables: &[GoldenTable]) -> Jso
             "per_get": "one atomic increment, a hash of the file name, three clock reads, six relaxed stores, and one boxed body stream",
             "samples_per_run": GET_SAMPLES,
         },
-        "span_classes": SPAN_FLOORS
-            .iter()
-            .enumerate()
-            .map(|(at, &least)| span_bounds(least, SPAN_FLOORS.get(at + 1).copied()))
-            .collect::<Vec<_>>(),
+        "span_classes": SPAN_CLASSES.map(|(least, most)| json!({ "min_pages": least, "max_pages": most })),
         "byte_class_floors": BYTE_CLASS_FLOORS,
     })
 }
