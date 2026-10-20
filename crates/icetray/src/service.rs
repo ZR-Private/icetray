@@ -404,10 +404,11 @@ fn multi_scan_within_bound(
     })
 }
 
-/// How many of `items`, the repeated field of a response whose other
-/// fields encode to `fixed` bytes, fit in `bound` bytes, taken in order,
-/// a response of the first `n` of them carrying `tail(n)` bytes more; a
-/// prefix whose tail is `None` does not fit.
+/// The longest prefix of `items`, the repeated field of a response whose
+/// other fields encode to `fixed` bytes, that fits in `bound` bytes, a
+/// response of the first `n` of them carrying `tail(n)` bytes more; a
+/// prefix whose tail is `None` does not fit. A shorter prefix need not fit
+/// where a longer one does, since a tail can shrink as `n` grows.
 fn fitting_prefix<M: Message>(
     items: &[M],
     fixed: usize,
@@ -415,14 +416,17 @@ fn fitting_prefix<M: Message>(
     tail: impl Fn(usize) -> Option<usize>,
 ) -> usize {
     let mut size = fixed;
-    items
-        .iter()
-        .enumerate()
-        .take_while(|(at, item)| {
-            size += message::encoded_len(REPEATED_FIELD_TAG, *item);
-            tail(at + 1).is_some_and(|tail| size + tail <= bound)
-        })
-        .count()
+    let mut fits = 0;
+    for (at, item) in items.iter().enumerate() {
+        size += message::encoded_len(REPEATED_FIELD_TAG, item);
+        if size > bound {
+            break;
+        }
+        if tail(at + 1).is_some_and(|tail| size + tail <= bound) {
+            fits = at + 1;
+        }
+    }
+    fits
 }
 
 /// A wire scan fault as a status: every fault is the caller's, so
@@ -1729,9 +1733,9 @@ mod tests {
     /// within `bound`, found by encoding each prefix.
     fn fits_rows(response: &ScanResponse, direction: Direction, bound: usize) -> usize {
         (0..=response.rows.len())
-            .take_while(|&rows| at_limit(response, rows, direction).encoded_len() <= bound)
-            .count()
-            .saturating_sub(1)
+            .filter(|&rows| at_limit(response, rows, direction).encoded_len() <= bound)
+            .max()
+            .unwrap_or(0)
     }
 
     /// For a bound at, one under, and one over each prefix's size, sent with
@@ -1774,6 +1778,48 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The length of the long order value of
+    /// `test_scan_within_bound_counts_a_prefix_past_a_shorter_one_that_does_not_fit`:
+    /// long enough that a `next` naming it outweighs a row and a short one.
+    const LONG_ORDER_CHARS: usize = 1_000;
+
+    /// Newest first, a `next` is the last row's order value, so a prefix
+    /// ending on a long one can be over the bound where a longer prefix,
+    /// ending on a short one, is within it: the count is of the longest
+    /// prefix that fits, not the first that does not.
+    #[test]
+    fn test_scan_within_bound_counts_a_prefix_past_a_shorter_one_that_does_not_fit() {
+        let long_order = "c".repeat(LONG_ORDER_CHARS);
+        let orders = [long_order.as_str(), "b", "a"];
+        let order = |at: usize| OrderValue::Str(orders[at].to_string());
+        let scanned = Scanned {
+            rows: (0..orders.len())
+                .map(|at| ScanRow {
+                    order: order(at),
+                    values: Vec::new(),
+                })
+                .collect(),
+            next: Some(order(orders.len() - 1)),
+        };
+        let wire = scanned_wire(scanned.clone());
+        let prefix = |taken: usize| ScanResponse {
+            rows: wire.rows[..taken].to_vec(),
+            next: Some(order_value_wire(order(taken - 1))),
+            snapshot_id: SAMPLE_SNAPSHOT,
+        };
+        let (one, two) = (prefix(1).encoded_len(), prefix(2).encoded_len());
+        assert!(
+            two < one,
+            "two rows ending on a short order value are the smaller"
+        );
+        let lookup = ScanLookup {
+            scanned,
+            snapshot_id: icetray_core::SnapshotId(SAMPLE_SNAPSHOT),
+        };
+        let refused = scan_within_bound(lookup, Direction::NewestFirst, two).unwrap_err();
+        assert_eq!(refused.fits, Fits::Rows(2));
     }
 
     /// A `MultiScan` response reports the leading results that fit, a key
