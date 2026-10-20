@@ -1683,7 +1683,7 @@ async fn test_golden_reference_layouts_earn_their_level_and_findings() -> Result
         let files_per_bucket = if layout.compacted {
             1
         } else {
-            1 + usize::try_from(recipe.append_batches).unwrap()
+            1 + usize::try_from(recipe.appends).unwrap()
         };
         assert_eq!(report.summary.buckets_with_files, buckets, "{table}");
         assert_eq!(

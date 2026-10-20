@@ -213,7 +213,7 @@ const APPEND_TAIL_DIVISOR: u64 = 5;
 
 /// The recipe's `APPEND_BATCHES`: the appends after a reference table's
 /// initial load, which split each key's tail evenly in order, unless the
-/// table sets its own count (`OrderedRecipe::append_batches`).
+/// table sets its own count (`OrderedRecipe::appends`).
 pub const APPEND_BATCHES: u64 = 4;
 
 /// The recipe's `LARGE_APPEND_BATCHES`: `ref_large_appended`'s appends,
@@ -474,7 +474,7 @@ pub struct OrderedRecipe {
     /// The appends after a reference table's initial load, which split
     /// each key's tail (`reference_writes`); zero outside the `reference`
     /// group.
-    pub append_batches: u64,
+    pub appends: u64,
 }
 
 /// The recipe's key expression of an ordered table.
@@ -514,7 +514,7 @@ impl GoldenSpec {
                 merged: false,
                 appended: false,
                 reference: false,
-                append_batches: 0,
+                appends: 0,
             }),
             ..Self::kv(name, KeyType::Long, FOUR_BUCKETS, ROWS_100K)
         }
@@ -531,7 +531,7 @@ impl GoldenSpec {
                 merged: false,
                 appended: false,
                 reference: true,
-                append_batches: APPEND_BATCHES,
+                appends: APPEND_BATCHES,
             }),
             ..Self::kv(name, KeyType::Long, REFERENCE_BUCKETS, REFERENCE_ROWS)
         }
@@ -559,7 +559,7 @@ impl GoldenSpec {
     /// initial load.
     const fn appended_in(mut self, batches: u64) -> Self {
         if let Some(order) = &mut self.order {
-            order.append_batches = batches;
+            order.appends = batches;
         }
         self
     }
@@ -1029,10 +1029,10 @@ pub fn reference_rows(keys: u64) -> u64 {
 /// The recipe's `reference_insert` ranges: the half-open row indexes of
 /// the key at key index `id` of reference table `table` that each write
 /// holds, the initial load first and then each of the table's appends
-/// (`OrderedRecipe::append_batches`). An append's range is empty for a key
+/// (`OrderedRecipe::appends`). An append's range is empty for a key
 /// whose tail it holds none of.
 pub fn reference_writes(table: GoldenTable, id: u64) -> Vec<Range<u64>> {
-    let batches = table.recipe().append_batches;
+    let batches = table.recipe().appends;
     assert!(batches > 0, "{table} is not a reference table");
     let rows = reference_rows_of(id);
     let tail = rows / APPEND_TAIL_DIVISOR;
@@ -1518,7 +1518,7 @@ mod tests {
     /// `REFERENCE_KEYS`, after checking that its writes tile each key's
     /// rows in order, the initial load the rows below the key's tail.
     fn reference_write_totals(table: GoldenTable) -> Vec<u64> {
-        let writes_per_key = 1 + usize::try_from(table.recipe().append_batches).unwrap();
+        let writes_per_key = 1 + usize::try_from(table.recipe().appends).unwrap();
         let mut totals = vec![0_u64; writes_per_key];
         for id in reference_ids() {
             let writes = reference_writes(table, id);

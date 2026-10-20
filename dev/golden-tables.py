@@ -228,7 +228,8 @@ LARGE_FILE_BYTES = 33_554_432
 LARGE_ROW_GROUP_BYTES = 6_291_456
 # `ref_large_appended`'s appends: with its initial load's file, nine files a
 # bucket, so its 64 buckets' uniqueness merges start 576 cursors, more than
-# the 512 reads a load of four worker threads holds in flight.
+# the reads a load of four worker threads holds in flight, which is four
+# times icetray-core's `LOAD_FILES_PER_WORKER` (`load_concurrency()`).
 LARGE_APPEND_BATCHES = 8
 
 LONG_KEY = f"id * {KEY_STEP}"
@@ -381,16 +382,15 @@ def reference_insert(spark, name, table, write):
     """An INSERT of each reference key's rows in the half-open row index
     range that `write` (0 the initial load, `b` the `b`th append) holds, at
     `MOR_FIRST_VERSION`: the initial load the rows below the key's tail,
-    and each of the table's `append_batches` appends its share of the
-    tail."""
+    and each of the table's `appends` appends its share of the tail."""
     tail = f"(r DIV {APPEND_TAIL_DIVISOR})"
     base = f"(r - {tail})"
     if write == 0:
         low, high = "0", base
     else:
         batch = write - 1
-        low = f"({base} + {tail} * {batch} DIV {table.append_batches})"
-        high = f"({base} + {tail} * {batch + 1} DIV {table.append_batches})"
+        low = f"({base} + {tail} * {batch} DIV {table.appends})"
+        high = f"({base} + {tail} * {batch + 1} DIV {table.appends})"
     counts = f"(SELECT id AS k, {reference_rows()} AS r FROM (SELECT id, {keyed_hash('id')} AS h FROM range({table.keys})))"
     source = (
         f"(SELECT k, explode(sequence({low}, {high} - 1)) AS j FROM {counts} WHERE {high} > {low})"
@@ -405,10 +405,10 @@ def fill_reference(spark, name, table):
 
 
 def append_batches(spark, name, table):
-    """The table's `append_batches` INSERTs of later rows of the keys with
-    a tail: up to a file per bucket each, over the bucket's earlier files'
+    """The table's `appends` INSERTs of later rows of the keys with a
+    tail: up to a file per bucket each, over the bucket's earlier files'
     key range."""
-    for write in range(1, table.append_batches + 1):
+    for write in range(1, table.appends + 1):
         reference_insert(spark, name, table, write)
 
 
@@ -603,8 +603,9 @@ class Golden(NamedTuple):
     # A reference table's key count, `--reference-keys`; its `rows` is the
     # total at `REFERENCE_KEYS`, for the summary to be read against.
     keys: int = 0
-    # A reference table's appends after its initial load.
-    append_batches: int = APPEND_BATCHES
+    # A reference table's appends after its initial load, which
+    # `append_batches` writes; zero outside the reference group.
+    appends: int = 0
 
 
 # Every golden table, in the order a full run writes them.
@@ -844,6 +845,7 @@ TABLES = [
         incompressible=True,
         changes=(append_batches, rewrite_sorted, expire_replaced),
         order=OrderShape(timed=True),
+        appends=APPEND_BATCHES,
     ),
     # The same writes left uncompacted: up to one file a bucket per write.
     Golden(
@@ -857,6 +859,7 @@ TABLES = [
         incompressible=True,
         changes=(append_batches,),
         order=OrderShape(timed=True),
+        appends=APPEND_BATCHES,
     ),
     # `ref_compacted` with each instant as ISO-8601 text.
     Golden(
@@ -870,6 +873,7 @@ TABLES = [
         incompressible=True,
         changes=(append_batches, rewrite_sorted, expire_replaced),
         order=OrderShape(timed=True, string=True),
+        appends=APPEND_BATCHES,
     ),
     # `ref_compacted` with each bucket's file in row groups of about a
     # quarter of it.
@@ -888,6 +892,7 @@ TABLES = [
         incompressible=True,
         changes=(append_batches, rewrite_sorted, expire_replaced),
         order=OrderShape(timed=True),
+        appends=APPEND_BATCHES,
     ),
     # The initial load in `ref_large_files`' sizes, a file a bucket of
     # several row groups, then `LARGE_APPEND_BATCHES` appends left
@@ -907,7 +912,7 @@ TABLES = [
         incompressible=True,
         changes=(append_batches,),
         order=OrderShape(timed=True),
-        append_batches=LARGE_APPEND_BATCHES,
+        appends=LARGE_APPEND_BATCHES,
     ),
 ]
 
