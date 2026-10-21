@@ -59,8 +59,9 @@
 //! and to the last byte. `--reference-table`, `--reference-scenario`, and
 //! `--rows-tier` narrow it, `--reference-max-scan-rows` sets the tables'
 //! `max_scan_rows`, at which the Scans run, so a raised one gives a heavy
-//! key's spans more pages, and its JSON says what it is (`"run": "reference"`), the
-//! limits it served at, and, per row, what each figure is of.
+//! key's spans more pages, and its JSON says what it is
+//! (`"run": "reference"`), the limits it served at, and, per row, what each
+//! figure is of.
 
 use std::alloc::{GlobalAlloc, Layout};
 use std::collections::hash_map::Entry;

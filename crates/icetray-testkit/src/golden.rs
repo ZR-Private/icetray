@@ -1043,6 +1043,20 @@ pub fn reference_writes(table: GoldenTable, id: u64) -> Vec<Range<u64>> {
     cuts.windows(2).map(|pair| pair[0]..pair[1]).collect()
 }
 
+/// The rows each write of reference table `table` of `keys` keys holds,
+/// the initial load first, every key's `reference_writes` summed write by
+/// write.
+pub fn reference_write_rows(table: GoldenTable, keys: u64) -> Vec<u64> {
+    let writes_per_key = 1 + usize::try_from(table.recipe().appends).expect("a few appends");
+    let mut totals = vec![0; writes_per_key];
+    for id in 0..keys {
+        for (total, write) in totals.iter_mut().zip(reference_writes(table, id)) {
+            *total += write.end - write.start;
+        }
+    }
+    totals
+}
+
 /// The recipe's `reference_ts`: the microsecond instant of row `index` of the
 /// key at key index `id`, `TS_STEP` per index after `TS_START` plus a
 /// jitter below `TS_STEP` hashed from the row.
@@ -1519,7 +1533,6 @@ mod tests {
     /// rows in order, the initial load the rows below the key's tail.
     fn reference_write_totals(table: GoldenTable) -> Vec<u64> {
         let writes_per_key = 1 + usize::try_from(table.recipe().appends).unwrap();
-        let mut totals = vec![0_u64; writes_per_key];
         for id in reference_ids() {
             let writes = reference_writes(table, id);
             assert_eq!(writes.len(), writes_per_key, "{table}");
@@ -1535,11 +1548,8 @@ mod tests {
                 rows - rows / APPEND_TAIL_DIVISOR,
                 "{table} {id}"
             );
-            for (total, write) in totals.iter_mut().zip(&writes) {
-                *total += write.end - write.start;
-            }
         }
-        totals
+        reference_write_rows(table, REFERENCE_KEYS)
     }
 
     #[test]

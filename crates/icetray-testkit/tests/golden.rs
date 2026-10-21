@@ -1667,21 +1667,6 @@ fn longest_reference_run(table: GoldenTable, keys: u64, compacted: bool) -> u64 
 /// snapshot added.
 const ADDED_RECORDS: &str = "added-records";
 
-/// The rows each write of reference table `table` of `keys` keys holds,
-/// the initial load first, as the recipe splits each key's rows
-/// (`golden::reference_writes`).
-fn reference_write_rows(table: GoldenTable, keys: u64) -> Vec<u64> {
-    let recipe = table.spec().order.expect("a reference table is ordered");
-    let appends = usize::try_from(recipe.appends).expect("a few appends");
-    let mut rows = vec![0; 1 + appends];
-    for id in 0..keys {
-        for (total, write) in rows.iter_mut().zip(golden::reference_writes(table, id)) {
-            *total += write.end - write.start;
-        }
-    }
-    rows
-}
-
 /// The rows each snapshot of `metadata` added, as its summary records
 /// them, oldest first along the current snapshot's ancestry.
 fn added_records(metadata: &TableMetadata) -> Vec<u64> {
@@ -1781,7 +1766,7 @@ async fn test_golden_reference_layouts_earn_their_level_and_findings() -> Result
         if !layout.compacted {
             assert_eq!(
                 added_records(&served_metadata(&golden).await?),
-                reference_write_rows(table, keys),
+                golden::reference_write_rows(table, keys),
                 "{table}: each write's rows"
             );
         }

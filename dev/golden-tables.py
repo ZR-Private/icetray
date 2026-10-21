@@ -408,6 +408,7 @@ def append_batches(spark, name, table):
     """The table's `appends` INSERTs of later rows of the keys with a
     tail: up to a file per bucket each, over the bucket's earlier files'
     key range."""
+    assert table.appends > 0, name
     for write in range(1, table.appends + 1):
         reference_insert(spark, name, table, write)
 
