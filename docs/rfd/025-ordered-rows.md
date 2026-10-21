@@ -1,5 +1,10 @@
 # Ordered rows per key
 
+> Updated 2026-10-20: every span GET races its window's one delay and
+> enters the window with its whole elapsed time, whatever its pages:
+> spans of 5 to 16 pages share a one-page GET's first-byte latency on
+> S3, so the delay no longer scales with a span's pages.
+
 > Updated 2026-10-20: a Scan's or MultiScan's own faults and those its
 > table's configuration finds, its limit and a MultiScan's values among
 > them, are answered before the in-flight bound and the table's
@@ -289,9 +294,13 @@ direction under a limit and optional bounds on the order value.
   lookup's GET does, so a Scan of another call waits only on pages a GET
   is fetching, never on a GET still waiting for its slot. Span GETs are
   hedged under RFD 013 (Tail latency) in a window of their own per
-  table, whose delay scales with a span's pages, since a span's latency
-  grows with its size; key-page GETs under `bloom` use the table's
-  lookup window.
+  table. The window's one delay applies to every span, whatever its
+  pages, and each span enters it with its whole elapsed time: on S3,
+  spans of 1 to 16 pages share one first-byte latency, the transfer of
+  a 269 KiB span adding about 2 ms at p50 and 13 ms at p99 ([span
+  latency, 5 to 16
+  pages](../analysis/2026-10-19-ordered-rows-on-s3.md#span-latency-5-to-16-pages)).
+  Key-page GETs under `bloom` use the table's lookup window.
 - **Limits.** `server.batch_fan_out` bounds the GETs one MultiGet, one
   Scan, or one MultiScan holds in flight. A MultiScan spreads its keys
   across idle worker threads as a MultiGet does: while fewer calls than
@@ -511,14 +520,13 @@ the cache holds in part costs one GET per uncached span, and under
 MultiScan at the full limit with one value column covers
 `max_multi_scan_values` over twice `max_scan_rows` keys, few at the
 defaults, so a caller reading many keys requests a smaller limit. The
-span hedge window scales its delay with a span's pages. On S3, spans of
-one to four pages, all a Scan of 128-byte values issued, shared
-one first-byte latency, and the scaling makes their few multi-page
-spans wait longer before a hedge, within the hedge ceiling ([ordered
-rows on S3](../analysis/2026-10-19-ordered-rows-on-s3.md#span-get-latency-by-size)).
-The scaling stays for the spans of many pages that larger values or
-limits issue, whose transfer time does grow with their size; a span
-past four pages is unmeasured.
+span hedge window's one delay applies to every span: on S3, spans of 1
+to 16 pages shared one first-byte latency ([ordered rows on
+S3](../analysis/2026-10-19-ordered-rows-on-s3.md#span-latency-5-to-16-pages)),
+and a span past 16 pages is unmeasured. The span window now has the
+lookup window's configuration and mechanism and differs from it only
+in the GETs that feed it; it stays a window of its own, and whether to
+fold the two into one is open.
 
 A load reads the order column once per row group, so a file costs one
 more GET per row group than RFD 004 (Resident key-chunk index) counts,

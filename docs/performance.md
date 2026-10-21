@@ -342,8 +342,10 @@ high percentile of the table's recent lookup GET latencies over a window
 of the latest GETs, so it tracks the object store's latency as it drifts.
 A ceiling caps the share of the window's lookup GETs that icetray hedges. icetray never hedges load
 reads. A `Scan`'s span GETs are hedged under the same settings in a
-window of their own per table, whose delay scales with a span's pages,
-since a span's latency grows with its size.
+window of their own per table, and every span GET races that window's
+one delay whatever its pages, since spans of up to 16 pages share a
+one-page GET's first-byte latency on S3 ([ordered rows on
+S3](analysis/2026-10-19-ordered-rows-on-s3.md#span-latency-5-to-16-pages)).
 
 - A lower percentile hedges sooner and cuts more of the tail, at the
   cost of more GETs. A higher one sends fewer redundant GETs and lets a

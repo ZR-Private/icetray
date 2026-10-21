@@ -115,11 +115,11 @@ impl FileHandle {
 
     /// Pages of the file through `cache` (`PageCache::get_span`): each run of
     /// pages it does not hold whose ranges meet is one span GET, a lookup
-    /// GET hedged against `window` and recorded into it rather than the
-    /// handle's own window, since a table hedges its Scans' spans in a
-    /// window of their own whose delay scales with a span's pages (RFD 013,
-    /// RFD 025, `Storage::read_span_hedged`), plus one more GET when a
-    /// hedge is issued. Each GET answers to `issue`, and each page is
+    /// GET hedged against `window` at its one delay, whatever the span's
+    /// pages, and recorded into it rather than the handle's own window,
+    /// since a table hedges its Scans' spans in a window of their own (RFD
+    /// 013, RFD 025, `Storage::read_range_hedged`), plus one more GET when
+    /// a hedge is issued. Each GET answers to `issue`, and each page is
     /// cached as its own entry at its offset, as `read_page` keys a page.
     pub(crate) async fn read_pages(
         &self,
@@ -129,9 +129,8 @@ impl FileHandle {
         window: &HedgeWindow,
     ) -> Result<(Vec<Bytes>, PageOrigin)> {
         cache
-            .get_span(&self.file_id, pages, issue, |span, held| {
-                self.storage
-                    .read_span_hedged(&self.located, span, held, window)
+            .get_span(&self.file_id, pages, issue, |span| {
+                self.storage.read_range_hedged(&self.located, span, window)
             })
             .await
     }
@@ -436,20 +435,25 @@ impl ChunkReader for Segments {
 #[cfg(test)]
 mod tests {
     use std::io::Read as _;
+    use std::time::Duration;
 
     use arrow::array::{ArrayRef, BinaryArray, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use futures::future::join_all;
+    use object_store::memory::InMemory;
+    use object_store::path::Path;
+    use object_store::throttle::{ThrottleConfig, ThrottledStore};
+    use object_store::{ObjectStore, ObjectStoreExt as _, PutPayload};
     use parquet::arrow::ArrowWriter;
     use parquet::file::FOOTER_SIZE;
     use parquet::file::metadata::FooterTail;
     use parquet::file::properties::{WriterProperties, WriterPropertiesBuilder};
 
     use super::*;
-    use crate::config::HedgeConfig;
-    use crate::generation::testing::{cache, page_rows};
-    use crate::storage::testing::{MEM_PREFIX, MemStore};
+    use crate::config::{HedgeConfig, StorageConfig};
+    use crate::generation::testing::{CACHE_BYTES, cache, page_rows};
+    use crate::storage::testing::{DEADLINE_GUARD, Gauged, MEM_PREFIX, MemStore};
 
     /// The `SegmentsFault` a parquet error carries, when it is one.
     fn fault(error: &ParquetError) -> Option<&SegmentsFault> {
@@ -838,6 +842,113 @@ mod tests {
         assert_eq!(origin, PageOrigin::Fetched);
         assert_eq!(stats.gets(), before + 2);
         assert_eq!(stats.hedges(), 0);
+    }
+
+    /// The pages of the many-page span the span-hedging tests read, each
+    /// one byte of the file: enough that the window's delay times the
+    /// pages is past `DEADLINE_GUARD`.
+    const MANY_PAGES: u64 = 128;
+    /// The span window's delay in the hedging test: far below
+    /// `DEADLINE_GUARD`, and past it times `MANY_PAGES`.
+    const SPAN_DELAY: Duration = Duration::from_millis(100);
+    /// A window sample above any read here, so a window of it never
+    /// hedges.
+    const HUGE: Duration = Duration::from_secs(10);
+    /// The wait a throttled store adds to each GET.
+    const SLOW: Duration = Duration::from_millis(10);
+
+    /// The first `pages` one-byte pages of a file.
+    fn one_byte_pages(pages: u64) -> Vec<Range<u64>> {
+        (0..pages).map(|at| at..at + 1).collect()
+    }
+
+    /// A file of `MANY_PAGES` bytes, written at `FILE_KEY` through
+    /// `store`, which a fresh storage reads under `MEM_PREFIX`, and a
+    /// handle over it whose own window is never read.
+    async fn file_through(store: Arc<dyn ObjectStore>) -> Arc<FileHandle> {
+        let file: Bytes = (0..MANY_PAGES)
+            .map(|at| u8::try_from(at).unwrap())
+            .collect();
+        store
+            .put(&Path::from(FILE_KEY), PutPayload::from(file.clone()))
+            .await
+            .unwrap();
+        let storage = Arc::new(Storage::new(StorageConfig::default()));
+        storage.register(MEM_PREFIX, store);
+        let window = Arc::new(HedgeWindow::new(&hedge_config(1)));
+        let location = format!("{MEM_PREFIX}{FILE_KEY}");
+        Arc::new(
+            FileHandle::open(storage, &location, approx::count(file.len()), window)
+                .await
+                .unwrap(),
+        )
+    }
+
+    /// A one-sample window whose delay is `delay`.
+    fn window_of(delay: Duration) -> HedgeWindow {
+        let window = HedgeWindow::new(&hedge_config(1));
+        window.record(delay, false);
+        window
+    }
+
+    /// A span GET of many pages races the window's one delay, as a read of
+    /// one page does (RFD 025, Caching and hedging): the store holds every
+    /// GET until two are in flight at once, so each read ends only through
+    /// its hedge, and a delay scaled by the pages would pass
+    /// `DEADLINE_GUARD`.
+    #[tokio::test]
+    async fn test_read_pages_hedges_a_span_of_many_pages_at_the_one_page_delay() {
+        assert!(SPAN_DELAY * u32::try_from(MANY_PAGES).unwrap() > DEADLINE_GUARD);
+        for pages in [1, MANY_PAGES] {
+            let gauged = Arc::new(Gauged::new(Arc::new(InMemory::new())));
+            let handle = file_through(Arc::<Gauged>::clone(&gauged)).await;
+            let window = window_of(SPAN_DELAY);
+            let both_in_flight = 2;
+            gauged.fill_to(both_in_flight);
+            let scans = PageCache::for_scans(CACHE_BYTES);
+            let span = one_byte_pages(pages);
+            let (read, origin) = tokio::time::timeout(
+                DEADLINE_GUARD,
+                handle.read_pages(&span, &scans, Issue::default(), &window),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("a span of {pages} pages hedges at the window's delay"))
+            .unwrap();
+            assert_eq!(read.len(), span.len());
+            assert_eq!(origin, PageOrigin::Fetched);
+            let stats = handle.storage.stats();
+            assert_eq!(stats.hedges(), 1, "{pages} pages");
+            assert_eq!(stats.gets(), 2, "{pages} pages");
+        }
+    }
+
+    /// A span GET enters its window with its whole elapsed time, not a
+    /// page's share of it: the store waits `SLOW` on every GET, and the
+    /// one-sample window then holds a sample of at least that.
+    #[tokio::test]
+    async fn test_read_pages_records_a_span_s_whole_elapsed_time() {
+        let throttled = ThrottledStore::new(
+            InMemory::new(),
+            ThrottleConfig {
+                wait_get_per_call: SLOW,
+                ..ThrottleConfig::default()
+            },
+        );
+        let handle = file_through(Arc::new(throttled)).await;
+        let window = window_of(HUGE);
+        let scans = PageCache::for_scans(CACHE_BYTES);
+        let span = one_byte_pages(MANY_PAGES);
+        handle
+            .read_pages(&span, &scans, Issue::default(), &window)
+            .await
+            .unwrap();
+        assert_eq!(handle.storage.stats().hedges(), 0);
+        let recorded = window.delay().expect("the window holds the span's sample");
+        assert!(
+            recorded >= SLOW,
+            "{recorded:?} recorded for one GET of {SLOW:?}"
+        );
+        assert!(recorded < HUGE, "the span's sample replaced the window's");
     }
 
     #[tokio::test]

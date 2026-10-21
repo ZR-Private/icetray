@@ -22,6 +22,10 @@
 > and span GETs are hedged in a window of their own per table whose
 > delay scales with a span's pages. See RFD 025.
 
+> Updated 2026-10-20: a span GET races its window's one delay, whatever
+> its pages, and enters the window with its whole elapsed time. See RFD
+> 025.
+
 ## Problem
 
 A cold hit costs one GET per value column it names, and the latency of

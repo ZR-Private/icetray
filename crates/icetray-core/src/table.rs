@@ -309,9 +309,10 @@ pub struct Table {
     hedge: Arc<HedgeWindow>,
     /// The window a Scan's span GETs are hedged in (RFD 025, Caching and
     /// hedging), apart from `hedge`, which the lookups and a Bloom-tier
-    /// Scan's key pages use: a span's latency grows with its pages, so the
-    /// window holds per-page latencies and a span's delay scales with its
-    /// pages (`Storage::read_span_hedged`).
+    /// Scan's key pages use. It takes `hedge`'s configuration, and every
+    /// span GET races its one delay and enters it with its whole elapsed
+    /// time, whatever its pages (`Storage::read_range_hedged`); only the
+    /// GETs that feed it differ.
     span_hedge: Arc<HedgeWindow>,
     /// What a Scan needs beside its generation, on an ordered table;
     /// `None` on a key-value table, which no Scan reads.

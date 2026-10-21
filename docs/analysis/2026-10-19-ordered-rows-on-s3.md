@@ -28,9 +28,10 @@ them. It also checks every answer against the derivation in
   issue.** 97.5% of Scan span GETs covered one page and the rest two to
   four. Both classes have the same first-byte latency (p50 25 ms, p99 53
   to 56 ms). The last byte adds 1 ms at p50 and 7 ms at p99. RFD 025
-  scales a span's hedge delay with its pages, and these spans do not
-  justify that scaling. No Scan span here reached five pages; Stage 4
-  measures spans of 5 to 16.
+  then scaled a span's hedge delay with its pages, and these spans did
+  not justify that scaling. No Scan span here reached five pages; Stage
+  4 measures spans of 5 to 16, and RFD 025 has since dropped the
+  scaling: every span GET races its window's one delay.
 - **Parallel overlap groups halve the load and do not cost CPU here.**
   On the table of 64 buckets with five overlapping files each, merging
   groups at once cut the first load from 4.06 to 1.93 s under `full`
@@ -175,12 +176,13 @@ At these sizes a GET's latency is a fixed first-byte time plus a small
 transfer term. That term is about 1.5 ms at p50 and 12 ms at p99 for
 70 KiB against 3 KiB. It is not a per-page cost.
 
-The span hedge window divides each span's elapsed time by its pages,
-records the quotient, and races a delay of the per-page percentile
-times its pages (`Storage::read_span_hedged`). With these latencies, a
-two-page span records half of what it took, which pulls the window's
-percentile down. That span also waits twice the delay before it
-hedges. Hedges fired on 2.9 to 3.9% of cold Scan and MultiScan GETs per
+The span hedge window, as measured here, divided each span's elapsed
+time by its pages, recorded the quotient, and raced a delay of the
+per-page percentile times its pages. With these latencies, a two-page
+span recorded half of what it took, which pulled the window's
+percentile down. That span also waited twice the delay before it
+hedged. The window now records each span's whole elapsed time and races
+its one delay. Hedges fired on 2.9 to 3.9% of cold Scan and MultiScan GETs per
 tier, under the 5% ceiling, so the effect stayed inside the budget at
 this mix of 97.5% single-page spans.
 
@@ -342,9 +344,10 @@ at a limit of 8,000, single task:
 
 The first byte does not depend on the span's pages up to 16, and the
 transfer adds about 2 ms at p50 and 13 ms at p99 for a 269 KiB span over
-a 32 KiB one. Under the page-scaled hedge delay, a 5-page span waits
-five times the per-page percentile, about 150 ms, before it hedges,
-where its latency is that of a one-page GET.
+a 32 KiB one. Under the page-scaled hedge delay this ran with, a 5-page
+span waited five times the per-page percentile, about 150 ms, before it
+hedged, where its latency is that of a one-page GET. So RFD 025 dropped
+the scaling: a span GET of any pages races the window's one delay.
 
 ### The merge with more cursors than slots
 

@@ -509,48 +509,30 @@ impl Storage {
         .await
     }
 
-    /// Reads one byte range on the lookup path, hedged against the table's
-    /// own latency window (RFD 013): when `window.delay()` names a delay,
+    /// Reads one byte range on the lookup path, hedged against a latency
+    /// window of its table's (RFD 013): when `window.delay()` names a delay,
     /// the request races a timer of that length, and if the timer wins an
     /// identical second request is issued, counted as a hedge, and the first
     /// answer wins. Every attempt, hedged or not, is recorded into the
-    /// window with its elapsed time, so the ceiling counts every hedge
+    /// window with its whole elapsed time, so the ceiling counts every hedge
     /// spent; that includes a read dropped after its delay passed
-    /// (`WindowSample`).
-    /// One lookup GET, plus one more when a hedge is issued. A plain `fn`
-    /// returning `read_span_hedged`'s future: every lookup future lays out
-    /// two of these, and an `async fn` around it would add its own state.
-    pub(crate) fn read_range_hedged<'a>(
-        &'a self,
-        l: &'a Located,
-        range: Range<u64>,
-        window: &'a HedgeWindow,
-    ) -> impl Future<Output = Result<Bytes>> + 'a {
-        self.read_span_hedged(l, range, 1, window)
-    }
-
-    /// `read_range_hedged` of a range holding `pages` pages, a Scan's span
-    /// GET (RFD 025, Caching and hedging): a span's latency grows with its
-    /// pages, so the delay it races is `window`'s per-page delay times its
-    /// pages (`HedgeWindow::delay_for`), and it enters the window as its
-    /// elapsed time over its pages. A window that records only such reads
-    /// holds per-page latencies; one page is a plain lookup GET.
-    pub(crate) async fn read_span_hedged(
+    /// (`WindowSample`). One lookup GET, plus one more when a hedge is
+    /// issued. A lookup's page and a Scan's span GET race the one delay of
+    /// the window they are given, whatever the span's pages (RFD 025,
+    /// Caching and hedging).
+    pub(crate) async fn read_range_hedged(
         &self,
         l: &Located,
         range: Range<u64>,
-        pages: u32,
         window: &HedgeWindow,
     ) -> Result<Bytes> {
         let len = range_len(&range);
         self.stats.record_get(ReadKind::Lookup, len);
-        let pages = pages.max(1);
-        let delay = window.delay_for(pages);
+        let delay = window.delay();
         let mut sample = WindowSample {
             window,
             started: Instant::now(),
             delay,
-            pages,
             hedged: false,
             recorded: false,
         };
@@ -825,9 +807,6 @@ struct WindowSample<'w> {
     started: Instant,
     /// The delay the read raced, `None` when it could not hedge.
     delay: Option<Duration>,
-    /// The pages the read holds, at least one: the window records its
-    /// elapsed time over them.
-    pages: u32,
     /// Whether a hedge was issued; set by `race` before it issues one.
     hedged: bool,
     /// Whether the sample is in the window.
@@ -838,7 +817,7 @@ impl WindowSample<'_> {
     /// Records the answered read and returns its elapsed time.
     fn record(&mut self) -> Duration {
         let elapsed = self.started.elapsed();
-        self.window.record(elapsed / self.pages, self.hedged);
+        self.window.record(elapsed, self.hedged);
         self.recorded = true;
         elapsed
     }
@@ -851,7 +830,7 @@ impl Drop for WindowSample<'_> {
         }
         let elapsed = self.started.elapsed();
         if self.hedged || self.delay.is_some_and(|delay| elapsed >= delay) {
-            self.window.record(elapsed / self.pages, self.hedged);
+            self.window.record(elapsed, self.hedged);
         }
     }
 }
@@ -1054,14 +1033,6 @@ impl HedgeWindow {
             return None;
         }
         samples.percentile
-    }
-
-    /// The delay after which a read of `pages` pages is hedged: `delay`
-    /// times the pages, `None` where `delay` gives none or the product
-    /// overflows. One page is `delay`.
-    pub(crate) fn delay_for(&self, pages: u32) -> Option<Duration> {
-        self.delay()
-            .and_then(|delay| delay.checked_mul(pages.max(1)))
     }
 
     /// Records one lookup GET: how long it took and whether a hedge was
@@ -2825,76 +2796,6 @@ mod tests {
         assert!(
             window.delay().is_none(),
             "the failed attempt entered the window as hedged"
-        );
-    }
-
-    /// The pages of a plain lookup GET, which `read_range_hedged` reads
-    /// through `read_span_hedged`.
-    const ONE_PAGE: u32 = 1;
-
-    /// `read_range_hedged`'s future is no larger than `read_span_hedged`'s:
-    /// every lookup future lays out two of them, warm hits included, and a
-    /// batched key's future is stored three times over, so state a wrapper
-    /// keeps of its own is paid on every key-value call.
-    #[tokio::test]
-    async fn test_read_range_hedged_future_is_no_larger_than_read_span_hedged() {
-        let (storage, located) = storage_with(Arc::new(InMemory::new())).await;
-        let window = HedgeWindow::new(&hedge_config(MEDIAN, TWO, HALF));
-        let range = size_of_val(&storage.read_range_hedged(&located, INNER_RANGE, &window));
-        let span = size_of_val(&storage.read_span_hedged(&located, INNER_RANGE, ONE_PAGE, &window));
-        assert!(range <= span, "{range} bytes against {span}");
-    }
-
-    /// The pages of the span the span-window tests read.
-    const SPAN_PAGES: u32 = 4;
-
-    /// A span's delay is the window's per-page delay times its pages, and
-    /// one page, or none, is the plain delay (RFD 025, Caching and hedging).
-    #[test]
-    fn test_delay_for_scales_the_window_delay_with_the_pages() {
-        let window = window_with(
-            &hedge_config(MEDIAN, TWO, HALF),
-            &[(TINY, false), (TINY, false)],
-        );
-        assert_eq!(window.delay_for(1), Some(TINY));
-        assert_eq!(window.delay_for(0), Some(TINY), "at least one page");
-        assert_eq!(window.delay_for(SPAN_PAGES), Some(TINY * SPAN_PAGES));
-        let empty = HedgeWindow::new(&hedge_config(MEDIAN, TWO, HALF));
-        assert_eq!(
-            empty.delay_for(SPAN_PAGES),
-            None,
-            "no delay before the window fills"
-        );
-    }
-
-    /// A span read enters its window as its elapsed time over its pages,
-    /// so the window holds per-page latencies: after one fast read of a
-    /// span, the window's median is at most a page's share of the time the
-    /// read took.
-    #[tokio::test]
-    async fn test_read_span_hedged_records_its_elapsed_time_per_page() {
-        let (storage, located) = storage_with(Arc::new(InMemory::new())).await;
-        let window = window_with(
-            &hedge_config(MEDIAN, TWO, HALF),
-            &[(HUGE, false), (HUGE, false)],
-        );
-        let started = Instant::now();
-        let bytes = storage
-            .read_span_hedged(&located, INNER_RANGE, SPAN_PAGES, &window)
-            .await
-            .unwrap();
-        let took = started.elapsed();
-        assert_eq!(&bytes[..], INNER_BYTES);
-        assert_eq!(storage.stats().gets(), 1);
-        assert_eq!(
-            storage.stats().hedges(),
-            0,
-            "the delay was HUGE times the pages"
-        );
-        let per_page = window.delay().expect("the window is full");
-        assert!(
-            per_page <= took / SPAN_PAGES,
-            "{per_page:?} recorded for a read of {took:?} over {SPAN_PAGES} pages"
         );
     }
 

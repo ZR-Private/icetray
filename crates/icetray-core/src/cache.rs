@@ -531,8 +531,8 @@ impl PageCache {
     /// page issue one GET for it, as `get_or_fetch` coalesces a lookup's
     /// page (RFD 025, Caching and hedging); its fetch's failure is this
     /// read's. Every maximal run of the remaining pages whose ranges meet
-    /// end to start is one call of `fetch` over the run's whole range and
-    /// the count of pages it holds, its bytes split by page and each page
+    /// end to start is one call of `fetch` over the run's whole range, its
+    /// bytes split by page and each page
     /// inserted as its own entry, keyed by `file` and the page's offset as
     /// `get_or_fetch` keys a page, so that a later read of any one of them
     /// finds it alone, then handed to every read waiting on it. The runs
@@ -566,7 +566,7 @@ impl PageCache {
         fetch: F,
     ) -> Result<(Vec<Bytes>, PageOrigin)>
     where
-        F: Fn(Range<u64>, u32) -> Fut,
+        F: Fn(Range<u64>) -> Fut,
         Fut: Future<Output = Result<Bytes>>,
     {
         let mut served: Vec<Option<Bytes>> = vec![None; pages.len()];
@@ -634,7 +634,7 @@ impl PageCache {
         fetch: &F,
     ) -> Result<Vec<(usize, Bytes)>>
     where
-        F: Fn(Range<u64>, u32) -> Fut,
+        F: Fn(Range<u64>) -> Fut,
         Fut: Future<Output = Result<Bytes>>,
     {
         let permit = issue.permit().await;
@@ -643,7 +643,7 @@ impl PageCache {
         };
         let run = claim.run.clone();
         let span = pages[run.start].start..pages[run.end - 1].end;
-        let fetched = fetch(span.clone(), u32::try_from(run.len()).unwrap_or(u32::MAX));
+        let fetched = fetch(span.clone());
         let run_of = self.run_for(PageKey(Arc::clone(file), span.start), permit, issue);
         let outcome = match run_of.run(fetched, std::convert::identity).await {
             Ok(bytes) => split_span(file, &pages[run.clone()], &bytes),
@@ -1766,7 +1766,7 @@ mod tests {
         let id: Arc<str> = Arc::from(FILE_ID);
         let file = span_file();
         let gate = Notify::new();
-        let slow = |span: Range<u64>, _| {
+        let slow = |span: Range<u64>| {
             let bytes = span_bytes(&file, &span);
             let gate = &gate;
             async move {
@@ -1776,7 +1776,7 @@ mod tests {
         };
         let (first, second, ()) = tokio::join!(
             cache.get_span(&id, &SPAN, Issue::default(), slow),
-            cache.get_span(&id, &SPAN, Issue::default(), |_, _| never()),
+            cache.get_span(&id, &SPAN, Issue::default(), |_| never()),
             async {
                 joined(&cache, count(SPAN.len())).await;
                 gate.notify_one();
@@ -1800,14 +1800,14 @@ mod tests {
         let cache = PageCache::for_scans(ROOMY_BYTES);
         let id: Arc<str> = Arc::from(FILE_ID);
         let file = span_file();
-        let mut dropped = Box::pin(cache.get_span(&id, &SPAN, Issue::default(), |_, _| {
+        let mut dropped = Box::pin(cache.get_span(&id, &SPAN, Issue::default(), |_| {
             std::future::pending::<Result<Bytes>>()
         }));
         assert!(
             futures::poll!(dropped.as_mut()).is_pending(),
             "it claims the pages"
         );
-        let answering = |span: Range<u64>, _| std::future::ready(Ok(span_bytes(&file, &span)));
+        let answering = |span: Range<u64>| std::future::ready(Ok(span_bytes(&file, &span)));
         let mut waiting = Box::pin(cache.get_span(&id, &SPAN, Issue::default(), answering));
         assert!(
             futures::poll!(waiting.as_mut()).is_pending(),
@@ -1831,7 +1831,7 @@ mod tests {
     async fn read_again(cache: &PageCache, id: &Arc<str>, file: &Bytes) -> Vec<Bytes> {
         let fetches = cache.fetches();
         let (served, origin) = cache
-            .get_span(id, &SPAN, Issue::default(), |span, _| {
+            .get_span(id, &SPAN, Issue::default(), |span| {
                 std::future::ready(Ok(span_bytes(file, &span)))
             })
             .await
@@ -1855,8 +1855,8 @@ mod tests {
         let runs = Arc::new(AtomicU64::new(0));
         let gate = Arc::new(Notify::new());
         let (claimer, joiner, ()) = tokio::join!(
-            cache.get_span(&id, &SPAN, Issue::default(), |_, _| failing(&runs, &gate)),
-            cache.get_span(&id, &SPAN, Issue::default(), |_, _| never()),
+            cache.get_span(&id, &SPAN, Issue::default(), |_| failing(&runs, &gate)),
+            cache.get_span(&id, &SPAN, Issue::default(), |_| never()),
             async {
                 joined(&cache, count(SPAN.len())).await;
                 gate.notify_one();
@@ -1887,10 +1887,8 @@ mod tests {
         let dropped = Arc::new(AtomicBool::new(false));
         let (claimer, joiner) = tokio::time::timeout(FETCH_GUARD, async {
             tokio::join!(
-                cache.get_span(&id, &SPAN, Issue::default(), |_, _| stalled(
-                    &runs, &dropped
-                )),
-                cache.get_span(&id, &SPAN, Issue::default(), |_, _| never()),
+                cache.get_span(&id, &SPAN, Issue::default(), |_| stalled(&runs, &dropped)),
+                cache.get_span(&id, &SPAN, Issue::default(), |_| never()),
             )
         })
         .await
@@ -1930,7 +1928,7 @@ mod tests {
         let cache = PageCache::for_scans(ROOMY_BYTES);
         let id: Arc<str> = Arc::from(FILE_ID);
         let file = span_file();
-        let short = |span: Range<u64>, _| {
+        let short = |span: Range<u64>| {
             let whole = span_bytes(&file, &span);
             std::future::ready(Ok(whole.slice(..whole.len() - short_by)))
         };
@@ -1953,7 +1951,7 @@ mod tests {
     async fn test_get_span_returns_a_failed_run_without_waiting_on_its_joins() {
         let cache = PageCache::for_scans(ROOMY_BYTES);
         let id: Arc<str> = Arc::from(FILE_ID);
-        let mut fetching = Box::pin(cache.get_span(&id, &SPAN[1..], Issue::default(), |_, _| {
+        let mut fetching = Box::pin(cache.get_span(&id, &SPAN[1..], Issue::default(), |_| {
             std::future::pending::<Result<Bytes>>()
         }));
         assert!(
@@ -1962,7 +1960,7 @@ mod tests {
         );
         let failed = tokio::time::timeout(
             crate::storage::testing::DEADLINE_GUARD,
-            cache.get_span(&id, &SPAN, Issue::default(), |_, _| {
+            cache.get_span(&id, &SPAN, Issue::default(), |_| {
                 std::future::ready(Err(Error::NotReady {
                     table: TABLE.to_string(),
                 }))
@@ -1995,7 +1993,7 @@ mod tests {
         let file = span_file();
         let full = Arc::new(Semaphore::new(1));
         let taken = Arc::clone(&full).acquire_owned().await.unwrap();
-        let answering = |span: Range<u64>, _| std::future::ready(Ok(span_bytes(&file, &span)));
+        let answering = |span: Range<u64>| std::future::ready(Ok(span_bytes(&file, &span)));
         let queued_issue = Issue {
             fan_out: Some(&full),
             counted: None,
@@ -2036,7 +2034,7 @@ mod tests {
         let full = Arc::new(Semaphore::new(1));
         let taken = Arc::clone(&full).acquire_owned().await.unwrap();
         let spans = std::sync::Mutex::new(Vec::new());
-        let recording = |span: Range<u64>, _| {
+        let recording = |span: Range<u64>| {
             spans.lock().unwrap().push(span.clone());
             std::future::ready(Ok(span_bytes(&file, &span)))
         };
@@ -2050,7 +2048,7 @@ mod tests {
             "it waits for its permit"
         );
         let gate = Notify::new();
-        let slow = |span: Range<u64>, _| {
+        let slow = |span: Range<u64>| {
             let bytes = span_bytes(&file, &span);
             let gate = &gate;
             async move {
@@ -2113,7 +2111,7 @@ mod tests {
         let first: Arc<str> = Arc::from(FILE_ID);
         let second = file_of_another_shard(&cache, &first);
         let locked = |id: &Arc<str>| cache.spans.shard(id).locked.load(Ordering::Relaxed);
-        let answering = |span: Range<u64>, _| std::future::ready(Ok(span_bytes(&file, &span)));
+        let answering = |span: Range<u64>| std::future::ready(Ok(span_bytes(&file, &span)));
         cache
             .get_span(&first, &SPAN, Issue::default(), answering)
             .await
@@ -2138,7 +2136,7 @@ mod tests {
             tokio::spawn(async move {
                 for _ in 0..WARM_READS {
                     let (_, origin) = cache
-                        .get_span(&id, &SPAN, Issue::default(), |_, _| never())
+                        .get_span(&id, &SPAN, Issue::default(), |_| never())
                         .await
                         .unwrap();
                     assert_eq!(origin, PageOrigin::Cached);
@@ -2367,8 +2365,8 @@ mod tests {
             .unwrap();
         let fetches = cache.fetches();
         let spans = std::sync::Mutex::new(Vec::new());
-        let fetch = |span: Range<u64>, held: u32| {
-            spans.lock().unwrap().push((span.clone(), held));
+        let fetch = |span: Range<u64>| {
+            spans.lock().unwrap().push(span.clone());
             let bytes = file.slice(approx::length(span.start)..approx::length(span.end));
             std::future::ready(Ok(bytes))
         };
@@ -2380,8 +2378,8 @@ mod tests {
         assert_eq!(origin, PageOrigin::Fetched);
         assert_eq!(
             *spans.lock().unwrap(),
-            [(0..10, 1), (26..40, 2), (100..110, 1)],
-            "each run with the pages it holds"
+            [0..10, 26..40, 100..110],
+            "one span per run"
         );
         assert_eq!(
             cache.fetches() - fetches,
@@ -2403,7 +2401,7 @@ mod tests {
             assert_eq!(origin, PageOrigin::Cached);
         }
         let (again, origin) = cache
-            .get_span(&id, &pages, Issue::default(), |_, _| never())
+            .get_span(&id, &pages, Issue::default(), |_| never())
             .await
             .unwrap();
         assert_eq!(again, served);
