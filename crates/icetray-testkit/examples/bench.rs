@@ -3572,7 +3572,7 @@ impl RssSampler {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
         let handle = std::thread::spawn(move || {
-            let mut resident = resident_reader();
+            let (_, mut resident) = resident_reader();
             let mut peak = 0;
             while !flag.load(Ordering::Relaxed) {
                 peak = peak.max(resident());
@@ -3592,7 +3592,40 @@ impl RssSampler {
 
 /// The process's resident set now, or zero where the platform reports none.
 fn resident_bytes() -> u64 {
-    resident_reader()()
+    let (_, mut resident) = resident_reader();
+    resident()
+}
+
+/// Where a `resident_reader` reads the resident set.
+#[derive(Clone, Copy, Debug)]
+enum RssSource {
+    /// `STATM`'s resident pages times the page size.
+    Statm {
+        /// The page size `STATM` counts in.
+        page_bytes: u64,
+    },
+    /// `memory_stats`' `physical_mem`.
+    MemoryStats,
+}
+
+impl RssSource {
+    /// The source as the settings JSON records it, with what its figures
+    /// can be compared with.
+    fn to_json(self) -> Json {
+        match self {
+            Self::Statm { page_bytes } => json!({
+                "kind": "statm",
+                "file": STATM,
+                "page_bytes": page_bytes,
+                "read": "one pread at offset 0 into a buffer on the stack per sample",
+                "accuracy": "statm's resident pages are the kernel's per-process counters, which are approximate, where /proc/self/smaps sums every mapping exactly; rss_*_bytes are not byte-comparable with runs that read smaps through memory_stats, Stage 4's on S3 among them",
+            }),
+            Self::MemoryStats => json!({
+                "kind": "memory_stats",
+                "read": "physical_mem: task_info on macOS, /proc/self/smaps on Linux",
+            }),
+        }
+    }
 }
 
 /// A reader of the process's resident set, or zero when it cannot be
@@ -3602,22 +3635,24 @@ fn resident_bytes() -> u64 {
 /// `/proc/self/smaps`, which `memory_stats` reads on Linux, walks every
 /// mapping and costs the sampler seconds of kernel time over a long load.
 /// Elsewhere it asks `memory_stats`, which on macOS is one `task_info`
-/// call.
-fn resident_reader() -> Box<dyn FnMut() -> u64> {
+/// call. The source comes back beside the reader, decided by the same
+/// open, so the settings JSON names the one a sampler reads.
+fn resident_reader() -> (RssSource, Box<dyn FnMut() -> u64>) {
     use std::os::unix::fs::FileExt as _;
     let Ok(statm) = std::fs::File::open(STATM) else {
-        return Box::new(|| {
-            memory_stats::memory_stats().map_or(0, |stats| approx::count(stats.physical_mem))
-        });
+        let reader =
+            || memory_stats::memory_stats().map_or(0, |stats| approx::count(stats.physical_mem));
+        return (RssSource::MemoryStats, Box::new(reader));
     };
     let page_bytes = page_bytes();
-    Box::new(move || {
+    let reader = move || {
         let mut buffer = [0_u8; STATM_BYTES];
         let Ok(read) = statm.read_at(&mut buffer, 0) else {
             return 0;
         };
         resident_pages(&buffer[..read]) * page_bytes
-    })
+    };
+    (RssSource::Statm { page_bytes }, Box::new(reader))
 }
 
 /// The resident pages `STATM`'s text `statm` counts, its second field, or
@@ -3628,16 +3663,6 @@ fn resident_pages(statm: &[u8]) -> u64 {
         .and_then(|text| text.split_ascii_whitespace().nth(1))
         .and_then(|pages| pages.parse().ok())
         .unwrap_or(0)
-}
-
-/// Where `resident_reader` reads the resident set on this host, for the
-/// settings JSON.
-fn rss_source() -> &'static str {
-    if std::fs::metadata(STATM).is_ok() {
-        "/proc/self/statm, its resident pages times the page size, read into a buffer on the stack"
-    } else {
-        "memory_stats physical_mem (task_info on macOS)"
-    }
 }
 
 /// The kernel's page size, which `STATM` counts in, or zero when the
@@ -4886,7 +4911,7 @@ fn reference_settings(cli: &Cli, warehouse: &str, tables: &[GoldenTable]) -> Jso
 /// How a load's resident set is sampled, and what its CPU time leaves out.
 fn rss_sampling() -> Json {
     json!({
-        "source": rss_source(),
+        "source": resident_reader().0.to_json(),
         "interval_us": micros(RSS_SAMPLE_INTERVAL),
         "thread": "one per load, started after the CPU and allocation counts are read and joined before they are read again",
         "cpu": "the sampler thread's own CPU time (CLOCK_THREAD_CPUTIME_ID, read as it ends) is left out of a load's cpu_us and reported as sampler_cpu_us",

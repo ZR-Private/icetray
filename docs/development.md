@@ -169,6 +169,15 @@ cargo run --profile profiling -p icetray-testkit --example bench -- \
   --rewrite-location "file:$PWD/target/golden-warehouse=s3a://bucket/copy"
 ```
 
+A load's resident-set peak comes from a sampler thread, whose own CPU
+is left out of the load's `cpu_us` and reported as `sampler_cpu_us`.
+On Linux it reads `/proc/self/statm`, whose resident count is the
+kernel's approximate per-process counter, so a peak from it is not
+byte-comparable with one an earlier run read from `/proc/self/smaps`,
+as Stage 4 of [ordered rows on
+S3](analysis/2026-10-19-ordered-rows-on-s3.md) did. The report's
+`settings.rss_sampling` says which source a run read.
+
 The tables are also the quickest way to try the binary: `icetray get
 --location target/golden-warehouse/db/long_2m --value-column value
 --column value 42` answers from one of them, and
