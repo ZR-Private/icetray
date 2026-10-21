@@ -3544,11 +3544,27 @@ async fn two_tables(
 /// How often the resident set is sampled while a load runs, for its peak.
 const RSS_SAMPLE_INTERVAL: Duration = Duration::from_millis(1);
 
+/// The file that counts the process's pages on Linux; its second field is
+/// the resident set, in pages.
+const STATM: &str = "/proc/self/statm";
+
+/// The most bytes `STATM` holds: seven counts of pages, each at most
+/// twenty digits, and their separators.
+const STATM_BYTES: usize = 256;
+
 /// The process's resident set sampled on a thread of its own until stopped;
-/// the largest sample is the peak of the window.
+/// the largest sample is the peak of the window. The thread's own CPU time
+/// comes back beside the peak, so a load's CPU can leave it out.
 struct RssSampler {
     stop: Arc<AtomicBool>,
-    handle: JoinHandle<u64>,
+    handle: JoinHandle<(u64, Duration)>,
+}
+
+/// What an `RssSampler` saw: the peak resident set, and the CPU time its
+/// thread spent sampling.
+struct Sampled {
+    peak: u64,
+    cpu: Duration,
 }
 
 impl RssSampler {
@@ -3556,25 +3572,95 @@ impl RssSampler {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
         let handle = std::thread::spawn(move || {
+            let mut resident = resident_reader();
             let mut peak = 0;
             while !flag.load(Ordering::Relaxed) {
-                peak = peak.max(resident_bytes());
+                peak = peak.max(resident());
                 std::thread::sleep(RSS_SAMPLE_INTERVAL);
             }
-            peak.max(resident_bytes())
+            (peak.max(resident()), thread_cpu())
         });
         Self { stop, handle }
     }
 
-    fn peak(self) -> u64 {
+    fn stop(self) -> Sampled {
         self.stop.store(true, Ordering::Relaxed);
-        self.handle.join().unwrap_or(0)
+        let (peak, cpu) = self.handle.join().unwrap_or_default();
+        Sampled { peak, cpu }
     }
 }
 
 /// The process's resident set now, or zero where the platform reports none.
 fn resident_bytes() -> u64 {
-    memory_stats::memory_stats().map_or(0, |stats| approx::count(stats.physical_mem))
+    resident_reader()()
+}
+
+/// A reader of the process's resident set, or zero when it cannot be
+/// read. Where `STATM` opens, as on Linux, it holds the file open and
+/// reads it into a buffer on the stack, so a sample costs one `pread` and
+/// allocates nothing the load's allocation count would see;
+/// `/proc/self/smaps`, which `memory_stats` reads on Linux, walks every
+/// mapping and costs the sampler seconds of kernel time over a long load.
+/// Elsewhere it asks `memory_stats`, which on macOS is one `task_info`
+/// call.
+fn resident_reader() -> Box<dyn FnMut() -> u64> {
+    use std::os::unix::fs::FileExt as _;
+    let Ok(statm) = std::fs::File::open(STATM) else {
+        return Box::new(|| {
+            memory_stats::memory_stats().map_or(0, |stats| approx::count(stats.physical_mem))
+        });
+    };
+    let page_bytes = page_bytes();
+    Box::new(move || {
+        let mut buffer = [0_u8; STATM_BYTES];
+        let Ok(read) = statm.read_at(&mut buffer, 0) else {
+            return 0;
+        };
+        resident_pages(&buffer[..read]) * page_bytes
+    })
+}
+
+/// The resident pages `STATM`'s text `statm` counts, its second field, or
+/// zero when it has none.
+fn resident_pages(statm: &[u8]) -> u64 {
+    std::str::from_utf8(statm)
+        .ok()
+        .and_then(|text| text.split_ascii_whitespace().nth(1))
+        .and_then(|pages| pages.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Where `resident_reader` reads the resident set on this host, for the
+/// settings JSON.
+fn rss_source() -> &'static str {
+    if std::fs::metadata(STATM).is_ok() {
+        "/proc/self/statm, its resident pages times the page size, read into a buffer on the stack"
+    } else {
+        "memory_stats physical_mem (task_info on macOS)"
+    }
+}
+
+/// The kernel's page size, which `STATM` counts in, or zero when the
+/// system does not say.
+fn page_bytes() -> u64 {
+    // SAFETY: `sysconf` reads a system constant and touches no memory of
+    // the caller's.
+    u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap_or(0)
+}
+
+/// The calling thread's user and system CPU time so far, or zero when the
+/// clock cannot be read.
+fn thread_cpu() -> Duration {
+    // SAFETY: `clock_gettime` writes one `timespec` into the zeroed struct
+    // it is handed and reads nothing else.
+    let now = unsafe {
+        let mut now: libc::timespec = std::mem::zeroed();
+        if libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &raw mut now) != 0 {
+            return Duration::ZERO;
+        }
+        now
+    };
+    clock_time(now)
 }
 
 /// The process's user and system CPU time so far, and its peak resident
@@ -3611,6 +3697,13 @@ impl Usage {
 fn cpu_time(value: libc::timeval) -> Duration {
     Duration::from_secs(u64::try_from(value.tv_sec).unwrap_or(0))
         + Duration::from_micros(u64::try_from(value.tv_usec).unwrap_or(0))
+}
+
+/// A `timespec` from `clock_gettime` as a `Duration`, at the kernel's
+/// boundary, where the time arrives as bare seconds and nanoseconds.
+fn clock_time(value: libc::timespec) -> Duration {
+    Duration::from_secs(u64::try_from(value.tv_sec).unwrap_or(0))
+        + Duration::from_nanos(u64::try_from(value.tv_nsec).unwrap_or(0))
 }
 
 /// What a load is of: one of the program's own tables, or a golden
@@ -3650,7 +3743,11 @@ struct Loaded {
     tier: Tier,
     round: u32,
     wall: Duration,
+    /// The process's CPU time over the load, the resident-set sampler's
+    /// own left out.
     cpu: Duration,
+    /// The CPU time the resident-set sampler's thread spent.
+    sampler_cpu: Duration,
     allocations: Allocations,
     rss_before: u64,
     rss_peak: u64,
@@ -3696,6 +3793,7 @@ impl Loaded {
             "round": self.round,
             "wall_us": micros(self.wall),
             "cpu_us": micros(self.cpu),
+            "sampler_cpu_us": micros(self.sampler_cpu),
             "allocations": self.allocations.calls,
             "allocated_bytes": self.allocations.bytes,
             "rss_before_bytes": self.rss_before,
@@ -3742,7 +3840,7 @@ async fn timed<F: Future<Output = BenchResult<()>>>(
     let started = Instant::now();
     work.await?;
     let wall = started.elapsed();
-    let rss_peak = sampler.peak();
+    let seen = sampler.stop();
     let after = Usage::now();
     let counters = Counters::read(served).since(before);
     let get_rounds = served.rounds.as_ref().map(|store| store.rounds());
@@ -3769,10 +3867,13 @@ async fn timed<F: Future<Output = BenchResult<()>>>(
         tier,
         round,
         wall,
-        cpu: (after.user + after.system).saturating_sub(usage.user + usage.system),
+        cpu: (after.user + after.system)
+            .saturating_sub(usage.user + usage.system)
+            .saturating_sub(seen.cpu),
+        sampler_cpu: seen.cpu,
         allocations: counters.allocations,
         rss_before,
-        rss_peak,
+        rss_peak: seen.peak,
         max_rss: after.max_rss,
         gets: counters.gets,
         get_bytes: counters.get_bytes,
@@ -4778,6 +4879,17 @@ fn reference_settings(cli: &Cli, warehouse: &str, tables: &[GoldenTable]) -> Jso
         },
         "span_classes": SPAN_CLASSES.map(|(least, most)| json!({ "min_pages": least, "max_pages": most })),
         "byte_class_floors": BYTE_CLASS_FLOORS,
+        "rss_sampling": rss_sampling(),
+    })
+}
+
+/// How a load's resident set is sampled, and what its CPU time leaves out.
+fn rss_sampling() -> Json {
+    json!({
+        "source": rss_source(),
+        "interval_us": micros(RSS_SAMPLE_INTERVAL),
+        "thread": "one per load, started after the CPU and allocation counts are read and joined before they are read again",
+        "cpu": "the sampler thread's own CPU time (CLOCK_THREAD_CPUTIME_ID, read as it ends) is left out of a load's cpu_us and reported as sampler_cpu_us",
     })
 }
 
@@ -5010,6 +5122,7 @@ fn report_settings(cli: &Cli, prepared: &[Prepared], compression: &[Json]) -> Js
         "multi_scan_limit": multi_scan_whole_runs().limit,
         "tables": prepared.iter().map(Prepared::to_json).collect::<Vec<_>>(),
         "compression": compression,
+        "rss_sampling": rss_sampling(),
     })
 }
 

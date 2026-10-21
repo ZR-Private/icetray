@@ -377,7 +377,10 @@ the name, and spends the same CPU either way. The difference is in
 short-lived threads named after the process, one per measured load,
 almost all of their time in the kernel: the resident-set sampler, which
 reads `/proc/self/smaps` every 1 ms for as long as the load runs, so a
-longer serial load costs it more.
+longer serial load costs it more. The bench has since read
+`/proc/self/statm` instead, and leaves the sampler thread's own CPU out
+of a load's `cpu_us`, reporting it as `sampler_cpu_us`; the settings
+JSON's `rss_sampling` records both, so a rerun's `cpu_us` is the load's.
 
 ## Reproducing
 
