@@ -474,11 +474,13 @@ pub enum ConfigViolation {
         /// The table's position in `tables`, when validation found it.
         index: Option<usize>,
     },
-    /// `server.max_multi_scan_values` is below twice an ordered table's
-    /// `max_scan_rows`, so a `MultiScan` of one key at the full limit and one
-    /// column would be refused (RFD 025).
+    /// `server.max_multi_scan_values` is below the least an ordered table's
+    /// `max_scan_rows` allows (`least_max_multi_scan_values`), so a
+    /// `MultiScan` of one key at the full limit and one column would be
+    /// refused (RFD 025).
     #[error(
-        "server.max_multi_scan_values {max_multi_scan_values} is below twice tables[{index}].max_scan_rows {max_scan_rows}, so a MultiScan of one key at the full limit and one column would be refused"
+        "server.max_multi_scan_values {max_multi_scan_values} is below {least}, the least tables[{index}].max_scan_rows {max_scan_rows} allows, so a MultiScan of one key at the full limit and one column would be refused",
+        least = least_max_multi_scan_values(*.max_scan_rows)
     )]
     MaxMultiScanValuesBelowScanRows {
         /// The ordered table's position in `tables`.
@@ -2112,10 +2114,10 @@ impl TableConfig {
     /// `ConfigViolation::MaxScanRowsOnKeyValueTable` for `max_scan_rows` on
     /// a table without an order column, `ConfigViolation::MaxScanRowsZero`
     /// for a zero one, and `ConfigViolation::MaxMultiScanValuesBelowScanRows`
-    /// when `max_multi_scan_values` is below twice the table's
-    /// `scan_rows`, so a `MultiScan` of one key at the full limit and one
-    /// column is always valid (RFD 025); `index` is the table's place in
-    /// `tables`.
+    /// when `max_multi_scan_values` is below `least_max_multi_scan_values`
+    /// of the table's `scan_rows`, so a `MultiScan` of one key at the full
+    /// limit and one column is always valid (RFD 025); `index` is the
+    /// table's place in `tables`.
     fn check_scan_rows(
         &self,
         index: usize,

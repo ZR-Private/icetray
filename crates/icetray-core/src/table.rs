@@ -1592,8 +1592,9 @@ impl Table {
     /// permit while it runs (`Lookups::run`). Dropping the returned future, as a
     /// deadline does, aborts the runs still going; a GET already issued
     /// runs on, holding its permit, and a lookup still waiting for one
-    /// issues nothing. A run's panic is resumed here; a run
-    /// canceled under a runtime shutdown is `Error::LookupCanceled`.
+    /// issues nothing. A run's panic is resumed at once, ahead of any
+    /// failure held, as a key's panic unwinds a call read on its own task;
+    /// a run canceled under a runtime shutdown is `Error::LookupCanceled`.
     pub async fn multi_get(&self, keys: &[Key], columns: &[ColumnRead<'_>]) -> Result<MultiLookup> {
         let _in_flight = self.lookups.enter();
         let columns = check_column_reads(&self.name, columns)?;
@@ -1700,8 +1701,9 @@ impl Table {
     /// key order, however the keys are read (`spawned`). Dropping the
     /// returned future aborts the runs still going, and a key one of them
     /// finishes after that counts nowhere (`ScanReceipt`). A run's panic is
-    /// resumed here; a run canceled under a runtime shutdown is
-    /// `Error::LookupCanceled`.
+    /// resumed at once, ahead of any failure held, as a key's panic unwinds
+    /// a call read on its own task; a run canceled under a runtime shutdown
+    /// is `Error::LookupCanceled`.
     pub async fn multi_scan(
         &self,
         keys: &[Key],
@@ -1833,8 +1835,10 @@ impl Table {
     /// passed, and a run that fails before it takes its place. The runs
     /// after the first failure known are stopped, since none of them can
     /// change the answer. The tasks live in a `JoinSet`, so returning, or
-    /// being dropped, aborts the rest. A run's panic is resumed here; a run
-    /// canceled under a runtime shutdown fails as `Error::LookupCanceled`.
+    /// being dropped, aborts the rest. A run's panic is resumed at once,
+    /// ahead of any failure held, as a key's panic unwinds a call read on
+    /// its own task; a run canceled under a runtime shutdown fails as
+    /// `Error::LookupCanceled`.
     async fn spawned<K, T, F>(
         &self,
         keys: &[K],
@@ -1851,6 +1855,8 @@ impl Table {
             .chunks(per_run)
             .map(|part| tasks.spawn(run(part)))
             .collect();
+        // `handles` keeps each run's id unique until the call ends: tokio
+        // reuses a task id only once no handle to its task is active.
         let run_of = |id: task::Id| {
             handles
                 .iter()
@@ -2955,6 +2961,24 @@ mod tests {
         load_deadline: Duration,
         refresh_deadline: Duration,
     ) -> Table {
+        table_fetching_within(
+            fixture,
+            config,
+            handles,
+            [load_deadline, refresh_deadline],
+            ServerConfig::default().get_deadline,
+        )
+    }
+
+    /// `table_sharing` with its load and refresh deadlines in `builds`, in
+    /// that order, and whose Gets end each page fetch at `get_deadline`.
+    fn table_fetching_within(
+        fixture: &Fixture,
+        config: TableConfig,
+        handles: TableHandles,
+        [load_deadline, refresh_deadline]: [Duration; 2],
+        get_deadline: Duration,
+    ) -> Table {
         Table::new(
             config,
             TableSource::Static {
@@ -2963,7 +2987,7 @@ mod tests {
             handles,
             load_deadline,
             refresh_deadline,
-            ServerConfig::default().get_deadline,
+            get_deadline,
             ServerConfig::default().scan_deadline,
         )
     }
@@ -4252,11 +4276,13 @@ mod tests {
         );
     }
 
-    /// The file a failing-batch test lays its first key out in, alone.
-    const FIRST_KEY_FILE: &str = "f0";
-    /// The file a failing-batch test lays its last key out in, alone; the
-    /// keys between are in a file of their own between the two.
-    const LAST_KEY_FILE: &str = "f2";
+    /// The position, in `file_at`'s order, of the file a failing-batch test
+    /// lays its first key out in, alone.
+    const FIRST_KEY_FILE: usize = 0;
+    /// The position of the file a failing-batch test lays its last key out
+    /// in, alone; the keys between are in a file of their own between the
+    /// two.
+    const LAST_KEY_FILE: usize = 2;
 
     /// `keys` split as the failing-batch tests lay them out: the first, the
     /// ones between, and the last.
@@ -4265,22 +4291,36 @@ mod tests {
         [&keys[..1], &keys[1..last], &keys[last..]]
     }
 
+    /// The name the fixtures of several files give their file at `at`:
+    /// `first_and_last_key_on_their_own`'s and `ordered_table_over`'s.
+    fn file_at(at: usize) -> String {
+        format!("f{at}")
+    }
+
+    /// The path on disk of `fixture`'s file at `at`.
+    fn on_disk(fixture: &Fixture, at: usize) -> String {
+        fixture
+            .path_of(&file_at(at))
+            .strip_prefix(FILE_PREFIX)
+            .unwrap()
+            .to_string()
+    }
+
+    /// Holds every GET of `fixture`'s file at `at`, and of no other file.
+    fn hold_file_at(fixture: &Fixture, gauged: &Gauged, at: usize) {
+        let path = fixture.path_of(&file_at(at));
+        gauged.hold_file(path.rsplit('/').next().unwrap());
+    }
+
     /// Holds every GET of `FIRST_KEY_FILE` and removes it, and empties
     /// `LAST_KEY_FILE`, both after the load read them: the first key's
     /// read waits on the store and, once released, fails with its file
     /// gone, while the store fails the last key's read at once, its range
     /// past the end of an empty file.
     fn first_key_slow_last_key_fast(fixture: &Fixture, gauged: &Gauged) {
-        gauged.hold_file(&format!("{FIRST_KEY_FILE}.parquet"));
-        let on_disk = |name| {
-            fixture
-                .path_of(name)
-                .strip_prefix(FILE_PREFIX)
-                .unwrap()
-                .to_string()
-        };
-        std::fs::remove_file(on_disk(FIRST_KEY_FILE)).unwrap();
-        std::fs::write(on_disk(LAST_KEY_FILE), []).unwrap();
+        hold_file_at(fixture, gauged, FIRST_KEY_FILE);
+        std::fs::remove_file(on_disk(fixture, FIRST_KEY_FILE)).unwrap();
+        std::fs::write(on_disk(fixture, LAST_KEY_FILE), []).unwrap();
     }
 
     /// Whether `error` is the page fetch of a file that is gone, as the
@@ -4303,7 +4343,10 @@ mod tests {
     /// releases the first key's read: the error the call answers, and the
     /// runs alive at the release, the first key's alone when the call
     /// spread and none when it read on its own task. A call that answers
-    /// before the release answered the last key's failure.
+    /// before the release answered the last key's failure, or the first
+    /// key's at the table's fetch deadline: the held read fails as
+    /// `Error::FetchDeadline` once that deadline passes, well inside
+    /// `DEADLINE_GUARD`, so the fetch deadline is the wait's real bound.
     async fn first_key_fails_after_the_last<T: fmt::Debug>(
         table: &Table,
         gauged: &Gauged,
@@ -4332,21 +4375,28 @@ mod tests {
             None => call.await,
         };
         let error = answered.expect_err("the first and the last key fail");
-        let runs =
-            runs.unwrap_or_else(|| panic!("answered before its first key failed: {error:?}"));
+        let runs = runs.unwrap_or_else(|| {
+            panic!(
+                "answered before the release, the last key's failure or the first key's \
+                 at its fetch deadline: {error:?}"
+            )
+        });
         (error, runs)
     }
 
     /// A loaded key-value table of `keys` laid out in three files of the
-    /// one bucket as `first_between_last` splits them, and the store its
-    /// storage reads through.
-    async fn first_and_last_key_on_their_own(keys: &[i64]) -> (Table, Fixture, Arc<Gauged>) {
+    /// one bucket as `first_between_last` splits them, whose Gets end each
+    /// page fetch at `get_deadline`, and the store its storage reads
+    /// through.
+    async fn first_and_last_key_on_their_own(
+        keys: &[i64],
+        get_deadline: Duration,
+    ) -> (Table, Fixture, Arc<Gauged>) {
         let mut fixture = Fixture::bucketed(1);
-        let names = [FIRST_KEY_FILE, "f1", LAST_KEY_FILE];
-        for (name, part) in names.into_iter().zip(first_between_last(keys)) {
+        for (at, part) in first_between_last(keys).into_iter().enumerate() {
             fixture
                 .add_file(FileSpec {
-                    name,
+                    name: &file_at(at),
                     keys: &long_keys(part),
                     values: values_of(part),
                     partition: Partition::Bucket(0),
@@ -4362,7 +4412,14 @@ mod tests {
         fixture
             .storage
             .register(FILE_PREFIX, Arc::<Gauged>::clone(&gauged));
-        let table = table_over(&fixture, lenient(&fixture)).await;
+        let defaults = ServerConfig::default();
+        let table = table_fetching_within(
+            &fixture,
+            lenient(&fixture),
+            handles_over(&fixture).await,
+            [defaults.load_deadline, defaults.refresh_deadline],
+            get_deadline,
+        );
         table.load().await.unwrap();
         (table, fixture, gauged)
     }
@@ -4382,7 +4439,8 @@ mod tests {
             keys.len() <= DEFAULT_BATCH_FAN_OUT,
             "one run reads every key at once"
         );
-        let (table, fixture, gauged) = first_and_last_key_on_their_own(&keys).await;
+        let (table, fixture, gauged) =
+            first_and_last_key_on_their_own(&keys, ServerConfig::default().get_deadline).await;
         let _others: Vec<InFlight<'_>> = (0..others).map(|_| table.lookups.enter()).collect();
         first_key_slow_last_key_fast(&fixture, &gauged);
         let asked = long_keys(&keys);
@@ -4405,6 +4463,58 @@ mod tests {
         let (error, runs) = multi_get_failing_first_and_last(others_filling_the_workers).await;
         assert_eq!(runs, 0, "the first key read on the call's task");
         assert!(file_gone(&error), "the first key's failure: {error:?}");
+    }
+
+    /// Whether `error` is the page fetch of a range past the end of its
+    /// file, as the store fails a read of a file emptied after the load.
+    fn range_refused(error: &Error) -> bool {
+        let Error::Cache(CacheError::Fetch(failed)) = error else {
+            return false;
+        };
+        matches!(
+            **failed,
+            Error::ObjectStore(object_store::Error::Generic { .. })
+        )
+    }
+
+    /// The holders of a serving generation's `Arc` once a batch has
+    /// returned, beside the runs it spawned that are still alive: the
+    /// table's own and the read.
+    const HOLDERS_ONCE_ANSWERED: usize = HOLDERS_BESIDE_THE_RUNS - 1;
+
+    /// A spread `MultiGet` whose first key fails answers that failure
+    /// though a later run cannot finish, and stops that run: the store
+    /// holds every GET of the last key's file, and the Gets end no page
+    /// fetch before `STALL`, so a call that waited on every run would wait
+    /// past `DEADLINE_GUARD`, and the last key's run ends only when it is
+    /// aborted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_multi_get_answers_its_first_key_failing_at_once_and_stops_the_later_runs() {
+        assert_eq!(shard::workers(), SPLIT_WORKERS);
+        let keys = keys_from(
+            0,
+            i64::try_from(MULTI_GET_TASK_KEYS_MIN * SPLIT_WORKERS).unwrap(),
+        );
+        let (table, fixture, gauged) = first_and_last_key_on_their_own(&keys, STALL).await;
+        hold_file_at(&fixture, &gauged, LAST_KEY_FILE);
+        std::fs::write(on_disk(&fixture, FIRST_KEY_FILE), []).unwrap();
+        let value = [ColumnRead::whole(VALUE_COLUMN)];
+        let answered =
+            tokio::time::timeout(DEADLINE_GUARD, table.multi_get(&long_keys(&keys), &value))
+                .await
+                .expect(
+                    "the call answers its first key's failure though a later run cannot finish",
+                );
+        let error = answered.expect_err("the first key's file is empty");
+        assert!(range_refused(&error), "the first key's failure: {error:?}");
+        tokio::time::timeout(DEADLINE_GUARD, async {
+            while Arc::strong_count(&table.current().unwrap()) > HOLDERS_ONCE_ANSWERED {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the run of the last key, held on the store, is stopped");
+        gauged.release();
     }
 
     /// The runs a batch of `DEFAULT_BATCH_FAN_OUT` cold hits on one table
@@ -7101,7 +7211,7 @@ mod tests {
         let mut fixture = Fixture::ordered(1);
         for (at, rows) in files.iter().enumerate() {
             fixture
-                .add_ordered_file(&format!("f{at}"), rows, Partition::Bucket(0), layout)
+                .add_ordered_file(&file_at(at), rows, Partition::Bucket(0), layout)
                 .await;
         }
         fixture
@@ -8044,8 +8154,8 @@ mod tests {
     fn test_multi_scan_counts_the_keys_it_finished_before_a_key_failed() {
         let ((), series) = recorded(async {
             let (table, fixture, _gauged, keys) = two_keys_in_two_files().await;
-            let path = fixture.path_of("f1");
-            std::fs::remove_file(path.strip_prefix(FILE_PREFIX).unwrap()).unwrap();
+            let second_key_file = 1;
+            std::fs::remove_file(on_disk(&fixture, second_key_file)).unwrap();
             let bounds = ScanBounds {
                 limit: u32::try_from(SCAN_ROWS_PER_KEY).unwrap(),
                 ..oldest_first()
@@ -8347,8 +8457,8 @@ mod tests {
             let bounds = spread_bounds();
             let mut call = Box::pin(table.multi_scan(&keys, &BOTH_READS, &bounds));
             let runs = until_only_the_cold_key_waits(&table, &gauged, &mut call).await;
-            let path = fixture.path_of("f1");
-            std::fs::remove_file(path.strip_prefix(FILE_PREFIX).unwrap()).unwrap();
+            let cold_key_file = 1;
+            std::fs::remove_file(on_disk(&fixture, cold_key_file)).unwrap();
             gauged.release();
             let failed = call.await;
             let Err(Error::Cache(CacheError::Fetch(failed))) = failed else {
