@@ -305,12 +305,13 @@ direction under a limit and optional bounds on the order value.
   whichever key failed first. A run's failure is held until every run
   before it has ended, and the runs after it are stopped, so the error a
   caller sees, and whether it retries, does not depend on scheduling.
-  Spreading cuts a lone MultiScan's latency for more CPU per key, spent only while cores would
-  otherwise sit idle. `server.max_multi_scan_values` bounds a
-  MultiScan's keys times its limit times one more than its requested
-  columns, and the server rejects a larger call before it reads any
-  key. A configuration whose `max_multi_scan_values` is below twice an
-  ordered table's `max_scan_rows` is refused, so a MultiScan of one key at the full
+  Spreading cuts a lone MultiScan's latency for more CPU per key, spent
+  only while cores would otherwise sit idle.
+  `server.max_multi_scan_values` bounds a MultiScan's keys times its
+  limit times one more than its requested columns, and the server
+  rejects a larger call before it reads any key. A configuration whose
+  `max_multi_scan_values` is below twice an ordered table's
+  `max_scan_rows` is refused, so a MultiScan of one key at the full
   limit and one column is always valid. That limit applies to a
   MultiScan of one key as to any other, and a caller reading one key's
   full limit over many columns uses Scan. `server.scan_deadline` bounds

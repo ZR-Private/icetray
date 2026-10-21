@@ -124,8 +124,9 @@ files. On the 4-CPU, 8 GiB colima VM `dev/runtime.sh` starts, the group
 takes an estimated five minutes, about a minute a table: the four other
 tables took about four minutes together, and `ref_large_appended` alone
 (`--only ref_large_appended`) took about 50 seconds, but the five have
-not been timed as one run. The warehouse grows by about 9 GB. The VM's disk also grows while Spark spills, and
-does not shrink, so keep about twice that free before writing the group.
+not been timed as one run. The warehouse grows by about 9 GB. The VM's
+disk also grows while Spark spills, and does not shrink, so keep about
+twice that free before writing the group.
 `--reference-keys` writes fewer keys for a quick run, and the tests
 derive the rows of whatever count the tables record; below the full size
 they check the advice as a floor and leave the row groups unchecked,

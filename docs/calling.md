@@ -505,8 +505,13 @@ with a fault of step 5 is `UNAVAILABLE` while the table loads and
 A `MultiGet` or `MultiScan` that passes these checks and then fails a
 read answers the error of its first failing key in request order,
 whichever key's read failed first. The code a caller decides its retry
-on does not depend on how the server scheduled the reads, and a
-`FAILED_PRECONDITION` names the first such key in request order.
+on does not depend on how the server scheduled the reads, and when that
+error is `FAILED_PRECONDITION`, it names that key. A failing call waits
+on the keys before its first failing one, up to their fetch deadline:
+a key earlier in the request whose read stalls answers its own
+`DEADLINE_EXCEEDED` once its fetch passes `server.get_deadline` (a
+`MultiGet`) or `server.scan_deadline` (a `MultiScan`), even when a later
+key has already failed with a code that is not retried.
 
 The gRPC layer enforces a deadline the client sends and reports its
 expiry to the client (a tonic client sees `CANCELLED`), and the server
