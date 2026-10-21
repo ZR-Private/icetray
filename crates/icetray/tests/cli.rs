@@ -2126,13 +2126,64 @@ async fn test_scan_takes_iso_bounds_for_time_orders_as_the_longs_they_name() -> 
     Ok(())
 }
 
+/// Digits alone on a `date` column are a day count, whatever date it
+/// falls on: `20260101` is day 20,260,101, past every row of a fixture
+/// whose rows start at 2026-01-01 and past the dates ISO text names, not
+/// 2026-01-01, so as `--start` it reads no row and as `--before` every
+/// row, as the model holds them.
+#[tokio::test]
+async fn test_scan_reads_digits_alone_on_a_date_column_as_a_day_count() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let kind = OrderKind::Date;
+    let fixture = local_fixture(
+        dir.path(),
+        ordered_spec_of("events_day_count", kind, NEW_YEAR_2026_DAYS, 1),
+    )
+    .await?;
+    let config = ordered_config(dir.path(), "day_count", &fixture)?;
+    let key = fixture.key(SAMPLE[1]);
+    let key_text = key.to_string();
+    let day_count = 20_260_101;
+    let text = day_count.to_string();
+    let limit = u32::try_from(ORDER_ROWS_PER_KEY)?;
+    for (start, before) in [(Some(day_count), None), (None, Some(day_count))] {
+        let page = TestScan {
+            direction: Direction::OldestFirst,
+            limit,
+            start,
+            before,
+        };
+        let output = scan_run(
+            &["--config", &config],
+            &key_text,
+            &page,
+            start.map(|_| text.as_str()),
+            before.map(|_| text.as_str()),
+        );
+        assert_exit(&output, EXIT_OK);
+        let (rows, call) = scan_lines(&output, TABLE_A, &key_text);
+        let (expected, _) = fixture.expected_scan(&key, &[VALUE_COLUMN], &page);
+        let context = format!("start {start:?} before {before:?}");
+        assert_eq!(
+            expected.len(),
+            if start.is_some() {
+                0
+            } else {
+                approx::length(ORDER_ROWS_PER_KEY)
+            },
+            "{context}"
+        );
+        assert_rows(&rows, &expected, kind, &context);
+        assert!(call.get("next").is_none(), "{call}");
+    }
+    Ok(())
+}
+
 /// ISO 8601 text a time bound's type cannot hold, ISO text in any form
-/// but the one, ISO text for a `long` order column, and a `date` long
-/// past jiff's dates are usage errors before the load, with the form as
-/// the hint: digits below a microsecond for a `timestamp`, an instant
+/// but the one, and ISO text for a `long` order column are usage errors
+/// before the load, with the form as the hint: digits below a microsecond for a `timestamp`, an instant
 /// without an offset, with a space for `T`, or with a zone annotation, a
-/// leap second, a year past 9999, and `20260101`, which on a `date` is
-/// the day count 20,260,101, not 2026-01-01.
+/// leap second, and a year past 9999.
 #[tokio::test]
 async fn test_scan_refuses_iso_bounds_a_column_s_type_cannot_hold() -> TestResult {
     let dir = tempfile::tempdir()?;
@@ -2151,7 +2202,6 @@ async fn test_scan_refuses_iso_bounds_a_column_s_type_cannot_hold() -> TestResul
         ),
         (OrderKind::TimestampTz, "--before", "2016-12-31T23:59:60Z"),
         (OrderKind::Date, "--start", "10000-01-01"),
-        (OrderKind::Date, "--before", "20260101"),
         (OrderKind::TimestampNs, "--before", "2263-01-01T00:00:00Z"),
         (OrderKind::Long, "--start", "2026-01-01T00:00:00Z"),
         (OrderKind::Long, "--before", "2026-01-01"),

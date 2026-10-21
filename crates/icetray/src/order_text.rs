@@ -15,7 +15,7 @@
 //! the `next` of a string read oldest first always ends in one, the zero
 //! byte `OrderValue::successor` appends.
 
-use icetray_core::time::{self, EpochUnit};
+use icetray_core::time;
 use icetray_core::{BoundSide, OrderType, OrderValue, OrderVariant};
 use serde::Serialize;
 
@@ -32,8 +32,7 @@ const ESCAPED_ZERO: char = '0';
 /// value of an integer or time type is `i64::from_str`, in the type's
 /// Iceberg unit: days for `date`, microseconds or nanoseconds for a
 /// timestamp, as the wire and the doctor's lines carry it; digits alone
-/// are always that long, so `20260101` on a `date` is a day count, and a
-/// `date`'s long must name a day jiff holds (`time::epoch_days`). Text
+/// are always that long, so `20260101` on a `date` is a day count. Text
 /// that is no integer is, for a date or timestamp type, ISO 8601 in the
 /// one form `time::epoch_count` reads, `YYYY-MM-DD` or
 /// `YYYY-MM-DDTHH:MM:SS[.fraction]` with `Z` or an offset, converted to
@@ -54,17 +53,13 @@ pub fn parse(
                 bound,
                 text: text.to_string(),
             };
-            let long = text.parse::<i64>();
-            let Some(unit) = order_type.epoch_unit() else {
-                return long.map(OrderValue::Long).map_err(|_| not_a_long());
+            if let Ok(count) = text.parse() {
+                return Ok(OrderValue::Long(count));
+            }
+            let Some(unit) = order_type.epoch_unit().filter(|_| !is_integer(text)) else {
+                return Err(not_a_long());
             };
-            let value = match long {
-                Ok(days) if unit == EpochUnit::Days => time::epoch_days(days),
-                Ok(count) => Ok(count),
-                Err(_) if is_integer(text) => return Err(not_a_long()),
-                Err(_) => time::epoch_count(text, unit),
-            };
-            value
+            time::epoch_count(text, unit)
                 .map(OrderValue::Long)
                 .map_err(|fault| OrderTextFault::NotATime {
                     bound,
@@ -404,32 +399,24 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_date_reads_digits_alone_as_days_and_refuses_days_jiff_lacks() {
+    fn test_parse_date_reads_digits_alone_as_days_whatever_their_date() {
         assert_eq!(
             parse("2026", OrderType::Date, BoundSide::Start),
             parse("1975-07-20", OrderType::Date, BoundSide::Start),
             "2026 is day 2026, not a year"
         );
-        assert_eq!(
-            parse("2026", OrderType::Date, BoundSide::Start),
-            Ok(OrderValue::Long(2026))
-        );
-        for text in ["20260101", "2932897", "-4371588"] {
+        for days in [
+            "20260101",
+            "2147483647",
+            "-2147483648",
+            "9223372036854775807",
+        ] {
             assert_eq!(
-                parse(text, OrderType::Date, BoundSide::Start),
-                Err(not_a_time(
-                    OrderType::Date,
-                    text,
-                    EpochTextFault::OutOfRange
-                )),
-                "{text}"
+                parse(days, OrderType::Date, BoundSide::Start),
+                Ok(OrderValue::Long(days.parse().unwrap())),
+                "{days}: a long, past the dates ISO text names"
             );
         }
-        assert_eq!(
-            parse("20260101", OrderType::Timestamp, BoundSide::Start),
-            Ok(OrderValue::Long(20_260_101)),
-            "a timestamp's long is not range-checked"
-        );
     }
 
     #[test]

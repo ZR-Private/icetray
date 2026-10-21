@@ -196,9 +196,9 @@ pub enum OrderTextFault {
         /// The text as given.
         text: String,
     },
-    /// A date or timestamp bound is neither a long the column's unit
-    /// holds (`icetray_core::time::epoch_days`) nor ISO 8601 text that
-    /// names one (`icetray_core::time::epoch_count`).
+    /// A date or timestamp bound is neither a signed 64-bit integer nor
+    /// ISO 8601 text that names a value of the column's unit
+    /// (`icetray_core::time::epoch_count`).
     #[error(
         "--{bound} {text} is not a {order_type} bound, which is a long of {unit} since the epoch or {}: {fault}",
         iso_form(*unit)

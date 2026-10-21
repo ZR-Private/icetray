@@ -108,8 +108,7 @@ impl std::fmt::Display for EpochUnit {
     }
 }
 
-/// Why text is not a time `epoch_count` turns into a count of its unit,
-/// or a count `epoch_days` admits.
+/// Why text is not a time `epoch_count` turns into a count of its unit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum EpochTextFault {
     /// The text is not in the one form the unit takes: `YYYY-MM-DD` for
@@ -132,11 +131,10 @@ pub enum EpochTextFault {
     /// a count of microseconds cannot hold.
     #[error("the instant has digits below a microsecond")]
     BelowTheUnit,
-    /// The value is outside what the unit holds: an instant whose count of
-    /// nanoseconds does not fit a signed 64-bit integer, which spans
-    /// 1677-09-21T00:12:43.145224192Z to 2262-04-11T23:47:16.854775807Z,
-    /// or a count of days outside jiff's dates, -9999-01-01 to 9999-12-31.
-    #[error("the value is outside the range the unit holds")]
+    /// The instant's count of nanoseconds does not fit a signed 64-bit
+    /// integer, which spans 1677-09-21T00:12:43.145224192Z to
+    /// 2262-04-11T23:47:16.854775807Z.
+    #[error("the instant is outside the range a long of nanoseconds holds")]
     OutOfRange,
 }
 
@@ -228,18 +226,6 @@ fn epoch_date() -> jiff::civil::Date {
     jiff::tz::Offset::UTC
         .to_datetime(jiff::Timestamp::UNIX_EPOCH)
         .date()
-}
-
-/// `days`, a count of days since the epoch as a `date` column stores it,
-/// when it names a date jiff holds, -9999-01-01 to 9999-12-31, and
-/// `OutOfRange` otherwise: the check a `date` bound given as a long
-/// meets, so it names a day its ISO form could name.
-pub fn epoch_days(days: i64) -> Result<i64, EpochTextFault> {
-    jiff::Span::new()
-        .try_days(days)
-        .and_then(|span| epoch_date().checked_add(span))
-        .map(|_| days)
-        .map_err(|_| EpochTextFault::OutOfRange)
 }
 
 /// The count of `unit` since the Unix epoch that ISO 8601 `text` names,
@@ -537,7 +523,7 @@ mod tests {
         assert_eq!(super::millis_after(EPOCH_MILLIS, Duration::MAX), i64::MAX);
     }
 
-    use super::{EpochTextFault, EpochUnit, epoch_count, epoch_days};
+    use super::{EpochTextFault, EpochUnit, epoch_count};
 
     #[test]
     fn test_epoch_count_days_counts_calendar_days_from_the_epoch() {
@@ -585,16 +571,6 @@ mod tests {
     }
 
     #[test]
-    fn test_epoch_days_admits_exactly_the_days_jiff_holds() {
-        assert_eq!(epoch_days(0), Ok(0));
-        assert_eq!(epoch_days(2_932_896), Ok(2_932_896), "9999-12-31");
-        assert_eq!(epoch_days(-4_371_587), Ok(-4_371_587), "-9999-01-01");
-        for days in [2_932_897, -4_371_588, 20_260_101, i64::MAX, i64::MIN] {
-            assert_eq!(epoch_days(days), Err(EpochTextFault::OutOfRange), "{days}");
-        }
-    }
-
-    #[test]
     fn test_epoch_count_microseconds_reads_an_instant_with_its_offset() {
         let micros = |text| epoch_count(text, EpochUnit::Microseconds);
         assert_eq!(micros("1970-01-01T00:00:00Z"), Ok(0));
@@ -603,6 +579,16 @@ mod tests {
         assert_eq!(micros("1969-12-31T23:59:59.999999Z"), Ok(-1));
         assert_eq!(micros("1970-01-01T01:00:00+01:00"), Ok(0));
         assert_eq!(micros("1970-01-01T00:00:00-00:00"), Ok(0));
+        assert_eq!(
+            micros("1970-01-01T23:59:00+23:59"),
+            Ok(0),
+            "the greatest offset"
+        );
+        assert_eq!(
+            micros("1969-12-31T00:01:00-23:59"),
+            Ok(0),
+            "the least offset"
+        );
         assert_eq!(micros("1969-12-31T23:00:00-01:00"), Ok(0));
         assert_eq!(
             micros("2023-11-14T22:13:20.123Z"),
@@ -623,6 +609,7 @@ mod tests {
             "1970-01-01T00:00:00.000001001Z",
             "1969-12-31T23:59:59.9999999Z",
             "1969-12-31T23:59:59.9999995Z",
+            "9999-12-30T22:00:00.999999999Z",
         ] {
             assert_eq!(
                 epoch_count(text, EpochUnit::Microseconds),

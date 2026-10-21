@@ -10,9 +10,11 @@
 > consulted; a `timestamp` bound is the instant's UTC wall-clock time.
 > A value that would move the window is refused rather than rounded: a
 > leap second, which jiff reads as the second before, and digits below
-> a microsecond type's unit. Digits alone stay the long, and the
-> printed `next` and `order` stay longs. No other order type takes ISO
-> text. The configuration reference gives the forms and ranges.
+> a microsecond type's unit. Only the ISO form is limited to jiff's
+> dates: digits alone stay the long, over every value the column holds,
+> so a printed `next`, a long, always pastes back, and `next` and
+> `order` stay longs. No other order type takes ISO text. The
+> configuration reference gives the forms and ranges.
 
 > Updated 2026-10-20: the span hedge window stays separate from the
 > lookup window, decided under Caching and hedging, and one hedge window

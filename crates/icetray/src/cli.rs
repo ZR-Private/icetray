@@ -282,7 +282,7 @@ pub struct ScanArgs {
     /// timestamp is a long in the column's Iceberg unit: days for a date,
     /// microseconds for timestamp and timestamptz, nanoseconds for their
     /// nanosecond types. Digits alone are always that long: 20260101 on a
-    /// date is a day count, refused as past 9999-12-31. A date also takes
+    /// date is day 20,260,101, not 2026-01-01. A date also takes
     /// YYYY-MM-DD, such as 2026-01-01, and a timestamp
     /// YYYY-MM-DDTHH:MM:SS[.fraction] with Z, +HH:MM, or -HH:MM, such as
     /// 2026-01-01T00:00:00Z, never a local time; a timestamp column's

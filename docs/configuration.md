@@ -706,16 +706,18 @@ it loads any data file:
   time is given with `Z`, as in `2026-01-01T09:00:00Z`, not with its
   offset, which shifts the bound by the offset. Every other form exits
   64: a space for `T`, lowercase `t` or `z`, an hour-only offset, one
-  with seconds, or one past 23 hours, a zone annotation such as `[Europe/Paris]`, the basic
-  form `20260101T000000Z`, a comma for the decimal point, and a time
-  without seconds or without an offset. So do a leap second, `:60`, and
-  an instant with digits below the column's unit that are not zero, such
-  as `.0000001` for a microsecond type: neither is rounded. Digits alone
-  are always the long: on a `date` column `2026` is day 2026,
-  1975-07-20, and `20260101` is day 20,260,101, past 9999-12-31 and
-  refused, since a `date` long outside jiff's dates, -9999-01-01 to
-  9999-12-31, exits 64. An `int` or `long` column, and every column
-  below, takes no ISO text;
+  with seconds, or one past 23 hours, a zone annotation such as
+  `[Europe/Paris]`, the basic form `20260101T000000Z`, a comma for the
+  decimal point, and a time without seconds or without an offset. So
+  do a leap second, `:60`, and an instant with digits below the
+  column's unit that are not zero, such as `.0000001` for a
+  microsecond type: neither is rounded. Only the ISO form is limited
+  to these ranges; the long takes every value the column holds, a
+  `date`'s whole `int` range of days included. Digits alone are always
+  the long: on a `date` column `2026` is day 2026, 1975-07-20, and
+  `20260101` is day 20,260,101, some 55,000 years from now, not
+  2026-01-01. An `int` or `long` column, and every column below, takes
+  no ISO text;
 - a `string` as its text, with two escapes: `\\` for a backslash and
   `\0` for a zero byte. No command-line argument can hold a zero byte,
   and a page read oldest first from a string column ends in one: its
