@@ -701,7 +701,7 @@ impl Target {
 #[cfg(test)]
 mod tests {
     use clap::CommandFactory as _;
-    use clap::error::ErrorKind;
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
     use icetray_core::config::{ColumnSetting, ConfigError, ConfigViolation};
     use icetray_core::{LocationError, LocationFault};
 
@@ -1146,6 +1146,14 @@ value_columns = ["value"]
             ErrorKind::MissingRequiredArgument,
             "{missing}"
         );
+        let Some(ContextValue::Strings(arguments)) = missing.get(ContextKind::InvalidArg) else {
+            panic!("clap names the missing arguments: {missing}");
+        };
+        let flags: Vec<&str> = arguments
+            .iter()
+            .filter_map(|argument| argument.split_whitespace().next())
+            .collect();
+        assert_eq!(flags, ["--order-column"]);
         let named = [&located[..], &["--order-column", "ts"], &request].concat();
         assert!(parse(&named).is_ok());
         for args in [

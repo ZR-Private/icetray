@@ -138,6 +138,24 @@ fn assert_plain_error(output: &Output) -> bool {
     }
 }
 
+/// The arguments a clap usage error on stderr lists as missing: the
+/// first word of each line between its `error:` line and the blank line
+/// after it.
+fn missing_arguments(output: &Output) -> Vec<String> {
+    let text = stderr(output);
+    let mut lines = text.lines();
+    assert!(
+        lines
+            .next()
+            .is_some_and(|line| line.starts_with(ERROR_PREFIX)),
+        "{text}"
+    );
+    lines
+        .take_while(|line| !line.is_empty())
+        .filter_map(|line| line.split_whitespace().next().map(str::to_string))
+        .collect()
+}
+
 /// Writes `spec` as a fixture under `dir` through a memory catalog.
 async fn local_fixture(dir: &Path, spec: FixtureSpec) -> Result<Fixture, BoxError> {
     let catalog = memory_catalog_local(dir).await?;
@@ -1872,8 +1890,8 @@ async fn test_scan_of_a_key_with_no_rows_prints_one_scan_line() -> TestResult {
 /// errors found from the configuration, before the load: with every data
 /// file gone, so a load fails with exit 1, each exits 64 with a hint
 /// naming the command that reads the table. A `scan` of a `--location`
-/// table with no `--order-column` is clap's usage error for the missing
-/// flag, which `cli`'s unit tests pin.
+/// table with no `--order-column` is clap's usage error, which lists
+/// that flag alone as missing.
 #[tokio::test]
 async fn test_get_of_an_ordered_table_and_scan_of_a_key_value_one_are_usage_errors() -> TestResult {
     let ordered_dir = tempfile::tempdir()?;
@@ -1925,6 +1943,7 @@ async fn test_get_of_an_ordered_table_and_scan_of_a_key_value_one_are_usage_erro
     let located_scan = scan_run(&location(&kv), &key, &TestScan::default(), None, None);
     assert_exit(&located_scan, EXIT_USAGE);
     assert!(located_scan.stdout.is_empty());
+    assert_eq!(missing_arguments(&located_scan), ["--order-column"]);
     Ok(())
 }
 
