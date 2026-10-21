@@ -182,9 +182,9 @@ per-page percentile times its pages. With these latencies, a two-page
 span recorded half of what it took, which pulled the window's
 percentile down. That span also waited twice the delay before it
 hedged. The window now records each span's whole elapsed time and races
-its one delay. Hedges fired on 2.9 to 3.9% of cold Scan and MultiScan GETs per
-tier, under the 5% ceiling, so the effect stayed inside the budget at
-this mix of 97.5% single-page spans.
+its one delay. Hedges fired on 2.9 to 3.9% of cold Scan and MultiScan
+GETs per tier, under the 5% ceiling, so the effect stayed inside the
+budget at this mix of 97.5% single-page spans.
 
 Larger spans need larger limits or values, and the merge's load GETs
 had them. Load GETs of 5 to 16 pages (mean 53 KiB) had a first-byte
@@ -384,6 +384,9 @@ longer serial load costs it more. The bench has since read
 `/proc/self/statm` instead, and leaves the sampler thread's own CPU out
 of a load's `cpu_us`, reporting it as `sampler_cpu_us`; the settings
 JSON's `rss_sampling` records both, so a rerun's `cpu_us` is the load's.
+The statm resident count is the kernel's approximate per-process
+counter, where smaps sums every mapping exactly, so a rerun's resident
+peaks are not byte-comparable with the ones here.
 
 ## Reproducing
 

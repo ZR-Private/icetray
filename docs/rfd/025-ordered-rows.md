@@ -526,7 +526,15 @@ S3](../analysis/2026-10-19-ordered-rows-on-s3.md#span-latency-5-to-16-pages)),
 and a span past 16 pages is unmeasured. The span window now has the
 lookup window's configuration and mechanism and differs from it only
 in the GETs that feed it; it stays a window of its own, and whether to
-fold the two into one is open.
+fold the two into one is open. On an ordered table the lookup window
+holds its dictionary-page GETs and, under `bloom`, its key-page GETs,
+so folding would change three things. One `max_rate` would cap span
+GETs and those GETs together, where today each may hedge up to its own
+ceiling. Spans would hedge as soon as the one window fills, with no
+warm-up of `window` span GETs of their own. And the one percentile
+would mix span transfer times, about 13 ms more at p99 for the spans
+of 5 to 16 pages measured, into a window of one-page GETs, raising
+their delay.
 
 A load reads the order column once per row group, so a file costs one
 more GET per row group than RFD 004 (Resident key-chunk index) counts,

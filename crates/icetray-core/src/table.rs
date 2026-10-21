@@ -4393,8 +4393,20 @@ mod tests {
         keys: &[i64],
         get_deadline: Duration,
     ) -> (Table, Fixture, Arc<Gauged>) {
+        key_value_table_of_files(&first_between_last(keys), get_deadline).await
+    }
+
+    /// A loaded key-value table of one file per entry of `files`, each of
+    /// its keys in order, in the one bucket and named `file_at` its
+    /// position, whose Gets end each page fetch at `get_deadline`, and the
+    /// store its storage reads through. Files' key ranges may overlap: the
+    /// table is lenient.
+    async fn key_value_table_of_files(
+        files: &[&[i64]],
+        get_deadline: Duration,
+    ) -> (Table, Fixture, Arc<Gauged>) {
         let mut fixture = Fixture::bucketed(1);
-        for (at, part) in first_between_last(keys).into_iter().enumerate() {
+        for (at, part) in files.iter().enumerate() {
             fixture
                 .add_file(FileSpec {
                     name: &file_at(at),
@@ -4516,6 +4528,62 @@ mod tests {
         .await
         .expect("the run of the last key, held on the store, is stopped");
         gauged.release();
+    }
+
+    /// A spread `MultiGet` whose middle run fails while its first run is
+    /// still reading stops the runs after the failure at once, though it
+    /// holds the failure until the first run ends: the first run's first
+    /// key and the last run's first key are alone in a file the store
+    /// holds, every other key is in a file emptied after the load, and the
+    /// Gets end no page fetch before `STALL`. Each run reads its keys in
+    /// order, so the first and the last run wait on the held file, and the
+    /// middle runs fail. Only the abort ends the last run before the
+    /// release.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_multi_get_stops_the_runs_after_a_failure_held_behind_an_earlier_run() {
+        assert_eq!(shard::workers(), SPLIT_WORKERS);
+        let per_run = MULTI_GET_TASK_KEYS_MIN;
+        let keys = keys_from(0, i64::try_from(per_run * SPLIT_WORKERS).unwrap());
+        assert!(
+            keys.len() <= DEFAULT_BATCH_FAN_OUT,
+            "one run reads every key at once"
+        );
+        let last_run_at = per_run * (SPLIT_WORKERS - 1);
+        let held = [keys[0], keys[last_run_at]];
+        let emptied: Vec<i64> = keys
+            .iter()
+            .copied()
+            .filter(|key| !held.contains(key))
+            .collect();
+        let held_file = 0;
+        let emptied_file = 1;
+        let (table, fixture, gauged) = key_value_table_of_files(&[&held, &emptied], STALL).await;
+        hold_file_at(&fixture, &gauged, held_file);
+        std::fs::write(on_disk(&fixture, emptied_file), []).unwrap();
+        let value = [ColumnRead::whole(VALUE_COLUMN)];
+        let asked = long_keys(&keys);
+        let mut call = std::pin::pin!(table.multi_get(&asked, &value));
+        let first_run_alone = 1;
+        let later_runs_stopped = async {
+            tokio::time::timeout(DEADLINE_GUARD, async {
+                while gauged.failed() == 0 || runs_alive(&table) > first_run_alone {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the runs after the middle run's failure are stopped");
+        };
+        tokio::select! {
+            biased;
+            answered = call.as_mut() => panic!("the first run is held on the store: {answered:?}"),
+            () = later_runs_stopped => {}
+        }
+        gauged.release();
+        let error = tokio::time::timeout(DEADLINE_GUARD, call)
+            .await
+            .expect("the first run ends once released")
+            .expect_err("every key but two is in an emptied file");
+        assert!(range_refused(&error), "the first run's failure: {error:?}");
     }
 
     /// The runs a batch of `DEFAULT_BATCH_FAN_OUT` cold hits on one table

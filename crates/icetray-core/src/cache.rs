@@ -532,11 +532,11 @@ impl PageCache {
     /// page (RFD 025, Caching and hedging); its fetch's failure is this
     /// read's. Every maximal run of the remaining pages whose ranges meet
     /// end to start is one call of `fetch` over the run's whole range, its
-    /// bytes split by page and each page
-    /// inserted as its own entry, keyed by `file` and the page's offset as
-    /// `get_or_fetch` keys a page, so that a later read of any one of them
-    /// finds it alone, then handed to every read waiting on it. The runs
-    /// are fetched together, and the waits run beside them.
+    /// bytes split by page and each page inserted as its own entry, keyed
+    /// by `file` and the page's offset as `get_or_fetch` keys a page, so
+    /// that a later read of any one of them finds it alone, then handed to
+    /// every read waiting on it. The runs are fetched together, and the
+    /// waits run beside them.
     /// Each run takes one permit of `issue` before it claims its pages as in
     /// flight and holds it until it ends, so none waits for a permit while
     /// it holds one (RFD 022), and no read waits on a run still queued for

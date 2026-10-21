@@ -201,8 +201,8 @@ the first rule whose `from` matches.
 When a lookup GET has no response after the delay, icetray sends it a
 second time and uses whichever response arrives first. Load reads are
 never hedged. A `Scan`'s span GETs are hedged under the same settings in
-a window of their own per table, which records each span's latency per
-page, so a span's delay is the window's percentile times its pages.
+a window of their own per table; every span GET races that window's one
+delay, whatever its pages, and enters it with its whole elapsed time.
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
@@ -684,9 +684,10 @@ it loads any data file:
   lines print it. A time is not taken as ISO-8601 text: RFC 3339 stops
   at the year 9999, and jiff, icetray's time library, spans the years
   -9999 to 9999, so the extreme values of a `date` or a microsecond
-  column have no such form, though every nanosecond value has one. The long is one form for
-  every value a column can hold, `timestamp` and `timestamptz` alike,
-  and a printed `next` pasted back reads exactly the next page;
+  column have no such form, though every nanosecond value has one. The
+  long is one form for every value a column can hold, `timestamp` and
+  `timestamptz` alike, and a printed `next` pasted back reads exactly
+  the next page;
 - a `string` as its text, with two escapes: `\\` for a backslash and
   `\0` for a zero byte. No command-line argument can hold a zero byte,
   and a page read oldest first from a string column ends in one: its
