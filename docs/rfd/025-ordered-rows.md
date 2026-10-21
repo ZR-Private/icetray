@@ -1,5 +1,9 @@
 # Ordered rows per key
 
+> Updated 2026-10-20: the span hedge window stays separate from the
+> lookup window, decided under Caching and hedging, and one hedge window
+> per table joins the rejected alternatives.
+
 > Updated 2026-10-20: every span GET races its window's one delay and
 > enters the window with its whole elapsed time, whatever its pages:
 > spans of 5 to 16 pages share a one-page GET's first-byte latency on
@@ -308,7 +312,11 @@ direction under a limit and optional bounds on the order value.
   a 269 KiB span adding about 2 ms at p50 and 13 ms at p99 ([span
   latency, 5 to 16
   pages](../analysis/2026-10-19-ordered-rows-on-s3.md#span-latency-5-to-16-pages)).
-  Key-page GETs under `bloom` use the table's lookup window.
+  Key-page GETs under `bloom` use the table's lookup window. The two
+  windows stay separate: a table usually serves one kind of call,
+  ordered or key-value, so in practice one window is fed, and separate
+  windows keep one call type from spending the other's hedge ceiling
+  and span transfer times out of the lookup percentile.
 - **Limits.** `server.batch_fan_out` bounds the GETs one MultiGet, one
   Scan, or one MultiScan holds in flight. A MultiScan spreads its keys
   across idle worker threads as a MultiGet does: while fewer calls than
@@ -489,6 +497,18 @@ refuses, and an advice finding for runs too large for that bound: a
 truncated response would hand a caller that does not check `next` fewer
 rows than it asked for, with no sign.
 
+One hedge window per table, span GETs and lookup GETs feeding one
+percentile. Rejected: on an ordered table the lookup window holds its
+dictionary-page GETs and, under `bloom`, its key-page GETs, so one
+window would change three things. One `max_rate` would cap span GETs
+and those GETs together, where each now hedges up to its own ceiling.
+Spans would hedge as soon as the one window fills, with no warm-up of
+`window` span GETs of their own. And the one percentile would mix span
+transfer times, about 13 ms more at p99 for the spans of 5 to 16 pages
+measured, into a window of one-page GETs, raising their delay. A table
+usually serves one kind of call, so in practice one window is fed
+either way.
+
 Bounds per key in a MultiScan. Deferred: one set of bounds serves the
 common call, the newest rows of many keys after one order value, and a
 caller paging several keys' histories continues with a Scan per key
@@ -531,18 +551,10 @@ defaults, so a caller reading many keys requests a smaller limit. The
 span hedge window's one delay applies to every span: on S3, spans of 1
 to 16 pages shared one first-byte latency ([ordered rows on
 S3](../analysis/2026-10-19-ordered-rows-on-s3.md#span-latency-5-to-16-pages)),
-and a span past 16 pages is unmeasured. The span window now has the
-lookup window's configuration and mechanism and differs from it only
-in the GETs that feed it; it stays a window of its own, and whether to
-fold the two into one is open. On an ordered table the lookup window
-holds its dictionary-page GETs and, under `bloom`, its key-page GETs,
-so folding would change three things. One `max_rate` would cap span
-GETs and those GETs together, where today each may hedge up to its own
-ceiling. Spans would hedge as soon as the one window fills, with no
-warm-up of `window` span GETs of their own. And the one percentile
-would mix span transfer times, about 13 ms more at p99 for the spans
-of 5 to 16 pages measured, into a window of one-page GETs, raising
-their delay.
+and a span past 16 pages is unmeasured. The span window has the lookup
+window's configuration and mechanism and differs from it only in the
+GETs that feed it: on an ordered table the lookup window holds its
+dictionary-page GETs and, under `bloom`, its key-page GETs.
 
 A load reads the order column once per row group, so a file costs one
 more GET per row group than RFD 004 (Resident key-chunk index) counts,
