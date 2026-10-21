@@ -686,18 +686,36 @@ it loads any data file:
   and a `scan` line's `next` print it, and a `next` pasted back reads
   exactly the next page;
 - a `date` or timestamp also as ISO 8601 text, converted to the same
-  long: a calendar date, `2026-01-01`, for a `date`, and for all four
-  timestamp types an RFC 3339 instant with `Z` or an offset,
-  `2026-01-01T00:00:00Z` or `2026-01-01T09:00:00+09:00`. A `timestamp`
-  records no zone, and its bound still needs `Z` or an offset, so no
-  local time zone is ever consulted. An instant with digits below the
-  column's unit that are not zero, such as `.0000001` for a
-  microsecond type, exits 64 rather than being rounded, and so do a
-  date with a time, a time without an offset, a nanosecond instant
-  outside the years 1677 to 2262 that a long of nanoseconds spans, and
-  any year outside -9999 to 9999, the years jiff, icetray's time
-  library, holds; a value past them is given as the long. An `int` or
-  `long` column, and every column below, takes no ISO text;
+  long, in exactly one form per type:
+  - a `date` as `YYYY-MM-DD`, such as `2026-01-01`, from `0000-01-01` to
+    `9999-12-31`;
+  - each of the four timestamp types as `YYYY-MM-DDTHH:MM:SS`, an
+    optional `.` and one to nine fraction digits, then `Z`, `+HH:MM`, or
+    `-HH:MM`, such as `2026-01-01T00:00:00Z` or
+    `2026-01-01T09:00:00.5+09:00`, from the year 0000 to
+    `9999-12-30T22:00:00.999999999Z`, where jiff, icetray's time
+    library, ends, and for `timestamp_ns` and `timestamptz_ns` from
+    `1677-09-21T00:12:43.145224192Z` to `2262-04-11T23:47:16.854775807Z`,
+    the range a long of nanoseconds spans.
+
+  The `T` and `Z` are uppercase and the year has four digits, so a
+  year before 0 is given as the long. The offset is required for
+  `timestamp` too, so no local time zone is ever consulted: a
+  `timestamp` column stores a wall-clock reading with no zone, and its
+  bound is the instant's wall-clock time in UTC, so a writer's local
+  time is given with `Z`, as in `2026-01-01T09:00:00Z`, not with its
+  offset, which shifts the bound by the offset. Every other form exits
+  64: a space for `T`, lowercase `t` or `z`, an hour-only offset, one
+  with seconds, or one past 23 hours, a zone annotation such as `[Europe/Paris]`, the basic
+  form `20260101T000000Z`, a comma for the decimal point, and a time
+  without seconds or without an offset. So do a leap second, `:60`, and
+  an instant with digits below the column's unit that are not zero, such
+  as `.0000001` for a microsecond type: neither is rounded. Digits alone
+  are always the long: on a `date` column `2026` is day 2026,
+  1975-07-20, and `20260101` is day 20,260,101, past 9999-12-31 and
+  refused, since a `date` long outside jiff's dates, -9999-01-01 to
+  9999-12-31, exits 64. An `int` or `long` column, and every column
+  below, takes no ISO text;
 - a `string` as its text, with two escapes: `\\` for a backslash and
   `\0` for a zero byte. No command-line argument can hold a zero byte,
   and a page read oldest first from a string column ends in one: its

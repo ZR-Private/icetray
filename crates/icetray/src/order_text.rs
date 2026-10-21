@@ -15,7 +15,8 @@
 //! the `next` of a string read oldest first always ends in one, the zero
 //! byte `OrderValue::successor` appends.
 
-use icetray_core::{BoundSide, OrderType, OrderValue, OrderVariant, time};
+use icetray_core::time::{self, EpochUnit};
+use icetray_core::{BoundSide, OrderType, OrderValue, OrderVariant};
 use serde::Serialize;
 
 use crate::error::OrderTextFault;
@@ -30,10 +31,13 @@ const ESCAPED_ZERO: char = '0';
 /// Parses `text`, given for `bound`, as an order value of `order_type`. A
 /// value of an integer or time type is `i64::from_str`, in the type's
 /// Iceberg unit: days for `date`, microseconds or nanoseconds for a
-/// timestamp, as the wire and the doctor's lines carry it. Text that is no
-/// long is, for a date or timestamp type, ISO 8601 in the form
-/// `time::epoch_count` reads, a calendar date or an RFC 3339 instant,
-/// converted to the same unit; no other type takes it. A string is the
+/// timestamp, as the wire and the doctor's lines carry it; digits alone
+/// are always that long, so `20260101` on a `date` is a day count, and a
+/// `date`'s long must name a day jiff holds (`time::epoch_days`). Text
+/// that is no integer is, for a date or timestamp type, ISO 8601 in the
+/// one form `time::epoch_count` reads, `YYYY-MM-DD` or
+/// `YYYY-MM-DDTHH:MM:SS[.fraction]` with `Z` or an offset, converted to
+/// the same unit; no other type takes it. A string is the
 /// text as given with `\\` read as a backslash and `\0` as a zero byte;
 /// any other backslash is a fault, so a typed path cannot pass for an
 /// escape. A binary or fixed value is hex as a binary key is, lowercase or
@@ -46,25 +50,29 @@ pub fn parse(
 ) -> Result<OrderValue, OrderTextFault> {
     match order_type.variant() {
         OrderVariant::Long => {
-            if let Ok(value) = text.parse() {
-                return Ok(OrderValue::Long(value));
-            }
-            match order_type.epoch_unit() {
-                Some(unit) => {
-                    time::epoch_count(text, unit)
-                        .map(OrderValue::Long)
-                        .map_err(|fault| OrderTextFault::NotATime {
-                            bound,
-                            order_type,
-                            text: text.to_string(),
-                            fault,
-                        })
-                }
-                None => Err(OrderTextFault::NotALong {
+            let not_a_long = || OrderTextFault::NotALong {
+                bound,
+                text: text.to_string(),
+            };
+            let long = text.parse::<i64>();
+            let Some(unit) = order_type.epoch_unit() else {
+                return long.map(OrderValue::Long).map_err(|_| not_a_long());
+            };
+            let value = match long {
+                Ok(days) if unit == EpochUnit::Days => time::epoch_days(days),
+                Ok(count) => Ok(count),
+                Err(_) if is_integer(text) => return Err(not_a_long()),
+                Err(_) => time::epoch_count(text, unit),
+            };
+            value
+                .map(OrderValue::Long)
+                .map_err(|fault| OrderTextFault::NotATime {
                     bound,
+                    order_type,
+                    unit,
                     text: text.to_string(),
-                }),
-            }
+                    fault,
+                })
         }
         OrderVariant::Str => {
             unescape(text)
@@ -87,6 +95,14 @@ pub fn parse(
                 },
             }),
     }
+}
+
+/// Whether `text` is an integer as `i64::from_str` reads one, an optional
+/// sign and at least one ASCII digit, whatever its size: text that fails
+/// to parse as a long for its size alone is no ISO text either.
+fn is_integer(text: &str) -> bool {
+    let digits = text.strip_prefix(['+', '-']).unwrap_or(text);
+    !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 /// `text` with its escapes read, or `None` for a backslash that starts
@@ -251,18 +267,27 @@ mod tests {
     }
 
     /// One instant in each form a time bound takes, per time type: the
-    /// ISO text and the long of the type's unit it names.
-    const SAME_INSTANT: [(OrderType, &str, &str); 5] = [
+    /// ISO text and the long of the type's unit it names, on both sides of
+    /// the epoch and on a leap day.
+    const SAME_INSTANT: [(OrderType, &str, &str); 11] = [
         (OrderType::Date, "2026-01-01", "20454"),
+        (OrderType::Date, "1969-12-31", "-1"),
+        (OrderType::Date, "2024-02-29", "19782"),
         (
             OrderType::Timestamp,
             "2026-01-01T00:00:00.000001Z",
             "1767225600000001",
         ),
+        (OrderType::Timestamp, "1969-12-31T23:59:59.999999Z", "-1"),
         (
             OrderType::TimestampTz,
             "2026-01-01T01:00:00+01:00",
             "1767225600000000",
+        ),
+        (
+            OrderType::TimestampTz,
+            "2024-02-29T00:00:00Z",
+            "1709164800000000",
         ),
         (
             OrderType::TimestampNs,
@@ -270,11 +295,28 @@ mod tests {
             "1767225600000000001",
         ),
         (
+            OrderType::TimestampNs,
+            "1969-12-31T23:59:59.999999999Z",
+            "-1",
+        ),
+        (
             OrderType::TimestampTzNs,
             "2025-12-31T19:00:00-05:00",
             "1767225600000000000",
         ),
+        (OrderType::TimestampTzNs, "1969-12-31T23:00:00-01:00", "0"),
     ];
+
+    /// The `NotATime` fault `parse` gives for `text` as `order_type`.
+    fn not_a_time(order_type: OrderType, text: &str, fault: EpochTextFault) -> OrderTextFault {
+        OrderTextFault::NotATime {
+            bound: BoundSide::Start,
+            order_type,
+            unit: order_type.epoch_unit().expect("a time type"),
+            text: text.to_string(),
+            fault,
+        }
+    }
 
     #[test]
     fn test_parse_time_takes_iso_text_and_the_long_it_names_as_one_bound() {
@@ -294,21 +336,16 @@ mod tests {
         let text = "2026-01-01T00:00:00.0000001Z";
         for order_type in [OrderType::Timestamp, OrderType::TimestampTz] {
             assert_eq!(
-                parse(text, order_type, BoundSide::Before),
-                Err(OrderTextFault::NotATime {
-                    bound: BoundSide::Before,
-                    order_type,
-                    text: text.to_string(),
-                    fault: EpochTextFault::BelowTheUnit,
-                })
+                parse(text, order_type, BoundSide::Start),
+                Err(not_a_time(order_type, text, EpochTextFault::BelowTheUnit))
             );
         }
         assert_eq!(
-            parse(text, OrderType::TimestampNs, BoundSide::Before),
+            parse(text, OrderType::TimestampNs, BoundSide::Start),
             parse(
                 "1767225600000000100",
                 OrderType::TimestampNs,
-                BoundSide::Before
+                BoundSide::Start
             )
         );
     }
@@ -317,7 +354,9 @@ mod tests {
     fn test_parse_time_refuses_text_out_of_its_type_s_range_or_form() {
         let cases = [
             (OrderType::Date, "10000-01-01", EpochTextFault::NotIso),
-            (OrderType::Date, "2026-02-30", EpochTextFault::NotIso),
+            (OrderType::Date, "-000001-01-01", EpochTextFault::NotIso),
+            (OrderType::Date, "2026-02-30", EpochTextFault::NoSuchTime),
+            (OrderType::Date, "2023-02-29", EpochTextFault::NoSuchTime),
             (
                 OrderType::Date,
                 "2026-01-01T00:00:00Z",
@@ -328,29 +367,92 @@ mod tests {
                 "2026-01-01T00:00:00",
                 EpochTextFault::NotIso,
             ),
+            (
+                OrderType::Timestamp,
+                "2026-01-01 00:00:00Z",
+                EpochTextFault::NotIso,
+            ),
+            (
+                OrderType::TimestampTz,
+                "2026-01-01T00:00:00Z[America/New_York]",
+                EpochTextFault::NotIso,
+            ),
+            (
+                OrderType::TimestampTz,
+                "2023-02-29T00:00:00Z",
+                EpochTextFault::NoSuchTime,
+            ),
+            (
+                OrderType::Timestamp,
+                "2016-12-31T23:59:60Z",
+                EpochTextFault::LeapSecond,
+            ),
             (OrderType::TimestampTz, "2026-01-01", EpochTextFault::NotIso),
             (
                 OrderType::TimestampTzNs,
                 "2263-01-01T00:00:00Z",
                 EpochTextFault::OutOfRange,
             ),
-            (
-                OrderType::Timestamp,
-                "9223372036854775808",
-                EpochTextFault::NotIso,
-            ),
         ];
         for (order_type, text, fault) in cases {
             assert_eq!(
                 parse(text, order_type, BoundSide::Start),
-                Err(OrderTextFault::NotATime {
-                    bound: BoundSide::Start,
-                    order_type,
-                    text: text.to_string(),
-                    fault,
-                }),
+                Err(not_a_time(order_type, text, fault)),
                 "{text} as {order_type}"
             );
+        }
+    }
+
+    #[test]
+    fn test_parse_date_reads_digits_alone_as_days_and_refuses_days_jiff_lacks() {
+        assert_eq!(
+            parse("2026", OrderType::Date, BoundSide::Start),
+            parse("1975-07-20", OrderType::Date, BoundSide::Start),
+            "2026 is day 2026, not a year"
+        );
+        assert_eq!(
+            parse("2026", OrderType::Date, BoundSide::Start),
+            Ok(OrderValue::Long(2026))
+        );
+        for text in ["20260101", "2932897", "-4371588"] {
+            assert_eq!(
+                parse(text, OrderType::Date, BoundSide::Start),
+                Err(not_a_time(
+                    OrderType::Date,
+                    text,
+                    EpochTextFault::OutOfRange
+                )),
+                "{text}"
+            );
+        }
+        assert_eq!(
+            parse("20260101", OrderType::Timestamp, BoundSide::Start),
+            Ok(OrderValue::Long(20_260_101)),
+            "a timestamp's long is not range-checked"
+        );
+    }
+
+    #[test]
+    fn test_parse_time_refuses_a_long_too_big_for_a_long_as_no_long() {
+        for text in [
+            "9223372036854775808",
+            "-9223372036854775809",
+            "+99999999999999999999",
+        ] {
+            for order_type in [
+                OrderType::Date,
+                OrderType::Timestamp,
+                OrderType::TimestampNs,
+            ] {
+                assert_eq!(
+                    parse(text, order_type, BoundSide::Start),
+                    Err(OrderTextFault::NotALong {
+                        bound: BoundSide::Start,
+                        text: text.to_string(),
+                    }),
+                    "{text} as {order_type}"
+                );
+            }
         }
     }
 

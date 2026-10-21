@@ -2036,7 +2036,9 @@ const NEW_YEAR_2026_NANOS: i64 = 1_767_225_600_000_000_000;
 
 /// Per time order kind: the raw value of a key's first row, its rows one
 /// unit apart, and the ISO text of its second row's value and of its last
-/// row's, the window `--start` and `--before` bound.
+/// row's, the window `--start` and `--before` bound. The last row is row
+/// 6, one unit per row after the first, since a key has
+/// `ORDER_ROWS_PER_KEY` rows, which the test asserts.
 const ISO_WINDOWS: [(OrderKind, i64, &str, &str); 5] = [
     (
         OrderKind::Date,
@@ -2077,6 +2079,7 @@ const ISO_WINDOWS: [(OrderKind, i64, &str, &str); 5] = [
 #[tokio::test]
 async fn test_scan_takes_iso_bounds_for_time_orders_as_the_longs_they_name() -> TestResult {
     let dir = tempfile::tempdir()?;
+    assert_eq!(ORDER_ROWS_PER_KEY, 7, "ISO_WINDOWS names row 6 as the last");
     let after_first = 1;
     let after_last = i64::try_from(ORDER_ROWS_PER_KEY - 1)?;
     for (kind, first, iso_start, iso_before) in ISO_WINDOWS {
@@ -2123,10 +2126,13 @@ async fn test_scan_takes_iso_bounds_for_time_orders_as_the_longs_they_name() -> 
     Ok(())
 }
 
-/// ISO 8601 text a time bound's type cannot hold, and ISO text for a
-/// `long` order column, are usage errors before the load, with the form
-/// as the hint: digits below a microsecond for a `timestamp`, a date past
-/// the years a date holds, an instant without an offset.
+/// ISO 8601 text a time bound's type cannot hold, ISO text in any form
+/// but the one, ISO text for a `long` order column, and a `date` long
+/// past jiff's dates are usage errors before the load, with the form as
+/// the hint: digits below a microsecond for a `timestamp`, an instant
+/// without an offset, with a space for `T`, or with a zone annotation, a
+/// leap second, a year past 9999, and `20260101`, which on a `date` is
+/// the day count 20,260,101, not 2026-01-01.
 #[tokio::test]
 async fn test_scan_refuses_iso_bounds_a_column_s_type_cannot_hold() -> TestResult {
     let dir = tempfile::tempdir()?;
@@ -2137,7 +2143,15 @@ async fn test_scan_refuses_iso_bounds_a_column_s_type_cannot_hold() -> TestResul
             "2026-01-01T00:00:00.0000001Z",
         ),
         (OrderKind::Timestamp, "--before", "2026-01-01T00:00:00"),
+        (OrderKind::Timestamp, "--start", "2026-01-01 00:00:00Z"),
+        (
+            OrderKind::TimestampTz,
+            "--start",
+            "2026-01-01T00:00:00Z[America/New_York]",
+        ),
+        (OrderKind::TimestampTz, "--before", "2016-12-31T23:59:60Z"),
         (OrderKind::Date, "--start", "10000-01-01"),
+        (OrderKind::Date, "--before", "20260101"),
         (OrderKind::TimestampNs, "--before", "2263-01-01T00:00:00Z"),
         (OrderKind::Long, "--start", "2026-01-01T00:00:00Z"),
         (OrderKind::Long, "--before", "2026-01-01"),

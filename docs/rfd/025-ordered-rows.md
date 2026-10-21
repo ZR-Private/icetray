@@ -1,5 +1,19 @@
 # Ordered rows per key
 
+> Updated 2026-10-20: `icetray scan` takes a bound of a `date` or
+> timestamp column as ISO 8601 text as well as the long, since a person
+> reading a time series types a date or an instant, converted through
+> jiff to the column's unit. Each type takes exactly one form, so no
+> text jiff also reads passes for another time: `YYYY-MM-DD` for
+> `date`, and `YYYY-MM-DDTHH:MM:SS[.fraction]` with `Z` or `±HH:MM` for
+> every timestamp type, `timestamp` included, so no local time zone is
+> consulted; a `timestamp` bound is the instant's UTC wall-clock time.
+> A value that would move the window is refused rather than rounded: a
+> leap second, which jiff reads as the second before, and digits below
+> a microsecond type's unit. Digits alone stay the long, and the
+> printed `next` and `order` stay longs. No other order type takes ISO
+> text. The configuration reference gives the forms and ranges.
+
 > Updated 2026-10-20: the span hedge window stays separate from the
 > lookup window, decided under Caching and hedging, and one hedge window
 > per table joins the rejected alternatives.
@@ -26,24 +40,17 @@
 > Updated 2026-10-20: `icetray scan` runs one Scan from the command line
 > through the same checks, a wrong-kind table refused from its
 > configuration before any load, and `get` of an ordered table likewise.
-> Its bounds and its printed `next` take one text form per order type: a
-> time type as a long in Iceberg's unit, as the wire carries it and a
-> row's `order` prints it. Not every value has an RFC 3339 form:
-> RFC 3339 stops at the year 9999, and jiff, icetray's time library,
-> spans the years -9999 to 9999, so the extreme values of a `date`
-> column (about 5.9 million years from the epoch) or a microsecond one
-> (about 292,000) have none, though every nanosecond value has one. The
-> printed `next` must round-trip exactly, and printed ISO would give
-> `timestamp` and `timestamptz` different forms. A bound of a `date` or
-> timestamp column also takes ISO 8601 text, which a person reading a
-> time series types, converted through jiff to the column's unit: a
-> calendar date for `date`, and for every timestamp type an RFC 3339
-> instant with `Z` or an offset, so no local time zone is consulted,
-> though `timestamp` records none. An instant finer than a microsecond
-> type holds is refused rather than rounded, since a rounded bound
-> moves the window, and no other order type takes ISO text. A string is
-> its text with a backslash written `\\` and a zero byte `\0`, since no
-> argument holds the zero byte an oldest-first `next` ends in. The
+> Its printed `next` and a row's `order` take one text form per order
+> type, a time type's as a long in Iceberg's unit, as the wire carries
+> it; its bounds take that form and, for `date` and the timestamps, ISO
+> 8601 text too. Not every value has an ISO form: jiff, icetray's time
+> library, spans about the years -9999 to 9999, so the extreme values
+> of a `date` column (about 5.9 million years from the epoch) or a
+> microsecond one (about 292,000) have none, though every nanosecond
+> value has one. The printed `next` must round-trip exactly, and printed
+> ISO would give `timestamp` and `timestamptz` different forms. A string
+> is its text with a backslash written `\\` and a zero byte `\0`, since
+> no argument holds the zero byte an oldest-first `next` ends in. The
 > command does not apply `server.max_scan_bytes`, which bounds a gRPC
 > response.
 

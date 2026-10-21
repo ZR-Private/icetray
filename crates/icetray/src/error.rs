@@ -124,7 +124,7 @@ impl fmt::Display for Hint {
             }),
             Self::BoundForm { variant } => f.write_str(match variant {
                 OrderVariant::Long => {
-                    "an integer bound is a long; a date or timestamp bound is a long of the column's unit since the epoch (days, microseconds, or nanoseconds) or ISO 8601 text: a date such as 2026-01-01, or an instant with Z or an offset such as 2026-01-01T00:00:00Z"
+                    "an integer bound is a long; a date or timestamp bound is a long of the column's unit since the epoch (days, microseconds, or nanoseconds) or ISO 8601 text: a date YYYY-MM-DD, or an instant YYYY-MM-DDTHH:MM:SS[.fraction] with Z or +HH:MM or -HH:MM"
                 }
                 OrderVariant::Str => {
                     "a string bound is its text, with \\\\ for a backslash and \\0 for a zero byte"
@@ -196,22 +196,23 @@ pub enum OrderTextFault {
         /// The text as given.
         text: String,
     },
-    /// A date or timestamp bound is neither a signed 64-bit integer nor
-    /// ISO 8601 text that names a value of the column's unit
-    /// (`icetray_core::time::epoch_count`).
+    /// A date or timestamp bound is neither a long the column's unit
+    /// holds (`icetray_core::time::epoch_days`) nor ISO 8601 text that
+    /// names one (`icetray_core::time::epoch_count`).
     #[error(
-        "--{bound} {text} is not a {order_type} bound, which is {} or {}: {fault}",
-        epoch_form(*order_type),
-        iso_form(*order_type)
+        "--{bound} {text} is not a {order_type} bound, which is a long of {unit} since the epoch or {}: {fault}",
+        iso_form(*unit)
     )]
     NotATime {
         /// The flag the text was given for.
         bound: BoundSide,
         /// The table's order type, a date or timestamp type.
         order_type: OrderType,
+        /// The unit `order_type` counts in.
+        unit: EpochUnit,
         /// The text as given.
         text: String,
-        /// Why the text is not the ISO form.
+        /// Why the text is no bound of the type.
         fault: EpochTextFault,
     },
     /// A binary or fixed bound's hex has an odd number of digits.
@@ -240,22 +241,14 @@ pub enum OrderTextFault {
     },
 }
 
-/// A time bound's count form: a long of its type's unit since the epoch.
-fn epoch_form(order_type: OrderType) -> String {
-    match order_type.epoch_unit() {
-        Some(unit) => format!("a long of {unit} since the epoch"),
-        None => "a long".to_string(),
-    }
-}
-
-/// A time bound's ISO form, with an example.
-fn iso_form(order_type: OrderType) -> &'static str {
-    match order_type.epoch_unit() {
-        Some(EpochUnit::Days) => "an ISO 8601 date such as 2026-01-01",
-        Some(EpochUnit::Microseconds | EpochUnit::Nanoseconds) => {
-            "an RFC 3339 instant with Z or an offset such as 2026-01-01T00:00:00Z"
+/// The ISO form a bound of a type counting in `unit` takes, as
+/// `icetray_core::time::epoch_count` reads it.
+fn iso_form(unit: EpochUnit) -> &'static str {
+    match unit {
+        EpochUnit::Days => "a date YYYY-MM-DD such as 2026-01-01",
+        EpochUnit::Microseconds | EpochUnit::Nanoseconds => {
+            "an instant YYYY-MM-DDTHH:MM:SS[.fraction] with Z or +HH:MM or -HH:MM, such as 2026-01-01T00:00:00Z"
         }
-        None => "no ISO text",
     }
 }
 
@@ -778,6 +771,7 @@ mod tests {
             CliError::Bound(OrderTextFault::NotATime {
                 bound: BoundSide::Before,
                 order_type: OrderType::Timestamp,
+                unit: EpochUnit::Microseconds,
                 text: "2026-01-01T00:00:00.0000001Z".to_string(),
                 fault: EpochTextFault::BelowTheUnit,
             }),
@@ -859,6 +853,7 @@ mod tests {
                 OrderTextFault::NotATime {
                     bound,
                     order_type: OrderType::Date,
+                    unit: EpochUnit::Days,
                     text: text(),
                     fault: EpochTextFault::NotIso,
                 },

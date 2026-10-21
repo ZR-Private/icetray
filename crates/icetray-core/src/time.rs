@@ -108,68 +108,188 @@ impl std::fmt::Display for EpochUnit {
     }
 }
 
-/// Why text is not an ISO 8601 time that `epoch_count` turns into a count
-/// of its unit.
+/// Why text is not a time `epoch_count` turns into a count of its unit,
+/// or a count `epoch_days` admits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum EpochTextFault {
-    /// The text is not the form the unit takes, or names a time outside
-    /// the years jiff holds, -9999 to 9999: for days a calendar date
-    /// `YYYY-MM-DD`, for the others an RFC 3339 instant with `Z` or an
-    /// offset.
-    #[error("the text is not ISO 8601 in the unit's form, within the years -9999 to 9999")]
+    /// The text is not in the one form the unit takes: `YYYY-MM-DD` for
+    /// days, `YYYY-MM-DDTHH:MM:SS[.fraction](Z|+HH:MM|-HH:MM)` for the
+    /// others, with an uppercase `T` and `Z`, a four-digit year, at most
+    /// nine fraction digits, and an offset hour of at most 23.
+    #[error("the text is not in the unit's ISO 8601 form")]
     NotIso,
+    /// The text has the form and names no date or instant jiff holds: a
+    /// field out of range such as a February 30, or an instant past
+    /// 9999-12-30T22:00:00.999999999Z, where jiff's instants end.
+    #[error("the text names no date or instant jiff holds")]
+    NoSuchTime,
+    /// The instant's seconds are 60, a leap second, which jiff reads as
+    /// the second before; refused, as a bound one second off moves the
+    /// window.
+    #[error("the instant is a leap second, which no epoch count holds")]
+    LeapSecond,
     /// The instant has digits below a microsecond that are not zero, which
     /// a count of microseconds cannot hold.
     #[error("the instant has digits below a microsecond")]
     BelowTheUnit,
-    /// The instant's count of nanoseconds does not fit a signed 64-bit
-    /// integer, which spans 1677-09-21 to 2262-04-11.
-    #[error("the instant is outside the range a long of nanoseconds holds")]
+    /// The value is outside what the unit holds: an instant whose count of
+    /// nanoseconds does not fit a signed 64-bit integer, which spans
+    /// 1677-09-21T00:12:43.145224192Z to 2262-04-11T23:47:16.854775807Z,
+    /// or a count of days outside jiff's dates, -9999-01-01 to 9999-12-31.
+    #[error("the value is outside the range the unit holds")]
     OutOfRange,
+}
+
+/// The shape of a calendar date: `D` stands for an ASCII digit, and every
+/// other byte for itself.
+const DATE_SHAPE: &[u8] = b"DDDD-DD-DD";
+
+/// The shape of an instant up to its fraction and offset.
+const DATETIME_SHAPE: &[u8] = b"DDDD-DD-DDTDD:DD:DD";
+
+/// The shape of a numeric offset after its sign.
+const OFFSET_SHAPE: &[u8] = b"DD:DD";
+
+/// The byte a shape holds where the text holds an ASCII digit.
+const SHAPE_DIGIT: u8 = b'D';
+
+/// What separates an instant's seconds from its fraction.
+const FRACTION_POINT: char = '.';
+
+/// The most fraction digits an instant takes: nanoseconds.
+const MAX_FRACTION_DIGITS: usize = 9;
+
+/// The offset of UTC.
+const ZULU: &str = "Z";
+
+/// The greatest offset hour, as its two digits; ASCII digits of one width
+/// order as their numbers do.
+const MAX_OFFSET_HOUR: &str = "23";
+
+/// How an instant whose seconds are a leap second ends, up to its
+/// fraction.
+const LEAP_SECOND: &str = ":60";
+
+/// Whether `text` has `shape` byte for byte.
+fn has_shape(text: &str, shape: &[u8]) -> bool {
+    text.len() == shape.len()
+        && text.bytes().zip(shape).all(|(byte, &want)| {
+            if want == SHAPE_DIGIT {
+                byte.is_ascii_digit()
+            } else {
+                byte == want
+            }
+        })
+}
+
+/// Whether `offset` is `Z` or a sign and `HH:MM` with an hour of at most
+/// 23. jiff checks the minutes.
+fn is_offset(offset: &str) -> bool {
+    offset == ZULU
+        || offset.strip_prefix(['+', '-']).is_some_and(|numeric| {
+            has_shape(numeric, OFFSET_SHAPE)
+                && numeric
+                    .get(..MAX_OFFSET_HOUR.len())
+                    .is_some_and(|hour| hour <= MAX_OFFSET_HOUR)
+        })
+}
+
+/// `Ok` when `text` has the one shape an instant takes (`NotIso`) and its
+/// seconds are no leap second (`LeapSecond`), which jiff would read as the
+/// second before.
+fn instant_shape(text: &str) -> Result<(), EpochTextFault> {
+    let (datetime, rest) = text
+        .split_at_checked(DATETIME_SHAPE.len())
+        .ok_or(EpochTextFault::NotIso)?;
+    if !has_shape(datetime, DATETIME_SHAPE) {
+        return Err(EpochTextFault::NotIso);
+    }
+    let offset = match rest.strip_prefix(FRACTION_POINT) {
+        Some(fraction) => {
+            let digits = fraction.bytes().take_while(u8::is_ascii_digit).count();
+            if !(1..=MAX_FRACTION_DIGITS).contains(&digits) {
+                return Err(EpochTextFault::NotIso);
+            }
+            fraction.get(digits..).ok_or(EpochTextFault::NotIso)?
+        }
+        None => rest,
+    };
+    if !is_offset(offset) {
+        return Err(EpochTextFault::NotIso);
+    }
+    if datetime.ends_with(LEAP_SECOND) {
+        return Err(EpochTextFault::LeapSecond);
+    }
+    Ok(())
+}
+
+/// The first day of the Unix epoch, which Iceberg counts dates from.
+fn epoch_date() -> jiff::civil::Date {
+    jiff::tz::Offset::UTC
+        .to_datetime(jiff::Timestamp::UNIX_EPOCH)
+        .date()
+}
+
+/// `days`, a count of days since the epoch as a `date` column stores it,
+/// when it names a date jiff holds, -9999-01-01 to 9999-12-31, and
+/// `OutOfRange` otherwise: the check a `date` bound given as a long
+/// meets, so it names a day its ISO form could name.
+pub fn epoch_days(days: i64) -> Result<i64, EpochTextFault> {
+    jiff::Span::new()
+        .try_days(days)
+        .and_then(|span| epoch_date().checked_add(span))
+        .map(|_| days)
+        .map_err(|_| EpochTextFault::OutOfRange)
 }
 
 /// The count of `unit` since the Unix epoch that ISO 8601 `text` names,
 /// as an Iceberg `date` or timestamp stores it: the one place such text
-/// becomes an epoch count. Days take only a calendar date, `2026-01-01`,
-/// exactly as jiff prints one, so a datetime's time is never dropped. The
-/// other units take an RFC 3339 instant, which carries `Z` or an offset,
-/// so no local time zone is ever consulted, a `timestamp`'s included,
-/// though that type records none. An instant is never rounded: digits
+/// becomes an epoch count. Each unit takes exactly one form, checked
+/// before jiff parses it, so no form jiff also reads, such as a space
+/// for `T`, an hour-only offset, or a bracketed time zone, passes for
+/// another time. Days take a calendar date, `2026-01-01`. The other
+/// units take an instant, `2026-01-01T00:00:00.5Z` or
+/// `2026-01-01T09:00:00+09:00`, whose offset is required, so no local
+/// time zone is ever consulted, a `timestamp`'s included, though that
+/// type records none: its count is the instant's UTC wall-clock reading.
+/// An instant is never rounded: a leap second is `LeapSecond`, digits
 /// below a microsecond that are not zero are `BelowTheUnit` for
-/// microseconds, and an instant whose nanoseconds a long does not hold is
-/// `OutOfRange`.
+/// microseconds, and an instant whose nanoseconds a long does not hold
+/// is `OutOfRange`.
 pub fn epoch_count(text: &str, unit: EpochUnit) -> Result<i64, EpochTextFault> {
     match unit {
         EpochUnit::Days => {
-            let date: jiff::civil::Date = text.parse().map_err(|_| EpochTextFault::NotIso)?;
-            if date.to_string() != text {
+            if !has_shape(text, DATE_SHAPE) {
                 return Err(EpochTextFault::NotIso);
             }
-            let epoch = jiff::tz::Offset::UTC
-                .to_datetime(jiff::Timestamp::UNIX_EPOCH)
-                .date();
+            let date: jiff::civil::Date = text.parse().map_err(|_| EpochTextFault::NoSuchTime)?;
             let days = date
-                .since(epoch)
+                .since(epoch_date())
                 .expect("a span in days holds the distance between any two dates jiff holds")
                 .get_days();
             Ok(i64::from(days))
         }
         EpochUnit::Microseconds => {
-            let at: jiff::Timestamp = text.parse().map_err(|_| EpochTextFault::NotIso)?;
+            let at = instant(text)?;
             let micros = at.as_microsecond();
-            let whole = jiff::Timestamp::from_microsecond(micros)
-                .expect("an instant truncated toward the epoch stays in jiff's range");
-            if whole == at {
+            if jiff::SignedDuration::from_micros(micros) == at.as_duration() {
                 Ok(micros)
             } else {
                 Err(EpochTextFault::BelowTheUnit)
             }
         }
         EpochUnit::Nanoseconds => {
-            let at: jiff::Timestamp = text.parse().map_err(|_| EpochTextFault::NotIso)?;
+            let at = instant(text)?;
             i64::try_from(at.as_nanosecond()).map_err(|_| EpochTextFault::OutOfRange)
         }
     }
+}
+
+/// `text` as an instant, when it has the one shape an instant takes and
+/// names an instant jiff holds.
+fn instant(text: &str) -> Result<jiff::Timestamp, EpochTextFault> {
+    instant_shape(text)?;
+    text.parse().map_err(|_| EpochTextFault::NoSuchTime)
 }
 
 /// A duration as configuration text, in the friendly form
@@ -417,46 +537,82 @@ mod tests {
         assert_eq!(super::millis_after(EPOCH_MILLIS, Duration::MAX), i64::MAX);
     }
 
+    use super::{EpochTextFault, EpochUnit, epoch_count, epoch_days};
+
     #[test]
     fn test_epoch_count_days_counts_calendar_days_from_the_epoch() {
-        let days = |text| super::epoch_count(text, super::EpochUnit::Days);
+        let days = |text| epoch_count(text, EpochUnit::Days);
         assert_eq!(days("1970-01-01"), Ok(0));
         assert_eq!(days("1970-01-02"), Ok(1));
         assert_eq!(days("1969-12-31"), Ok(-1));
         assert_eq!(days("1972-03-01"), Ok(790), "1972 is a leap year");
+        assert_eq!(days("2024-02-29"), Ok(19_782), "2024 is a leap year");
+        assert_eq!(days("0000-01-01"), Ok(-719_528));
+        assert_eq!(days("9999-12-31"), Ok(2_932_896));
     }
 
     #[test]
-    fn test_epoch_count_days_refuses_anything_but_a_calendar_date_jiff_holds() {
+    fn test_epoch_count_days_refuses_anything_but_yyyy_mm_dd() {
         for text in [
-            "2026-02-30",
-            "10000-01-01",
             "+010000-01-01",
+            "-000001-01-01",
+            "+002026-01-01",
+            "10000-01-01",
             "2026-01-01T00:00:00",
             "2026-01-01T00:00:00+00:00",
             "20260101",
             "2026-1-1",
+            "2026-01-01 ",
             "",
         ] {
             assert_eq!(
-                super::epoch_count(text, super::EpochUnit::Days),
-                Err(super::EpochTextFault::NotIso),
+                epoch_count(text, EpochUnit::Days),
+                Err(EpochTextFault::NotIso),
                 "{text:?}"
             );
         }
     }
 
     #[test]
+    fn test_epoch_count_days_refuses_a_day_no_calendar_holds() {
+        for text in ["2026-02-30", "2023-02-29", "2026-13-01", "2026-00-10"] {
+            assert_eq!(
+                epoch_count(text, EpochUnit::Days),
+                Err(EpochTextFault::NoSuchTime),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_epoch_days_admits_exactly_the_days_jiff_holds() {
+        assert_eq!(epoch_days(0), Ok(0));
+        assert_eq!(epoch_days(2_932_896), Ok(2_932_896), "9999-12-31");
+        assert_eq!(epoch_days(-4_371_587), Ok(-4_371_587), "-9999-01-01");
+        for days in [2_932_897, -4_371_588, 20_260_101, i64::MAX, i64::MIN] {
+            assert_eq!(epoch_days(days), Err(EpochTextFault::OutOfRange), "{days}");
+        }
+    }
+
+    #[test]
     fn test_epoch_count_microseconds_reads_an_instant_with_its_offset() {
-        let micros = |text| super::epoch_count(text, super::EpochUnit::Microseconds);
+        let micros = |text| epoch_count(text, EpochUnit::Microseconds);
         assert_eq!(micros("1970-01-01T00:00:00Z"), Ok(0));
         assert_eq!(micros("1970-01-01T00:00:00.000001Z"), Ok(1));
         assert_eq!(micros("1970-01-01T00:00:00.000001000Z"), Ok(1));
         assert_eq!(micros("1969-12-31T23:59:59.999999Z"), Ok(-1));
         assert_eq!(micros("1970-01-01T01:00:00+01:00"), Ok(0));
+        assert_eq!(micros("1970-01-01T00:00:00-00:00"), Ok(0));
+        assert_eq!(micros("1969-12-31T23:00:00-01:00"), Ok(0));
         assert_eq!(
             micros("2023-11-14T22:13:20.123Z"),
-            Ok(EPOCH_MILLIS * MICROS_PER_MILLI)
+            Ok(1_700_000_000_123_000)
+        );
+        assert_eq!(micros("2024-02-29T00:00:00Z"), Ok(1_709_164_800_000_000));
+        assert_eq!(
+            micros("9999-12-30T22:00:00.999999Z"),
+            Ok(253_402_207_200_999_999),
+            "the last microsecond jiff holds"
         );
     }
 
@@ -466,25 +622,78 @@ mod tests {
             "1970-01-01T00:00:00.0000001Z",
             "1970-01-01T00:00:00.000001001Z",
             "1969-12-31T23:59:59.9999999Z",
+            "1969-12-31T23:59:59.9999995Z",
         ] {
             assert_eq!(
-                super::epoch_count(text, super::EpochUnit::Microseconds),
-                Err(super::EpochTextFault::BelowTheUnit),
+                epoch_count(text, EpochUnit::Microseconds),
+                Err(EpochTextFault::BelowTheUnit),
                 "{text:?}"
             );
         }
     }
 
     #[test]
-    fn test_epoch_count_instants_refuse_text_with_no_offset() {
-        for unit in [
-            super::EpochUnit::Microseconds,
-            super::EpochUnit::Nanoseconds,
-        ] {
-            for text in ["2026-01-01T00:00:00", "2026-01-01", "1700000000", "now"] {
+    fn test_epoch_count_instants_refuse_every_form_but_the_one() {
+        let forms = [
+            "2026-01-01T00:00:00",
+            "2026-01-01",
+            "1700000000",
+            "now",
+            "2026-01-01 00:00:00Z",
+            "2026-01-01t00:00:00z",
+            "2026-01-01T00:00:00z",
+            "2026-01-01T00:00:00+05",
+            "2026-01-01T00:00:00+0500",
+            "2026-01-01T00:00:00+05:30:15",
+            "2026-01-01T00:00:00+24:00",
+            "2026-01-01T00Z",
+            "2026-01-01T00:00Z",
+            "20260101T000000Z",
+            "2026-01-01T00:00:00,5Z",
+            "2026-01-01T00:00:00.Z",
+            "2026-01-01T00:00:00.0000000001Z",
+            "+002026-01-01T00:00:00Z",
+            "-000001-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z[America/New_York]",
+            "2026-01-01T00:00:00+09:00[America/New_York]",
+            "2026-01-01T00:00:00Z[u-ca=hebrew]",
+            "2026-01-01T00:00:00[America/New_York]",
+            "2026-01-01T00:00:00Z ",
+        ];
+        for unit in [EpochUnit::Microseconds, EpochUnit::Nanoseconds] {
+            for text in forms {
                 assert_eq!(
-                    super::epoch_count(text, unit),
-                    Err(super::EpochTextFault::NotIso),
+                    epoch_count(text, unit),
+                    Err(EpochTextFault::NotIso),
+                    "{text:?} as {unit}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_epoch_count_instants_refuse_a_time_no_calendar_holds() {
+        for text in [
+            "2023-02-29T00:00:00Z",
+            "2026-01-01T24:00:00Z",
+            "2026-01-01T00:00:00+05:60",
+            "9999-12-31T00:00:00Z",
+        ] {
+            assert_eq!(
+                epoch_count(text, EpochUnit::Microseconds),
+                Err(EpochTextFault::NoSuchTime),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_epoch_count_instants_refuse_a_leap_second() {
+        for unit in [EpochUnit::Microseconds, EpochUnit::Nanoseconds] {
+            for text in ["2016-12-31T23:59:60Z", "2016-12-31T23:59:60.5Z"] {
+                assert_eq!(
+                    epoch_count(text, unit),
+                    Err(EpochTextFault::LeapSecond),
                     "{text:?} as {unit}"
                 );
             }
@@ -493,22 +702,14 @@ mod tests {
 
     #[test]
     fn test_epoch_count_nanoseconds_spans_exactly_a_long() {
-        let nanos = |text| super::epoch_count(text, super::EpochUnit::Nanoseconds);
+        let nanos = |text| epoch_count(text, EpochUnit::Nanoseconds);
         assert_eq!(nanos("1970-01-01T00:00:00.000000001Z"), Ok(1));
         assert_eq!(nanos("2262-04-11T23:47:16.854775807Z"), Ok(i64::MAX));
         assert_eq!(nanos("1677-09-21T00:12:43.145224192Z"), Ok(i64::MIN));
         for text in ["2262-04-11T23:47:16.854775808Z", "1677-09-21T00:00:00Z"] {
-            assert_eq!(
-                nanos(text),
-                Err(super::EpochTextFault::OutOfRange),
-                "{text:?}"
-            );
+            assert_eq!(nanos(text), Err(EpochTextFault::OutOfRange), "{text:?}");
         }
     }
-
-    /// Microseconds in a millisecond, so `EPOCH_MILLIS` reads as an
-    /// instant's microseconds.
-    const MICROS_PER_MILLI: i64 = 1_000;
 
     #[test]
     fn test_deserialize_parses_seconds() {
