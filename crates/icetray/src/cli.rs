@@ -210,6 +210,7 @@ pub enum Command {
     /// it reads the next page. A key with no rows is an answer, not a
     /// failure: the exit status is 0. A key-value table is read with get,
     /// and scan of one fails before it loads.
+    #[command(mut_arg("location", |location| location.requires("order_column")))]
     Scan {
         /// Where the tables come from.
         #[command(flatten)]
@@ -269,9 +270,9 @@ pub struct ScanArgs {
     /// newest returns the highest order values first, oldest the lowest.
     #[arg(long, value_name = "DIRECTION", value_parser = direction_parser())]
     pub direction: Direction,
-    /// The most rows to print, from 1 to the table's `max_scan_rows`.
+    /// The most rows to print, from 1 to the table's scan row limit.
     ///
-    /// A limit of 0, or one above the table's `max_scan_rows`, which info
+    /// A limit of 0, or one above the table's scan row limit, which info
     /// reports, fails the run before the table loads.
     #[arg(long, value_name = "N")]
     pub limit: u32,
@@ -279,8 +280,8 @@ pub struct ScanArgs {
     ///
     /// The value is text of the table's order type. An integer, date, or
     /// timestamp is a long in the column's Iceberg unit: days for a date,
-    /// microseconds for timestamp and timestamptz, nanoseconds for
-    /// `timestamp_ns` and `timestamptz_ns`. A string is its text, with \\
+    /// microseconds for timestamp and timestamptz, nanoseconds for their
+    /// nanosecond types. A string is its text, with \\
     /// for a backslash and \0 for a zero byte. A binary or fixed value is
     /// hex, two digits per byte in either case, with or without 0x. A scan
     /// line's next is in this form.
@@ -331,7 +332,9 @@ fn direction_parser() -> impl TypedValueParser<Value = Direction> {
 /// `--config` without tripping either; `--value-column` has no default, so
 /// a located table serves no value column unless one is named, and
 /// `--order-column` none, so a located table is a key-value table unless
-/// it names one. Each field's doc comment is its help.
+/// it names one. `scan`, which reads only ordered tables, makes
+/// `--location` require `--order-column`. Each field's doc comment is its
+/// help.
 #[derive(Args, Debug)]
 pub struct Target {
     /// The configuration file listing the tables.
@@ -397,6 +400,9 @@ pub struct Target {
     pub value_columns: Vec<ValueColumnConfig>,
     /// The order column of the located table, which makes it an ordered
     /// table that scan reads.
+    ///
+    /// Without it a located table is key-value, so scan with --location
+    /// requires it.
     #[arg(
         long,
         value_name = "COLUMN",
@@ -1123,6 +1129,31 @@ value_columns = ["value"]
         ] {
             let error = scan(extra);
             assert_eq!(error.kind(), kind, "{extra:?}: {error}");
+        }
+    }
+
+    /// A located table is key-value unless it names an order column, so a
+    /// scan of one without `--order-column` is clap's usage error for the
+    /// missing flag, while the other one-shots take a located table
+    /// without one.
+    #[test]
+    fn test_try_parse_scan_of_a_located_table_requires_its_order_column() {
+        let request = ["--direction", "newest", "--limit", "1", "7"];
+        let located = ["scan", "--location", LOCATION];
+        let missing = parse(&[&located[..], &request].concat()).unwrap_err();
+        assert_eq!(
+            missing.kind(),
+            ErrorKind::MissingRequiredArgument,
+            "{missing}"
+        );
+        let named = [&located[..], &["--order-column", "ts"], &request].concat();
+        assert!(parse(&named).is_ok());
+        for args in [
+            &["get", "--location", LOCATION, "7"][..],
+            &["doctor", "--location", LOCATION],
+            &["info", "--location", LOCATION],
+        ] {
+            assert!(parse(args).is_ok(), "{args:?}");
         }
     }
 

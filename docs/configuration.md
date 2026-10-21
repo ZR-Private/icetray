@@ -587,7 +587,7 @@ The one-shots share one set of flags, grouped in their help as follows.
 |---|---|---|
 | `--key-column <COLUMN>` | `key` | The key column, a name under `key_column`'s rule. |
 | `--value-column <NAME[:FORMAT]>` | none | A value column the table serves, with its format, `opaque` by default or `protobuf`; repeatable. A name holding a `:` takes its format after it, as `a:b:opaque`. An unknown format exits 64. The name follows `key_column`'s rule. With none, the table is served for key presence only. |
-| `--order-column <COLUMN>` | none | The order column, which makes the table an [ordered table](#tables) that `scan` reads, at the default `max_scan_rows`. The name follows `key_column`'s rule. With none, the table is a key-value table. |
+| `--order-column <COLUMN>` | none | The order column, which makes the table an [ordered table](#tables) that `scan` reads, at the default `max_scan_rows`. The name follows `key_column`'s rule. With none, the table is a key-value table, so `scan --location` without it exits 64 naming the missing flag. |
 | `--ref <REF>` | `main` | The branch or tag to read. |
 | `--residency <RESIDENCY>` | `full` | `full` or `bloom`. `disk` requires a local directory, so it is available only through a configuration file. |
 
@@ -681,11 +681,14 @@ it loads any data file:
   unit: days since 1970-01-01 for a `date`, microseconds since the epoch
   for `timestamp` and `timestamptz`, and nanoseconds for `timestamp_ns`
   and `timestamptz_ns`, as `Scan` takes it on the wire and the doctor's
-  lines print it. A timestamp is not taken as ISO-8601 text, so every
-  value a column can hold has one form, `timestamp` and `timestamptz`
-  alike;
-- a `string` as its text, with two escapes: `\` for a backslash and
-  ` ` for a zero byte. No command-line argument can hold a zero byte,
+  lines print it. A time is not taken as ISO-8601 text: RFC 3339 stops
+  at the year 9999, and jiff, icetray's time library, spans the years
+  -9999 to 9999, so the extreme values of a `date` or a microsecond
+  column have no such form, though every nanosecond value has one. The long is one form for
+  every value a column can hold, `timestamp` and `timestamptz` alike,
+  and a printed `next` pasted back reads exactly the next page;
+- a `string` as its text, with two escapes: `\\` for a backslash and
+  `\0` for a zero byte. No command-line argument can hold a zero byte,
   and a page read oldest first from a string column ends in one: its
   `next` is the last row's value with a zero byte appended
   ([Paging with `next`](calling.md#paging-with-next)). Any other
@@ -964,6 +967,7 @@ The same codes apply to every command; the root help's footer lists them.
   `--residency` other than `full` or `bloom`; a malformed `--rewrite`;
   `--table` with `--location`; a `--table` that no configured table has;
   `get` or `scan` without `--table` when several tables are configured;
-  `get` of an ordered table or `scan` of a key-value one; a key or a
+  `get` of an ordered table or `scan` of a key-value one; `scan` with
+  `--location` and no `--order-column`; a key or a
   `scan` bound that does not parse; a `--column` the table refuses; or a
   `scan` direction, limit, or window that a `Scan` refuses.

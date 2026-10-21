@@ -470,7 +470,7 @@ pub enum CliError {
     },
     /// A `get` of an ordered table or a `scan` of a key-value one, found
     /// from the table's configuration before the load.
-    #[error("table {table} is {kind}, and {command} reads a {} table", command.reads())]
+    #[error("table {table} is {kind}, and {command} reads only {} tables", command.reads())]
     WrongCommand {
         /// The table's configured name.
         table: String,

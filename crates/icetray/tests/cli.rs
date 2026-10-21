@@ -1775,21 +1775,31 @@ async fn test_scan_pages_by_next_to_the_end_in_both_directions_and_windows() -> 
     Ok(())
 }
 
+/// The width of the fixed order column the paging test reads: the fewest
+/// bytes that hold every raw order value of its fixture.
+const FIXED_ORDER_BYTES: u32 = 2;
+
 /// A string order column pages oldest first through a `next` that ends in
-/// a zero byte, printed as `\0`, and a binary one through hex, on a table
-/// a configuration file names and on one `--location` opens with
-/// `--order-column`.
+/// a zero byte, printed as `\0`, a binary one through hex, a fixed one
+/// through hex one byte wider than the column oldest first, and a date,
+/// an int32 kind, through its days, on a table a configuration file names
+/// and on one `--location` opens with `--order-column`.
 #[tokio::test]
-async fn test_scan_pages_a_string_and_a_binary_order_column_by_their_printed_next() -> TestResult {
+async fn test_scan_pages_string_binary_fixed_and_date_orders_by_their_next() -> TestResult {
     let dir = tempfile::tempdir()?;
-    for kind in [OrderKind::Str, OrderKind::Bin] {
-        let name = format!("events_{kind:?}").to_lowercase();
+    let kinds = [
+        (OrderKind::Str, "events_str"),
+        (OrderKind::Bin, "events_bin"),
+        (OrderKind::Fixed(FIXED_ORDER_BYTES), "events_fixed"),
+        (OrderKind::Date, "events_date"),
+    ];
+    for (kind, name) in kinds {
         let fixture = local_fixture(
             dir.path(),
-            ordered_spec_of(&name, kind, ORDER_START, ORDER_STEP),
+            ordered_spec_of(name, kind, ORDER_START, ORDER_STEP),
         )
         .await?;
-        let config = ordered_config(dir.path(), &name, &fixture)?;
+        let config = ordered_config(dir.path(), name, &fixture)?;
         let located = [
             "--location",
             fixture.metadata_location(),
@@ -1861,7 +1871,9 @@ async fn test_scan_of_a_key_with_no_rows_prints_one_scan_line() -> TestResult {
 /// `get` of an ordered table and `scan` of a key-value one are usage
 /// errors found from the configuration, before the load: with every data
 /// file gone, so a load fails with exit 1, each exits 64 with a hint
-/// naming the command that reads the table.
+/// naming the command that reads the table. A `scan` of a `--location`
+/// table with no `--order-column` is clap's usage error for the missing
+/// flag, which `cli`'s unit tests pin.
 #[tokio::test]
 async fn test_get_of_an_ordered_table_and_scan_of_a_key_value_one_are_usage_errors() -> TestResult {
     let ordered_dir = tempfile::tempdir()?;
@@ -1873,7 +1885,7 @@ async fn test_get_of_an_ordered_table_and_scan_of_a_key_value_one_are_usage_erro
     let get = run(&["get", "--config", &config, &key], &[]);
     assert_exit(&get, EXIT_USAGE);
     assert!(get.stdout.is_empty());
-    assert!(assert_plain_error(&get), "the hint names scan");
+    assert!(assert_plain_error(&get), "a hint follows the error");
     let located_get = run(
         &[
             "get",
@@ -1897,12 +1909,22 @@ async fn test_get_of_an_ordered_table_and_scan_of_a_key_value_one_are_usage_erro
 
     let kv_dir = tempfile::tempdir()?;
     let kv = local_fixture(kv_dir.path(), FixtureSpec::small("kv_kind", KeyType::Long)).await?;
+    let kv_config = write_file(kv_dir.path(), "kv.toml", &toml_table(TABLE_A, &kv))?;
     assert!(remove_data_files(kv_dir.path())? > 0);
     let key = kv.key(SAMPLE[0]).to_string();
-    let scan = scan_run(&location(&kv), &key, &TestScan::default(), None, None);
+    let scan = scan_run(
+        &["--config", &kv_config],
+        &key,
+        &TestScan::default(),
+        None,
+        None,
+    );
     assert_exit(&scan, EXIT_USAGE);
     assert!(scan.stdout.is_empty());
-    assert!(assert_plain_error(&scan), "the hint names get");
+    assert!(assert_plain_error(&scan), "a hint follows the error");
+    let located_scan = scan_run(&location(&kv), &key, &TestScan::default(), None, None);
+    assert_exit(&located_scan, EXIT_USAGE);
+    assert!(located_scan.stdout.is_empty());
     Ok(())
 }
 

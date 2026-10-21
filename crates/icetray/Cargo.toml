@@ -3,7 +3,7 @@ name = "icetray"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "One binary: the serve daemon and the one-shot doctor, get, and info subcommands"
+description = "One binary: the serve daemon and the one-shot doctor, get, scan, and info subcommands"
 
 [lints]
 workspace = true

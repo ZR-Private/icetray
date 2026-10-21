@@ -19,13 +19,16 @@
 > configuration before any load, and `get` of an ordered table likewise.
 > Its bounds and its printed `next` take one text form per order type: a
 > time type as a long in Iceberg's unit, as the wire carries it, rather
-> than ISO-8601 text, whose years stop at 9999 while a microsecond
-> column's longs reach about 292,000 years from the epoch, and which
-> would give `timestamp` and `timestamptz` different forms; and a string
-> as its text with a backslash written `\\` and a zero byte `\0`, since
-> no argument holds the zero byte an oldest-first `next` ends in. The
-> command does not apply `server.max_scan_bytes`, which bounds a gRPC
-> response.
+> than ISO-8601 text. Not every value has an RFC 3339 form: RFC 3339
+> stops at the year 9999, and jiff, icetray's time library, spans the
+> years -9999 to 9999, so the extreme values of a `date` column (about 5.9
+> million years from the epoch) or a microsecond one (about 292,000)
+> have none, though every nanosecond value has one. The printed `next`
+> must round-trip exactly, and ISO would give `timestamp` and
+> `timestamptz` different forms. A string is its text with a backslash
+> written `\\` and a zero byte `\0`, since no argument holds the zero
+> byte an oldest-first `next` ends in. The command does not apply
+> `server.max_scan_bytes`, which bounds a gRPC response.
 
 ## Problem
 

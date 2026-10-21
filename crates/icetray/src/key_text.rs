@@ -1,7 +1,7 @@
 //! A key from command-line text in the form for its key type (`parse`),
 //! and a key as that text (`text`), which `parse` reads back as the same
 //! key. The key type comes from the table's metadata, read before any data
-//! file is (`Table::resolve_key_type`); the text alone does not say whether
+//! file is (`Table::resolve_layout`); the text alone does not say whether
 //! `1` is a long or a string.
 
 use icetray_core::key::HEX_DIGITS_PER_BYTE;
