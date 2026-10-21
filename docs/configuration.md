@@ -681,13 +681,23 @@ it loads any data file:
   unit: days since 1970-01-01 for a `date`, microseconds since the epoch
   for `timestamp` and `timestamptz`, and nanoseconds for `timestamp_ns`
   and `timestamptz_ns`, as `Scan` takes it on the wire and the doctor's
-  lines print it. A time is not taken as ISO-8601 text: RFC 3339 stops
-  at the year 9999, and jiff, icetray's time library, spans the years
-  -9999 to 9999, so the extreme values of a `date` or a microsecond
-  column have no such form, though every nanosecond value has one. The
-  long is one form for every value a column can hold, `timestamp` and
-  `timestamptz` alike, and a printed `next` pasted back reads exactly
-  the next page;
+  lines print it. The long is one form for every value a column can
+  hold, `timestamp` and `timestamptz` alike, so a `row` line's `order`
+  and a `scan` line's `next` print it, and a `next` pasted back reads
+  exactly the next page;
+- a `date` or timestamp also as ISO 8601 text, converted to the same
+  long: a calendar date, `2026-01-01`, for a `date`, and for all four
+  timestamp types an RFC 3339 instant with `Z` or an offset,
+  `2026-01-01T00:00:00Z` or `2026-01-01T09:00:00+09:00`. A `timestamp`
+  records no zone, and its bound still needs `Z` or an offset, so no
+  local time zone is ever consulted. An instant with digits below the
+  column's unit that are not zero, such as `.0000001` for a
+  microsecond type, exits 64 rather than being rounded, and so do a
+  date with a time, a time without an offset, a nanosecond instant
+  outside the years 1677 to 2262 that a long of nanoseconds spans, and
+  any year outside -9999 to 9999, the years jiff, icetray's time
+  library, holds; a value past them is given as the long. An `int` or
+  `long` column, and every column below, takes no ISO text;
 - a `string` as its text, with two escapes: `\\` for a backslash and
   `\0` for a zero byte. No command-line argument can hold a zero byte,
   and a page read oldest first from a string column ends in one: its
@@ -697,8 +707,10 @@ it loads any data file:
 - a `binary` or `fixed` value as hex, two digits per byte in either case,
   with or without `0x`, as a binary key is given.
 
-A bound that does not parse exits 64 with a hint giving the form. A
-[`scan` line](#scan)'s `next` is in this form.
+A bound that does not parse exits 64, its message naming the order type
+and the forms it takes, with a hint giving the form. A
+[`scan` line](#scan)'s `next` is in this form, a long for a `date` or
+timestamp whichever form the bound was given in.
 
 ## Output
 

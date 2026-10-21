@@ -6,12 +6,16 @@
 //! (`Table::resolve_layout`); the text alone does not say whether `10` is a
 //! long or a string.
 //!
+//! A date or timestamp bound is a long of the type's unit or ISO 8601 text
+//! for the same value; a line carries the long, so a `next` pages on
+//! whichever form the first bound was given in.
+//!
 //! A string travels as its text with two escapes, `\\` for a backslash and
 //! `\0` for a zero byte: no command-line argument can hold a zero byte, and
 //! the `next` of a string read oldest first always ends in one, the zero
 //! byte `OrderValue::successor` appends.
 
-use icetray_core::{BoundSide, OrderType, OrderValue, OrderVariant};
+use icetray_core::{BoundSide, OrderType, OrderValue, OrderVariant, time};
 use serde::Serialize;
 
 use crate::error::OrderTextFault;
@@ -26,7 +30,10 @@ const ESCAPED_ZERO: char = '0';
 /// Parses `text`, given for `bound`, as an order value of `order_type`. A
 /// value of an integer or time type is `i64::from_str`, in the type's
 /// Iceberg unit: days for `date`, microseconds or nanoseconds for a
-/// timestamp, as the wire and the doctor's lines carry it. A string is the
+/// timestamp, as the wire and the doctor's lines carry it. Text that is no
+/// long is, for a date or timestamp type, ISO 8601 in the form
+/// `time::epoch_count` reads, a calendar date or an RFC 3339 instant,
+/// converted to the same unit; no other type takes it. A string is the
 /// text as given with `\\` read as a backslash and `\0` as a zero byte;
 /// any other backslash is a fault, so a typed path cannot pass for an
 /// escape. A binary or fixed value is hex as a binary key is, lowercase or
@@ -39,12 +46,25 @@ pub fn parse(
 ) -> Result<OrderValue, OrderTextFault> {
     match order_type.variant() {
         OrderVariant::Long => {
-            text.parse()
-                .map(OrderValue::Long)
-                .map_err(|_| OrderTextFault::NotALong {
+            if let Ok(value) = text.parse() {
+                return Ok(OrderValue::Long(value));
+            }
+            match order_type.epoch_unit() {
+                Some(unit) => {
+                    time::epoch_count(text, unit)
+                        .map(OrderValue::Long)
+                        .map_err(|fault| OrderTextFault::NotATime {
+                            bound,
+                            order_type,
+                            text: text.to_string(),
+                            fault,
+                        })
+                }
+                None => Err(OrderTextFault::NotALong {
                     bound,
                     text: text.to_string(),
-                })
+                }),
+            }
         }
         OrderVariant::Str => {
             unescape(text)
@@ -127,12 +147,13 @@ impl Serialize for OrderText<'_> {
 
 #[cfg(test)]
 mod tests {
+    use icetray_core::time::EpochTextFault;
     use serde_json::Value as Json;
 
     use super::*;
 
     /// One order type of each variant.
-    const LONG: OrderType = OrderType::TimestampNs;
+    const LONG: OrderType = OrderType::Long;
     const STRING: OrderType = OrderType::String;
     const BINARY: OrderType = OrderType::Binary;
 
@@ -226,6 +247,136 @@ mod tests {
                 }),
                 "{text:?}"
             );
+        }
+    }
+
+    /// One instant in each form a time bound takes, per time type: the
+    /// ISO text and the long of the type's unit it names.
+    const SAME_INSTANT: [(OrderType, &str, &str); 5] = [
+        (OrderType::Date, "2026-01-01", "20454"),
+        (
+            OrderType::Timestamp,
+            "2026-01-01T00:00:00.000001Z",
+            "1767225600000001",
+        ),
+        (
+            OrderType::TimestampTz,
+            "2026-01-01T01:00:00+01:00",
+            "1767225600000000",
+        ),
+        (
+            OrderType::TimestampNs,
+            "2026-01-01T00:00:00.000000001Z",
+            "1767225600000000001",
+        ),
+        (
+            OrderType::TimestampTzNs,
+            "2025-12-31T19:00:00-05:00",
+            "1767225600000000000",
+        ),
+    ];
+
+    #[test]
+    fn test_parse_time_takes_iso_text_and_the_long_it_names_as_one_bound() {
+        for (order_type, iso, long) in SAME_INSTANT {
+            let from_iso = parse(iso, order_type, BoundSide::Start);
+            assert!(from_iso.is_ok(), "{iso} as {order_type}: {from_iso:?}");
+            assert_eq!(
+                from_iso,
+                parse(long, order_type, BoundSide::Start),
+                "{iso} as {order_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_time_refuses_digits_below_a_microsecond_type_s_unit() {
+        let text = "2026-01-01T00:00:00.0000001Z";
+        for order_type in [OrderType::Timestamp, OrderType::TimestampTz] {
+            assert_eq!(
+                parse(text, order_type, BoundSide::Before),
+                Err(OrderTextFault::NotATime {
+                    bound: BoundSide::Before,
+                    order_type,
+                    text: text.to_string(),
+                    fault: EpochTextFault::BelowTheUnit,
+                })
+            );
+        }
+        assert_eq!(
+            parse(text, OrderType::TimestampNs, BoundSide::Before),
+            parse(
+                "1767225600000000100",
+                OrderType::TimestampNs,
+                BoundSide::Before
+            )
+        );
+    }
+
+    #[test]
+    fn test_parse_time_refuses_text_out_of_its_type_s_range_or_form() {
+        let cases = [
+            (OrderType::Date, "10000-01-01", EpochTextFault::NotIso),
+            (OrderType::Date, "2026-02-30", EpochTextFault::NotIso),
+            (
+                OrderType::Date,
+                "2026-01-01T00:00:00Z",
+                EpochTextFault::NotIso,
+            ),
+            (
+                OrderType::Timestamp,
+                "2026-01-01T00:00:00",
+                EpochTextFault::NotIso,
+            ),
+            (OrderType::TimestampTz, "2026-01-01", EpochTextFault::NotIso),
+            (
+                OrderType::TimestampTzNs,
+                "2263-01-01T00:00:00Z",
+                EpochTextFault::OutOfRange,
+            ),
+            (
+                OrderType::Timestamp,
+                "9223372036854775808",
+                EpochTextFault::NotIso,
+            ),
+        ];
+        for (order_type, text, fault) in cases {
+            assert_eq!(
+                parse(text, order_type, BoundSide::Start),
+                Err(OrderTextFault::NotATime {
+                    bound: BoundSide::Start,
+                    order_type,
+                    text: text.to_string(),
+                    fault,
+                }),
+                "{text} as {order_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_takes_iso_text_for_no_type_but_a_date_or_timestamp() {
+        let iso = ["2026-01-01", "2026-01-01T00:00:00Z"];
+        for order_type in [OrderType::Int, OrderType::Long] {
+            for text in iso {
+                assert_eq!(
+                    parse(text, order_type, BoundSide::Start),
+                    Err(OrderTextFault::NotALong {
+                        bound: BoundSide::Start,
+                        text: text.to_string(),
+                    })
+                );
+            }
+        }
+        for text in iso {
+            assert_eq!(
+                parse(text, STRING, BoundSide::Start),
+                Ok(OrderValue::Str(text.to_string()))
+            );
+            assert!(matches!(
+                parse(text, BINARY, BoundSide::Start),
+                Err(OrderTextFault::NotHex { .. } | OrderTextFault::OddHexLength { .. })
+            ));
         }
     }
 

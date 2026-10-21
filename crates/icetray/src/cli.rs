@@ -281,10 +281,14 @@ pub struct ScanArgs {
     /// The value is text of the table's order type. An integer, date, or
     /// timestamp is a long in the column's Iceberg unit: days for a date,
     /// microseconds for timestamp and timestamptz, nanoseconds for their
-    /// nanosecond types. A string is its text, with \\
-    /// for a backslash and \0 for a zero byte. A binary or fixed value is
-    /// hex, two digits per byte in either case, with or without 0x. A scan
-    /// line's next is in this form.
+    /// nanosecond types. A date also takes an ISO 8601 date, 2026-01-01,
+    /// and a timestamp an RFC 3339 instant with Z or an offset,
+    /// 2026-01-01T00:00:00Z, never a local time; an instant finer than a
+    /// microsecond type holds is refused, not rounded. A string is its
+    /// text, with \\ for a backslash and \0 for a zero byte. A binary or
+    /// fixed value is hex, two digits per byte in either case, with or
+    /// without 0x. A scan line's next is in this form, a long for a date or
+    /// timestamp.
     #[arg(long, value_name = "ORDER", allow_hyphen_values = true)]
     pub start: Option<String>,
     /// Only rows below this order value, in the form --start takes.

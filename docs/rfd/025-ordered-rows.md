@@ -23,17 +23,25 @@
 > through the same checks, a wrong-kind table refused from its
 > configuration before any load, and `get` of an ordered table likewise.
 > Its bounds and its printed `next` take one text form per order type: a
-> time type as a long in Iceberg's unit, as the wire carries it, rather
-> than ISO-8601 text. Not every value has an RFC 3339 form: RFC 3339
-> stops at the year 9999, and jiff, icetray's time library, spans the
-> years -9999 to 9999, so the extreme values of a `date` column (about 5.9
-> million years from the epoch) or a microsecond one (about 292,000)
-> have none, though every nanosecond value has one. The printed `next`
-> must round-trip exactly, and ISO would give `timestamp` and
-> `timestamptz` different forms. A string is its text with a backslash
-> written `\\` and a zero byte `\0`, since no argument holds the zero
-> byte an oldest-first `next` ends in. The command does not apply
-> `server.max_scan_bytes`, which bounds a gRPC response.
+> time type as a long in Iceberg's unit, as the wire carries it and a
+> row's `order` prints it. Not every value has an RFC 3339 form:
+> RFC 3339 stops at the year 9999, and jiff, icetray's time library,
+> spans the years -9999 to 9999, so the extreme values of a `date`
+> column (about 5.9 million years from the epoch) or a microsecond one
+> (about 292,000) have none, though every nanosecond value has one. The
+> printed `next` must round-trip exactly, and printed ISO would give
+> `timestamp` and `timestamptz` different forms. A bound of a `date` or
+> timestamp column also takes ISO 8601 text, which a person reading a
+> time series types, converted through jiff to the column's unit: a
+> calendar date for `date`, and for every timestamp type an RFC 3339
+> instant with `Z` or an offset, so no local time zone is consulted,
+> though `timestamp` records none. An instant finer than a microsecond
+> type holds is refused rather than rounded, since a rounded bound
+> moves the window, and no other order type takes ISO text. A string is
+> its text with a backslash written `\\` and a zero byte `\0`, since no
+> argument holds the zero byte an oldest-first `next` ends in. The
+> command does not apply `server.max_scan_bytes`, which bounds a gRPC
+> response.
 
 ## Problem
 

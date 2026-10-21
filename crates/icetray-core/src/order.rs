@@ -10,6 +10,7 @@ use parquet::basic::{ConvertedType, LogicalType, TimeUnit, Type as PhysicalType}
 use parquet::schema::types::ColumnDescriptor;
 
 use crate::key::write_hex;
+use crate::time::EpochUnit;
 
 /// The Iceberg type of an ordered table's order column (RFD 025, Order
 /// values). Integer and time types compare as signed 64-bit integers in
@@ -167,6 +168,18 @@ impl OrderType {
             | Self::TimestampTzNs => OrderVariant::Long,
             Self::String => OrderVariant::Str,
             Self::Binary | Self::Fixed(_) => OrderVariant::Bin,
+        }
+    }
+
+    /// The unit a date or timestamp counts from the epoch in, whose ISO
+    /// 8601 text `time::epoch_count` reads; `None` for an integer, string,
+    /// binary, or fixed type, which takes no ISO text.
+    pub fn epoch_unit(self) -> Option<EpochUnit> {
+        match self {
+            Self::Date => Some(EpochUnit::Days),
+            Self::Timestamp | Self::TimestampTz => Some(EpochUnit::Microseconds),
+            Self::TimestampNs | Self::TimestampTzNs => Some(EpochUnit::Nanoseconds),
+            Self::Int | Self::Long | Self::String | Self::Binary | Self::Fixed(_) => None,
         }
     }
 

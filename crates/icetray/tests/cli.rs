@@ -2028,6 +2028,155 @@ async fn test_scan_refuses_a_bad_direction_limit_bound_or_key_before_the_load() 
     Ok(())
 }
 
+/// 2026-01-01T00:00:00Z in each unit a time order type counts since the
+/// epoch: days, microseconds, nanoseconds.
+const NEW_YEAR_2026_DAYS: i64 = 20_454;
+const NEW_YEAR_2026_MICROS: i64 = 1_767_225_600_000_000;
+const NEW_YEAR_2026_NANOS: i64 = 1_767_225_600_000_000_000;
+
+/// Per time order kind: the raw value of a key's first row, its rows one
+/// unit apart, and the ISO text of its second row's value and of its last
+/// row's, the window `--start` and `--before` bound.
+const ISO_WINDOWS: [(OrderKind, i64, &str, &str); 5] = [
+    (
+        OrderKind::Date,
+        NEW_YEAR_2026_DAYS,
+        "2026-01-02",
+        "2026-01-07",
+    ),
+    (
+        OrderKind::Timestamp,
+        NEW_YEAR_2026_MICROS,
+        "2026-01-01T00:00:00.000001Z",
+        "2026-01-01T00:00:00.000006Z",
+    ),
+    (
+        OrderKind::TimestampTz,
+        NEW_YEAR_2026_MICROS,
+        "2026-01-01T01:00:00.000001+01:00",
+        "2026-01-01T00:00:00.000006000Z",
+    ),
+    (
+        OrderKind::TimestampNs,
+        NEW_YEAR_2026_NANOS,
+        "2026-01-01T00:00:00.000000001Z",
+        "2026-01-01T00:00:00.000000006Z",
+    ),
+    (
+        OrderKind::TimestampTzNs,
+        NEW_YEAR_2026_NANOS,
+        "2025-12-31T19:00:00.000000001-05:00",
+        "2026-01-01T00:00:00.000000006Z",
+    ),
+];
+
+/// A date or timestamp bound given as ISO 8601 text bounds the same window
+/// as the long of the column's unit it names: per time type and direction,
+/// the two runs print the same `row` lines, the model's rows inside the
+/// window, and the same `next`, a long either way.
+#[tokio::test]
+async fn test_scan_takes_iso_bounds_for_time_orders_as_the_longs_they_name() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let after_first = 1;
+    let after_last = i64::try_from(ORDER_ROWS_PER_KEY - 1)?;
+    for (kind, first, iso_start, iso_before) in ISO_WINDOWS {
+        let name = format!("events_iso_{kind:?}").to_lowercase();
+        let fixture = local_fixture(dir.path(), ordered_spec_of(&name, kind, first, 1)).await?;
+        let config = ordered_config(dir.path(), &name, &fixture)?;
+        let key = fixture.key(SAMPLE[1]);
+        let key_text = key.to_string();
+        let (start, before) = (first + after_first, first + after_last);
+        let (long_start, long_before) = (start.to_string(), before.to_string());
+        for direction in [Direction::NewestFirst, Direction::OldestFirst] {
+            let page = TestScan {
+                direction,
+                limit: SCAN_PAGE_ROWS,
+                start: Some(start),
+                before: Some(before),
+            };
+            let context = format!("{kind:?} {direction:?}");
+            let target = ["--config", config.as_str()];
+            let by_iso = scan_run(&target, &key_text, &page, Some(iso_start), Some(iso_before));
+            let by_long = scan_run(
+                &target,
+                &key_text,
+                &page,
+                Some(&long_start),
+                Some(&long_before),
+            );
+            assert_exit(&by_iso, EXIT_OK);
+            assert_exit(&by_long, EXIT_OK);
+            let (iso_rows, iso_call) = scan_lines(&by_iso, TABLE_A, &key_text);
+            let (long_rows, long_call) = scan_lines(&by_long, TABLE_A, &key_text);
+            let (expected, last) = fixture.expected_scan(&key, &[VALUE_COLUMN], &page);
+            assert!(!expected.is_empty(), "{context}: the window holds rows");
+            assert_rows(&iso_rows, &expected, kind, &context);
+            assert_eq!(iso_rows, long_rows, "{context}");
+            let next = last
+                .and_then(|last| page.next_after(kind, last))
+                .map(|next| next_json(&next));
+            assert!(next.is_some(), "{context}: rows remain past the page");
+            assert_eq!(iso_call.get("next"), next.as_ref(), "{context}");
+            assert_eq!(long_call.get("next"), next.as_ref(), "{context}");
+        }
+    }
+    Ok(())
+}
+
+/// ISO 8601 text a time bound's type cannot hold, and ISO text for a
+/// `long` order column, are usage errors before the load, with the form
+/// as the hint: digits below a microsecond for a `timestamp`, a date past
+/// the years a date holds, an instant without an offset.
+#[tokio::test]
+async fn test_scan_refuses_iso_bounds_a_column_s_type_cannot_hold() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let cases = [
+        (
+            OrderKind::Timestamp,
+            "--start",
+            "2026-01-01T00:00:00.0000001Z",
+        ),
+        (OrderKind::Timestamp, "--before", "2026-01-01T00:00:00"),
+        (OrderKind::Date, "--start", "10000-01-01"),
+        (OrderKind::TimestampNs, "--before", "2263-01-01T00:00:00Z"),
+        (OrderKind::Long, "--start", "2026-01-01T00:00:00Z"),
+        (OrderKind::Long, "--before", "2026-01-01"),
+    ];
+    for (at, (kind, flag, text)) in cases.into_iter().enumerate() {
+        let name = format!("events_iso_bad_{at}");
+        let fixture = local_fixture(
+            dir.path(),
+            ordered_spec_of(&name, kind, ORDER_START, ORDER_STEP),
+        )
+        .await?;
+        let config = ordered_config(dir.path(), &name, &fixture)?;
+        assert!(remove_data_files(dir.path())? > 0);
+        let key = fixture.key(SAMPLE[1]).to_string();
+        let output = run(
+            &[
+                "scan",
+                "--config",
+                &config,
+                "--direction",
+                "newest",
+                "--limit",
+                "1",
+                flag,
+                text,
+                &key,
+            ],
+            &[],
+        );
+        assert_exit(&output, EXIT_USAGE);
+        assert!(output.stdout.is_empty(), "{kind:?} {flag} {text}");
+        assert!(
+            assert_plain_error(&output),
+            "{kind:?} {flag} {text}: the form is the hint"
+        );
+    }
+    Ok(())
+}
+
 /// A `scan` whose lines carry a long order value past 2^53, on a `row`
 /// line or as `next`, logs the one warning for its table on stderr, and
 /// one whose values stay within it logs none; stdout carries the exact

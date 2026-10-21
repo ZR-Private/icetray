@@ -24,8 +24,9 @@ use std::time::Duration;
 
 use icetray_core::config::{ConfigError, schema_detail};
 use icetray_core::key::UUID_BYTES;
+use icetray_core::time::{EpochTextFault, EpochUnit};
 use icetray_core::{
-    BoundSide, CacheError, ErrorKind, KeyType, LocationError, OrderVariant, TableKind,
+    BoundSide, CacheError, ErrorKind, KeyType, LocationError, OrderType, OrderVariant, TableKind,
 };
 
 use crate::cli::{ConfigPath, ENV_CONFIG};
@@ -123,7 +124,7 @@ impl fmt::Display for Hint {
             }),
             Self::BoundForm { variant } => f.write_str(match variant {
                 OrderVariant::Long => {
-                    "an integer or time bound is a long in the column's unit: days for a date, microseconds or nanoseconds for a timestamp"
+                    "an integer bound is a long; a date or timestamp bound is a long of the column's unit since the epoch (days, microseconds, or nanoseconds) or ISO 8601 text: a date such as 2026-01-01, or an instant with Z or an offset such as 2026-01-01T00:00:00Z"
                 }
                 OrderVariant::Str => {
                     "a string bound is its text, with \\\\ for a backslash and \\0 for a zero byte"
@@ -195,6 +196,24 @@ pub enum OrderTextFault {
         /// The text as given.
         text: String,
     },
+    /// A date or timestamp bound is neither a signed 64-bit integer nor
+    /// ISO 8601 text that names a value of the column's unit
+    /// (`icetray_core::time::epoch_count`).
+    #[error(
+        "--{bound} {text} is not a {order_type} bound, which is {} or {}: {fault}",
+        epoch_form(*order_type),
+        iso_form(*order_type)
+    )]
+    NotATime {
+        /// The flag the text was given for.
+        bound: BoundSide,
+        /// The table's order type, a date or timestamp type.
+        order_type: OrderType,
+        /// The text as given.
+        text: String,
+        /// Why the text is not the ISO form.
+        fault: EpochTextFault,
+    },
     /// A binary or fixed bound's hex has an odd number of digits.
     #[error("--{bound} {text} has an odd number of hex digits")]
     OddHexLength {
@@ -221,11 +240,30 @@ pub enum OrderTextFault {
     },
 }
 
+/// A time bound's count form: a long of its type's unit since the epoch.
+fn epoch_form(order_type: OrderType) -> String {
+    match order_type.epoch_unit() {
+        Some(unit) => format!("a long of {unit} since the epoch"),
+        None => "a long".to_string(),
+    }
+}
+
+/// A time bound's ISO form, with an example.
+fn iso_form(order_type: OrderType) -> &'static str {
+    match order_type.epoch_unit() {
+        Some(EpochUnit::Days) => "an ISO 8601 date such as 2026-01-01",
+        Some(EpochUnit::Microseconds | EpochUnit::Nanoseconds) => {
+            "an RFC 3339 instant with Z or an offset such as 2026-01-01T00:00:00Z"
+        }
+        None => "no ISO text",
+    }
+}
+
 impl OrderTextFault {
     /// The variant the text did not parse as.
     pub fn variant(&self) -> OrderVariant {
         match self {
-            Self::NotALong { .. } => OrderVariant::Long,
+            Self::NotALong { .. } | Self::NotATime { .. } => OrderVariant::Long,
             Self::OddHexLength { .. } | Self::NotHex { .. } => OrderVariant::Bin,
             Self::BadEscape { .. } => OrderVariant::Str,
         }
@@ -737,6 +775,12 @@ mod tests {
                 bound: BoundSide::Start,
                 text: "abc".to_string(),
             }),
+            CliError::Bound(OrderTextFault::NotATime {
+                bound: BoundSide::Before,
+                order_type: OrderType::Timestamp,
+                text: "2026-01-01T00:00:00.0000001Z".to_string(),
+                fault: EpochTextFault::BelowTheUnit,
+            }),
             CliError::Request(core_error()),
         ];
         for error in cases {
@@ -808,6 +852,15 @@ mod tests {
                 OrderTextFault::NotALong {
                     bound,
                     text: text(),
+                },
+                OrderVariant::Long,
+            ),
+            (
+                OrderTextFault::NotATime {
+                    bound,
+                    order_type: OrderType::Date,
+                    text: text(),
+                    fault: EpochTextFault::NotIso,
                 },
                 OrderVariant::Long,
             ),
