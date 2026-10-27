@@ -2991,10 +2991,13 @@ mod tests {
     /// Merged together, overlap groups refuse as merged one at a time: the
     /// first group in group order that refuses, though a later one refuses
     /// first, and a group after one that refuses stops at once. Each of
-    /// three groups shares a pair. The first group's GETs are held until
-    /// the second has refused and the third, whose GETs are held
-    /// throughout, has stopped: its GETs, under way at the gate, are
-    /// dropped. The refusal names the first group's pair and file.
+    /// three groups shares a pair, and every GET is held. Once the third
+    /// group's GETs are under way at the gate, the second group's pass, so
+    /// a third group stopped before it reads anything never stands in for
+    /// one stopped mid-read. The first group's GETs are held until the
+    /// second has refused and the third, whose GETs are held throughout,
+    /// has stopped: its GETs are dropped. The refusal names the first
+    /// group's pair and file.
     #[tokio::test]
     async fn test_verify_rows_refuses_for_the_first_group_that_refuses_whichever_refuses_first() {
         let keys: Vec<i64> = (0..i64::try_from(MERGED_GROUPS).unwrap())
@@ -3004,8 +3007,8 @@ mod tests {
         for (prefix, &key) in ["f", "g", "h"].into_iter().zip(&keys) {
             files.extend(sharing_a_pair(prefix, key).await);
         }
-        let (first, third) = (&files[..2], &files[4..]);
-        for one in first.iter().chain(third) {
+        let (first, second, third) = (&files[..2], &files[2..4], &files[4..]);
+        for one in &files {
             one.gauged.hold();
         }
         let refused_later_first = async {
@@ -3014,6 +3017,9 @@ mod tests {
                 "the third group's GETs never reached the store",
             )
             .await;
+            for one in second {
+                one.gauged.release();
+            }
             until(
                 || third.iter().all(|one| one.gauged.in_flight() == 0),
                 "the third group's GETs went on after the second group refused",
